@@ -1656,7 +1656,6 @@ class TidalMigrationManager:
 
             launch_kwargs = {
                 "user_data_dir": str(actual_profile),
-                "channel": "chrome",
                 "headless": self.headless,
                 "args": launch_args,
                 "ignore_default_args": ["--enable-automation"],
@@ -1664,6 +1663,8 @@ class TidalMigrationManager:
                 "locale": "es-ES",
                 "proxy": proxy_dict
             }
+            if not proxy_dict:
+                launch_kwargs["channel"] = "chrome"
             if self.headless:
                 launch_kwargs["user_agent"] = NORMAL_USER_AGENT
             self.context = p.chromium.launch_persistent_context(**launch_kwargs)
@@ -3058,7 +3059,6 @@ class TidalMigrationManager:
             
         launch_kwargs = {
             "user_data_dir": str(self.main_profile),
-            "channel": "chrome",
             "headless": self.headless,
             "args": launch_args,
             "ignore_default_args": ["--enable-automation"],
@@ -3066,6 +3066,8 @@ class TidalMigrationManager:
             "locale": "es-ES",
             "proxy": proxy_dict
         }
+        if not proxy_dict:
+            launch_kwargs["channel"] = "chrome"
         if self.headless:
             launch_kwargs["user_agent"] = NORMAL_USER_AGENT
         self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -3395,7 +3397,6 @@ class TidalMigrationManager:
             
         launch_kwargs = {
             "user_data_dir": str(self.main_profile),
-            "channel": "chrome",
             "headless": self.headless,
             "args": launch_args,
             "ignore_default_args": ["--enable-automation"],
@@ -3403,6 +3404,8 @@ class TidalMigrationManager:
             "locale": "es-ES",
             "proxy": proxy_dict
         }
+        if not proxy_dict:
+            launch_kwargs["channel"] = "chrome"
         if self.headless:
             launch_kwargs["user_agent"] = NORMAL_USER_AGENT
         self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -4176,7 +4179,6 @@ class TidalMigrationManager:
                         print(f"  [Paso 9] Iniciando navegador familiar titular (Intento {intento_conexion}/3)...")
                         launch_kwargs = {
                             "user_data_dir": str(self.parent_profile),
-                            "channel": "chrome",
                             "headless": self.headless,
                             "args": launch_args,
                             "ignore_default_args": ["--enable-automation"],
@@ -4184,6 +4186,8 @@ class TidalMigrationManager:
                             "locale": "es-ES",
                             "proxy": proxy_dict
                         }
+                        if not proxy_dict:
+                            launch_kwargs["channel"] = "chrome"
                         if self.headless:
                             launch_kwargs["user_agent"] = NORMAL_USER_AGENT
                         parent_context = p.chromium.launch_persistent_context(**launch_kwargs)
