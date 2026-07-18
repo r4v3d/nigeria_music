@@ -1615,10 +1615,7 @@ class TidalMigrationManager:
         # Cambiar el flag a headed
         self.headless = False
         
-        # Cerrar el contexto y la instancia de Playwright actuales de forma segura
-        # El error "Target page, context or browser has been closed" ocurre porque
-        # la instancia de Playwright (self.playwright) queda corrupta cuando el browser
-        # headless crashea. La ÚNICA solución es crear una instancia NUEVA de Playwright.
+        # Cerrar el contexto actual de forma segura (manteniendo la instancia de Playwright viva para no cerrar el bucle de eventos)
         try:
             if self.context:
                 self.context.close()
@@ -1626,15 +1623,6 @@ class TidalMigrationManager:
             pass
         self.context = None
         self.page = None
-        
-        # Detener la instancia de Playwright actual (el sync_playwright() original)
-        old_pw = self.playwright
-        self.playwright = None
-        try:
-            if old_pw:
-                old_pw.stop()
-        except Exception:
-            pass
         
         # Matar procesos Chrome huérfanos y limpiar locks del perfil de forma profunda
         import subprocess as _sp
@@ -1647,86 +1635,21 @@ class TidalMigrationManager:
         reparar_perfil_corrupto(self.main_profile)
         time.sleep(1.0)
         
-        # Crear una instancia NUEVA y FRESCA de Playwright y levantar el navegador headed
-        print("  [Modo Headless] Creando nueva instancia de Playwright y levantando navegador headed...")
-        last_error = None
-        for intento in range(1, 4):
-            try:
-                # Crear nueva instancia de Playwright
-                from playwright.sync_api import sync_playwright
-                new_pw = sync_playwright().start()
-                self.playwright = new_pw
-                
-                # Construir argumentos de lanzamiento
-                launch_args = [
-                    "--disable-blink-features=AutomationControlled",
-                    "--credentials-enable-service=false",
-                    "--password-store=basic",
-                    "--disable-autofill",
-                    "--disable-save-password-bubble",
-                ]
-                proxy_dict = None
-                if self.use_proxy and self.proxy_pe_server:
-                    proxy_dict = {"server": self.proxy_pe_server}
-                    if self.proxy_pe_user:
-                        proxy_dict["username"] = self.proxy_pe_user
-                    if self.proxy_pe_pass:
-                        proxy_dict["password"] = self.proxy_pe_pass
-                    print(f"  [Proxy] Usando proxy de PERÚ para el navegador headed: {self.proxy_pe_server}")
-                
-                launch_kwargs = {
-                    "user_data_dir": str(self.main_profile),
-                    "headless": False,  # Siempre headed en esta transición
-                    "args": launch_args,
-                    "ignore_default_args": ["--enable-automation"],
-                    "viewport": {"width": 1280, "height": 800},
-                    "locale": "es-ES",
-                    "proxy": proxy_dict
-                }
-                if not proxy_dict:
-                    launch_kwargs["channel"] = "chrome"
-                
-                self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
-                self.context.set_default_navigation_timeout(45000)
-                self.context.set_default_timeout(35000)
-                self.registrar_contador_datos(self.context)
-                self.context.add_init_script(STEALTH_SCRIPT)
-                self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-                self.page.client_email = self.client_email
-                self.page.manager = self
-                
+        # Re-levantar el navegador principal en modo visual usando asegurar_navegador_abierto
+        print("  [Modo Headless] Levantando navegador headed...")
+        try:
+            self.asegurar_navegador_abierto()
+            if self.page and not self.page.is_closed():
                 if current_url and current_url.startswith("http"):
                     try:
                         self.page.goto(current_url, wait_until="domcontentloaded", timeout=25000)
                         time.sleep(2.0)
                     except Exception:
-                        pass  # No es crítico si la navegación falla
-                
-                print(f"  [Modo Headless] Navegador headed abierto correctamente (intento {intento}/3).")
-                return
-                
-            except Exception as e:
-                last_error = e
-                print(f"  [Modo Headless] [WARN] Intento {intento}/3 de levantar navegador headed falló: {e}")
-                # Limpiar antes de reintentar
-                try:
-                    if self.context:
-                        self.context.close()
-                except Exception:
-                    pass
-                try:
-                    if self.playwright:
-                        self.playwright.stop()
-                except Exception:
-                    pass
-                self.context = None
-                self.page = None
-                self.playwright = None
-                time.sleep(3.0)
-        
-        # Si llegamos aquí, ningún intento funcionó
-        print(f"  [Modo Headless] [ERROR] No se pudo abrir el navegador headed tras 3 intentos. Último error: {last_error}")
-        raise RuntimeError(f"No se pudo transicionar a modo visual: {last_error}")
+                        pass
+                print("  [Modo Headless] Navegador headed abierto correctamente.")
+        except Exception as e:
+            print(f"  [Modo Headless] [ERROR] No se pudo abrir el navegador headed: {e}")
+            raise RuntimeError(f"No se pudo transicionar a modo visual: {e}")
 
     def input_concurrente(self, prompt):
         self.forzar_modo_visual()
