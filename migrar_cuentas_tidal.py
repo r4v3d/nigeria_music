@@ -1559,6 +1559,16 @@ class TidalMigrationManager:
         # Rotar el proxy (esto cierra el contexto y llama a asegurar_navegador_abierto)
         self.rotar_proxy_contexto(tipo=tipo)
         
+        # Limpiar cookies de Tidal para evitar propagar el bloqueo de la IP/sesión anterior
+        try:
+            if self.context:
+                print("  [Auto-Proxy] Limpiando cookies antiguas de Tidal...")
+                self.context.clear_cookies(domain="tidal.com")
+                self.context.clear_cookies(domain="login.tidal.com")
+                self.context.clear_cookies(domain="account.tidal.com")
+        except Exception:
+            pass
+            
         # Re-navegar a la URL original con el nuevo proxy
         if current_url and current_url.startswith("http"):
             print(f"  [Auto-Proxy] Recargando página con el nuevo proxy en: {current_url}")
@@ -3330,7 +3340,7 @@ class TidalMigrationManager:
             else:
                 if codigo.startswith("http"):
                     reg_page = self.context.new_page()
-                    reg_page.goto("https://login.tidal.com/", wait_until="domcontentloaded", timeout=12000)
+                    reg_page.goto(codigo)
                     time.sleep(4.0)
                     reg_page.close()
                     
