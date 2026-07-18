@@ -1601,17 +1601,19 @@ class TidalMigrationManager:
 
             print(f"\n>>> Iniciando navegador principal con perfil: {actual_profile} (batch_mode={self.batch_mode})...")
 
-            self.context = p.chromium.launch_persistent_context(
-                user_data_dir=str(actual_profile),
-                channel="chrome",
-                headless=self.headless,
-                user_agent=NORMAL_USER_AGENT,
-                args=launch_args,
-                ignore_default_args=["--enable-automation"],
-                viewport={"width": 1280, "height": 800},
-                locale="es-ES",
-                proxy=proxy_dict
-            )
+            launch_kwargs = {
+                "user_data_dir": str(actual_profile),
+                "channel": "chrome",
+                "headless": self.headless,
+                "args": launch_args,
+                "ignore_default_args": ["--enable-automation"],
+                "viewport": {"width": 1280, "height": 800},
+                "locale": "es-ES",
+                "proxy": proxy_dict
+            }
+            if self.headless:
+                launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+            self.context = p.chromium.launch_persistent_context(**launch_kwargs)
             self.context.set_default_navigation_timeout(45000)
             self.context.set_default_timeout(35000)
             
@@ -3001,17 +3003,19 @@ class TidalMigrationManager:
                 proxy_dict["password"] = self.proxy_ng_pass
             print(f"  [Proxy] Usando proxy de NIGERIA: {self.proxy_ng_server}")
             
-        self.context = self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.main_profile),
-            channel="chrome",
-            headless=self.headless,
-            user_agent=NORMAL_USER_AGENT,
-            args=launch_args,
-            ignore_default_args=["--enable-automation"],
-            viewport={"width": 1280, "height": 800},
-            locale="es-ES",
-            proxy=proxy_dict
-        )
+        launch_kwargs = {
+            "user_data_dir": str(self.main_profile),
+            "channel": "chrome",
+            "headless": self.headless,
+            "args": launch_args,
+            "ignore_default_args": ["--enable-automation"],
+            "viewport": {"width": 1280, "height": 800},
+            "locale": "es-ES",
+            "proxy": proxy_dict
+        }
+        if self.headless:
+            launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+        self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         self.context.set_default_navigation_timeout(45000)
         self.context.set_default_timeout(35000)
         self.registrar_contador_datos(self.context)
@@ -3336,17 +3340,19 @@ class TidalMigrationManager:
                 proxy_dict["password"] = self.proxy_pe_pass
             print(f"  [Proxy] Usando proxy de PERÚ para el navegador: {self.proxy_pe_server}")
             
-        self.context = self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.main_profile),
-            channel="chrome",
-            headless=self.headless,
-            user_agent=NORMAL_USER_AGENT,
-            args=launch_args,
-            ignore_default_args=["--enable-automation"],
-            viewport={"width": 1280, "height": 800},
-            locale="es-ES",
-            proxy=proxy_dict
-        )
+        launch_kwargs = {
+            "user_data_dir": str(self.main_profile),
+            "channel": "chrome",
+            "headless": self.headless,
+            "args": launch_args,
+            "ignore_default_args": ["--enable-automation"],
+            "viewport": {"width": 1280, "height": 800},
+            "locale": "es-ES",
+            "proxy": proxy_dict
+        }
+        if self.headless:
+            launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+        self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         self.context.set_default_navigation_timeout(45000)
         self.context.set_default_timeout(35000)
         self.registrar_contador_datos(self.context)
@@ -3705,12 +3711,14 @@ class TidalMigrationManager:
                 if self.proxy_pe_pass:
                     proxy_dict["password"] = self.proxy_pe_pass
             
-            temp_context = self.context.browser.new_context(
-                viewport={"width": 1280, "height": 800}, 
-                locale="es-ES",
-                user_agent=NORMAL_USER_AGENT,
-                proxy=proxy_dict
-            )
+            context_kwargs = {
+                "viewport": {"width": 1280, "height": 800}, 
+                "locale": "es-ES",
+                "proxy": proxy_dict
+            }
+            if self.headless:
+                context_kwargs["user_agent"] = NORMAL_USER_AGENT
+            temp_context = self.context.browser.new_context(**context_kwargs)
             temp_context.set_default_navigation_timeout(45000)
             temp_context.set_default_timeout(35000)
             self.registrar_contador_datos(temp_context)
@@ -4117,17 +4125,19 @@ class TidalMigrationManager:
                                 proxy_dict["password"] = self.proxy_pe_pass
 
                         print(f"  [Paso 9] Iniciando navegador familiar titular (Intento {intento_conexion}/3)...")
-                        parent_context = p.chromium.launch_persistent_context(
-                            user_data_dir=str(self.parent_profile),
-                            channel="chrome",
-                            headless=self.headless,
-                            user_agent=NORMAL_USER_AGENT,
-                            args=launch_args,
-                            ignore_default_args=["--enable-automation"],
-                            viewport={"width": 1280, "height": 800},
-                            locale="es-ES",
-                            proxy=proxy_dict
-                        )
+                        launch_kwargs = {
+                            "user_data_dir": str(self.parent_profile),
+                            "channel": "chrome",
+                            "headless": self.headless,
+                            "args": launch_args,
+                            "ignore_default_args": ["--enable-automation"],
+                            "viewport": {"width": 1280, "height": 800},
+                            "locale": "es-ES",
+                            "proxy": proxy_dict
+                        }
+                        if self.headless:
+                            launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+                        parent_context = p.chromium.launch_persistent_context(**launch_kwargs)
                         parent_context.set_default_navigation_timeout(45000)
                         parent_context.set_default_timeout(35000)
                         self.registrar_contador_datos(parent_context)
