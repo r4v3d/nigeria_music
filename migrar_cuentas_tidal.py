@@ -1547,7 +1547,7 @@ class TidalMigrationManager:
         # Guardar URL actual
         current_url = "https://account.tidal.com/"
         try:
-            if self.page:
+            if self.page and not self.page.is_closed():
                 current_url = self.page.url
         except Exception:
             pass
@@ -1559,19 +1559,79 @@ class TidalMigrationManager:
         try:
             if self.context:
                 self.context.close()
-                time.sleep(3.0)
         except Exception:
             pass
-            
-        # Re-levantar el navegador principal en modo visual
-        print("  [Modo Headless] Levantando navegador headed...")
+        self.context = None
+        self.page = None
+        
+        # Esperar a que el proceso de Chrome termine y limpiar archivos de lock del perfil
+        # El exitCode=2147483651 ocurre cuando Chrome intenta abrir un perfil aún bloqueado
+        import subprocess as _sp
         try:
-            self.asegurar_navegador_abierto()
-            if current_url and current_url.startswith("http"):
-                self.page.goto(current_url, wait_until="domcontentloaded", timeout=25000)
-                time.sleep(2.0)
-        except Exception as e:
-            print(f"  [Modo Headless] [WARN] Error al levantar navegador headed o navegar: {e}")
+            # Matar cualquier proceso de Chrome/Chromium huérfano que siga usando el perfil
+            profile_str = str(self.main_profile)
+            _sp.run(
+                ["taskkill", "/F", "/IM", "chrome.exe"],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
+        time.sleep(2.0)
+        
+        # Limpiar los archivos Singleton que bloquean el perfil
+        import glob
+        profile_path = Path(self.main_profile)
+        for lock_file in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+            lock_path = profile_path / lock_file
+            try:
+                if lock_path.exists():
+                    lock_path.unlink()
+                    print(f"  [Modo Headless] Eliminado archivo de bloqueo: {lock_file}")
+            except Exception:
+                pass
+        # También limpiar el lockfile en subdirectorios comunes
+        for pattern in [str(profile_path / "**" / "SingletonLock"), str(profile_path / "**" / "lockfile")]:
+            for f in glob.glob(pattern, recursive=True):
+                try:
+                    Path(f).unlink()
+                except Exception:
+                    pass
+        
+        time.sleep(1.0)
+        
+        # Re-levantar el navegador principal en modo visual con reintentos
+        print("  [Modo Headless] Levantando navegador headed...")
+        last_error = None
+        for intento in range(1, 4):
+            try:
+                self.asegurar_navegador_abierto()
+                if self.page and not self.page.is_closed():
+                    self.page.client_email = self.client_email
+                    self.page.manager = self
+                    if current_url and current_url.startswith("http"):
+                        try:
+                            self.page.goto(current_url, wait_until="domcontentloaded", timeout=25000)
+                            time.sleep(2.0)
+                        except Exception:
+                            pass  # No es crítico si la navegación falla, lo importante es tener el browser abierto
+                    print(f"  [Modo Headless] Navegador headed abierto correctamente (intento {intento}/3).")
+                    return
+            except Exception as e:
+                last_error = e
+                print(f"  [Modo Headless] [WARN] Intento {intento}/3 de levantar navegador headed falló: {e}")
+                # Limpiar antes de reintentar
+                try:
+                    if self.context:
+                        self.context.close()
+                except Exception:
+                    pass
+                self.context = None
+                self.page = None
+                time.sleep(3.0)
+        
+        # Si llegamos aquí, ningún intento funcionó
+        print(f"  [Modo Headless] [ERROR] No se pudo abrir el navegador headed tras 3 intentos. Último error: {last_error}")
+        raise RuntimeError(f"No se pudo transicionar a modo visual: {last_error}")
 
     def input_concurrente(self, prompt):
         self.forzar_modo_visual()
@@ -3462,6 +3522,7 @@ class TidalMigrationManager:
         self.registrar_contador_datos(self.context)
         self.context.add_init_script(STEALTH_SCRIPT)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        self.page.client_email = self.client_email
         self.page.manager = self
         self.page.bring_to_front()
 
@@ -3472,11 +3533,34 @@ class TidalMigrationManager:
         try:
             if self.context:
                 self.context.close()
-                time.sleep(3.0)
         except Exception:
             pass
         self.context = None
         self.page = None
+        
+        # Limpiar procesos Chrome residuales y archivos de bloqueo del perfil
+        import subprocess as _sp
+        try:
+            _sp.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True, timeout=5)
+        except Exception:
+            pass
+        time.sleep(2.0)
+        
+        import glob
+        profile_path = Path(self.main_profile)
+        for lock_file in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+            lock_path = profile_path / lock_file
+            try:
+                if lock_path.exists():
+                    lock_path.unlink()
+            except Exception:
+                pass
+        for pattern in [str(profile_path / "**" / "SingletonLock"), str(profile_path / "**" / "lockfile")]:
+            for f in glob.glob(pattern, recursive=True):
+                try:
+                    Path(f).unlink()
+                except Exception:
+                    pass
         
         if tipo == "PE":
             if valid_pe_list:
