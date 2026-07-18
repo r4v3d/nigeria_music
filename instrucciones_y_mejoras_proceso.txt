@@ -1,0 +1,150 @@
+================================================================================
+GUÍA DETALLADA DEL PROCESO DE MIGRACIÓN DE CUENTAS TIDAL (NIGERIA) Y MEJORAS
+================================================================================
+
+Este documento describe a detalle técnico el flujo de 11 pasos del script 
+'migrar_cuentas_tidal.py', las configuraciones utilizadas y las oportunidades 
+de mejora y corrección identificadas en la arquitectura actual.
+
+--------------------------------------------------------------------------------
+1. ARQUITECTURA Y ARCHIVOS DE CONFIGURACIÓN
+--------------------------------------------------------------------------------
+
+El script utiliza los siguientes archivos locales para operar:
+* cuentas.txt: Contiene la lista de clientes a migrar con formato:
+  correo, contrasena_actual, nueva_contrasena
+* passwords.txt: Almacena credenciales críticas del sistema, principalmente 
+  los correos de Gmail reales junto con sus 'App Passwords' de Google para la 
+  conexión automática por IMAP.
+* titular_familiar.txt: Registra la cuenta titular del plan familiar de Nigeria,
+  la cantidad de miembros actuales y su disponibilidad.
+* proxies.txt / lista_proxies_pe.txt / lista_proxies_ng.txt: Listas de proxies
+  residenciales/datacenter para Perú (PE) y Nigeria (NG) que evitan bloqueos 
+  por geolocalización.
+* perfiles/ (Carpeta): Contiene los perfiles de Chrome principales que se copian
+  a carpetas temporales de forma dinámica para evitar bloqueos por uso concurrente
+  de base de datos de Chrome en Windows.
+
+--------------------------------------------------------------------------------
+2. DETALLE DE LOS 11 PASOS DEL PROCESO DE MIGRACIÓN
+--------------------------------------------------------------------------------
+
+[PASO 1] Iniciar sesión en la cuenta Tidal del cliente (Perú)
+* Objetivo: Validar las credenciales actuales del cliente y preparar la sesión.
+* Acción del robot: Inicia Chrome con un perfil local limpio de cookies de Tidal.
+  Navega a Tidal, comprueba si hay sesión previa, la cierra si es incorrecta,
+  e ingresa el correo y la contraseña actual del cliente.
+
+[PASO 2] Cambiar correo a cakeseller1234 con puntos aleatorios
+* Objetivo: Liberar el correo original del cliente para poder registrar una 
+  nueva cuenta en Nigeria con ese mismo correo.
+* Acción del robot: Cambia el correo de la cuenta vieja del cliente a una 
+  variación con puntos de 'cakeseller1234@gmail.com' (ej: c.a.k.e.seller1234@gmail.com).
+  Para confirmar el cambio, el robot lee automáticamente el código de verificación
+  enviado a Gmail a través de una conexión IMAP segura en segundo plano.
+
+[PASOS 3 & 4] Exportando playlists a CSV vía TuneMyMusic
+* Objetivo: Guardar la biblioteca musical del cliente localmente.
+* Acción del robot: Carga la sesión activa de Tidal, navega a TuneMyMusic (TMM),
+  selecciona Tidal como origen, lee las playlists y canciones, y las exporta 
+  a un archivo CSV temporal dentro de la carpeta 'descargas/'.
+* Sincronización: Este paso utiliza un bloqueo exclusivo de sistema operativo
+  (SystemLock) para evitar que varios hilos interactúen con TMM al mismo tiempo
+  y evitar colisiones de cookies.
+
+[PASO 5] Eliminando la cuenta Tidal del cliente
+* Objetivo: Borrar de forma definitiva la cuenta antigua (que ahora tiene el 
+  correo temporal c.a.k.e.seller...) para que el correo original del cliente 
+  deje de estar registrado en la base de datos global de Tidal.
+* Acción del robot: Navega a la página de eliminación de cuenta de Tidal, 
+  completa el formulario de confirmación, espera el código de eliminación 
+  vía IMAP en 'cakeseller1234@gmail.com', lo ingresa y confirma la eliminación.
+
+[PASO 6] Creando nueva cuenta Tidal del cliente (Nigeria)
+* Objetivo: Registrar al cliente en la región de Nigeria para pagar tarifas bajas.
+* Acción del robot: Lanza un navegador configurado con un proxy residencial de 
+  Nigeria. Navega al registro de Tidal e inscribe al cliente con su correo 
+  original (ahora libre) y una fecha de nacimiento por defecto.
+  Espera el código de verificación del nuevo registro vía IMAP, lo rellena 
+  y asegura que la cuenta esté creada exitosamente.
+
+[PASO 7] Transfiriendo música del CSV a la nueva cuenta Tidal
+* Objetivo: Importar la música respaldada a la nueva cuenta de Nigeria.
+* Acción del robot: Abre TMM en el navegador principal, sube el archivo CSV 
+  del Paso 3, selecciona Tidal como destino, inicia sesión en la nueva cuenta 
+  creada y completa la transferencia de playlists.
+
+[PASO 8] Solicitando restablecimiento de contraseña para la nueva cuenta
+* Objetivo: Disparar el flujo para definir la nueva contraseña final.
+* Acción del robot: Navega a la página de restablecimiento de contraseña de 
+  Tidal, ingresa el correo del cliente y solicita el enlace de reset.
+
+[PASO 9] Creando invitación familiar en la cuenta del titular
+* Objetivo: Vincular la nueva cuenta del cliente al plan familiar de Nigeria.
+* Acción del robot: Abre el perfil de la cuenta titular (familiar), navega a 
+  la administración de miembros e ingresa el correo del cliente para enviarle 
+  la invitación.
+
+[PASO 10] Buscando enlace de reinicio de contraseña y cambiando contraseña
+* Objetivo: Configurar la contraseña final ('nueva_contrasena') provista.
+* Acción del robot: Busca vía IMAP el correo con el enlace de restablecimiento.
+  (Nota: Gracias al cambio de hoy, esta búsqueda ahora es estrictamente sensible 
+  a los puntos del alias para que no colisionen hilos paralelos). Abre el enlace,
+  digita y guarda la nueva contraseña.
+
+[PASO 11] Aceptando invitación familiar en el correo del cliente
+* Objetivo: Completar la migración agregando formalmente la cuenta al plan familiar.
+* Acción del robot: Busca vía IMAP el correo de invitación familiar de Tidal 
+  con el enlace 'Join Family'. Abre el enlace en el navegador, inicia sesión 
+  con la cuenta recién configurada y acepta unirse al grupo familiar.
+
+--------------------------------------------------------------------------------
+3. MEJORAS Y CAMBIOS DETECTADOS (PUNTOS A MEJORAR O CORREGIR)
+--------------------------------------------------------------------------------
+
+A partir de la revisión técnica del script, se han identificado las siguientes 
+áreas de mejora cruciales para aumentar la estabilidad y evitar cuelgues:
+
+1. Corrección de Bloqueos Infinitos por Error (Deadlock en Barreras)
+   * Diagnóstico: El script define barreras (`threading.Barrier`) para sincronizar 
+     los hilos. También define un método `abort_all_barriers()`. Sin embargo, 
+     este método NUNCA se manda a llamar cuando un hilo falla. Si un hilo tiene 
+     un error y aborta en medio de un paso, los demás hilos se quedarán esperando 
+     indefinidamente en `barrier.wait()` y el programa se colgará (deadlock).
+   * Solución: Modificar `registrar_error_y_abortar` para que llame a 
+     `self.abort_all_barriers()`. De esta forma, si un hilo falla, se romperán 
+     las barreras de forma controlada y los demás hilos lanzarán un error 
+     `BrokenBarrierError` en lugar de quedarse congelados.
+
+2. Automatización de Resumabilidad de Estado
+   * Diagnóstico: Si la migración falla en el paso 7, el usuario debe ejecutar 
+     manualmente el script usando el parámetro `--start-step 7`. En ejecuciones
+     concurrentes masivas esto es confuso.
+   * Solución: Implementar un archivo JSON de estado (ej: `estado_progreso.json`) 
+     donde se guarde en tiempo real el último paso exitoso completado por cada 
+     cuenta. Al reanudar el script, este debería leer el archivo y continuar 
+     automáticamente cada cuenta desde donde se quedó.
+
+3. Detección Inteligente de Bloqueos de Proxy/Cloudflare (DataDome)
+   * Diagnóstico: Tidal utiliza DataDome para detectar bots. Si un proxy es 
+     marcado, la carga de la página se detiene o pide un captcha imposible.
+   * Solución: Integrar un servicio de resolución de captchas automático 
+     (como 2Captcha o CapSolver) o mejorar la detección de páginas bloqueadas 
+     para rotar el proxy de forma agresiva de inmediato sin esperar a que 
+     termine el timeout de 30 segundos.
+
+4. Limpieza de Archivos Temporales Residuales
+   * Diagnóstico: Si el script se interrumpe de golpe (ej. Ctrl+C), las carpetas 
+     temporales de perfiles de Chrome (`temp_profile_*`) se quedan en el disco 
+     duro ocupando bastante espacio.
+   * Solución: Añadir un manejador de señales (`signal` en Python) para interceptar 
+     la salida forzada del programa y ejecutar un método de limpieza general que 
+     elimine todos los directorios temporales creados en esa ejecución.
+
+5. Optimización del Uso de Memoria (Playwright Headless)
+   * Diagnóstico: Correr 5 navegadores en modo no-headless consume bastante 
+     memoria RAM en computadoras de recursos medios.
+   * Solución: Probar y configurar una bandera para correr en modo `headless` 
+     (segundo plano) siempre que sea posible, habilitando el modo visual solo 
+     cuando se detecte un problema que requiera intervención.
+================================================================================
