@@ -46,6 +46,7 @@ progreso_lock = threading.Lock()
 family_invite_queue = []
 BATCH_MODE = False
 BATCH_MODE_VPN = False
+NORMAL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 barrier_step1 = None
 barrier_step2 = None
 barrier_step3_4 = None
@@ -1604,6 +1605,7 @@ class TidalMigrationManager:
                 user_data_dir=str(actual_profile),
                 channel="chrome",
                 headless=self.headless,
+                user_agent=NORMAL_USER_AGENT,
                 args=launch_args,
                 ignore_default_args=["--enable-automation"],
                 viewport={"width": 1280, "height": 800},
@@ -3003,6 +3005,7 @@ class TidalMigrationManager:
             user_data_dir=str(self.main_profile),
             channel="chrome",
             headless=self.headless,
+            user_agent=NORMAL_USER_AGENT,
             args=launch_args,
             ignore_default_args=["--enable-automation"],
             viewport={"width": 1280, "height": 800},
@@ -3337,6 +3340,7 @@ class TidalMigrationManager:
             user_data_dir=str(self.main_profile),
             channel="chrome",
             headless=self.headless,
+            user_agent=NORMAL_USER_AGENT,
             args=launch_args,
             ignore_default_args=["--enable-automation"],
             viewport={"width": 1280, "height": 800},
@@ -3701,17 +3705,10 @@ class TidalMigrationManager:
                 if self.proxy_pe_pass:
                     proxy_dict["password"] = self.proxy_pe_pass
             
-            # Obtener el User Agent real del navegador principal
-            user_agent = None
-            try:
-                user_agent = self.page.evaluate("navigator.userAgent")
-            except Exception:
-                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-
             temp_context = self.context.browser.new_context(
                 viewport={"width": 1280, "height": 800}, 
                 locale="es-ES",
-                user_agent=user_agent,
+                user_agent=NORMAL_USER_AGENT,
                 proxy=proxy_dict
             )
             temp_context.set_default_navigation_timeout(45000)
@@ -4124,6 +4121,7 @@ class TidalMigrationManager:
                             user_data_dir=str(self.parent_profile),
                             channel="chrome",
                             headless=self.headless,
+                            user_agent=NORMAL_USER_AGENT,
                             args=launch_args,
                             ignore_default_args=["--enable-automation"],
                             viewport={"width": 1280, "height": 800},
