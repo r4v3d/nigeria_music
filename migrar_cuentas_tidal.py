@@ -1475,9 +1475,7 @@ class TidalMigrationManager:
                 pass
         context.on("requestfinished", on_request_finished)
 
-    def optimizar_pagina(self, page, es_tmm=False):
-        """Desactivado por completo para evitar bloqueos y fallas de carga en los flujos de Tidal y TuneMyMusic."""
-        return
+
 
     def abort_all_barriers(self):
         global barrier_step1, barrier_step2, barrier_step3_4, barrier_step5, barrier_step6, barrier_step7, barrier_step8, barrier_step9, barrier_step10
@@ -1494,6 +1492,7 @@ class TidalMigrationManager:
             print(f"  [ERROR] {paso_nombre} falló para {self.client_email}: {exception}")
             self.cuenta_abortada = True
             self.abort_reason = f"Error en {paso_nombre}: {exception}"
+            self.abort_all_barriers()
             try:
                 self.context.close()
             except Exception:
@@ -1565,7 +1564,6 @@ class TidalMigrationManager:
             
             self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
             self.page.client_email = self.client_email
-            self.optimizar_pagina(self.page)
             self.page.bring_to_front()
             
             try:
@@ -1929,13 +1927,7 @@ class TidalMigrationManager:
                             const elms = document.querySelectorAll('button, a, [role="button"], div, span');
                             const isVisible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
                             for (const el of elms) {
-                                const text = (el.textContent || '').trim().toLowerCase();
-                                if (isVisible(el) && keywords.some(kw => text.includes(kw))) {
-                                    const opts = { bubbles: true, cancelable: true, view: window };
-                                    el.dispatchEvent(new PointerEvent('pointerdown', opts));
-                                    el.dispatchEvent(new MouseEvent('mousedown', opts));
-                                    el.dispatchEvent(new PointerEvent('pointerup', opts));
-                                    el.dispatchEvent(new MouseEvent('mouseup', opts));
+                                if (isVisible(el) && keywords.some(kw => (el.textContent || '').trim().toLowerCase().includes(kw))) {
                                     el.click();
                                     return true;
                                 }
@@ -2201,7 +2193,6 @@ class TidalMigrationManager:
         tmm_lock.acquire()
         print("  [TuneMyMusic] Bloqueo global adquirido. Iniciando...")
         tmm_page = self.page
-        self.optimizar_pagina(tmm_page, es_tmm=True)
         try:
             # No borramos las cookies de tunemymusic.com para mantener la sesión de usuario iniciada
                 
@@ -2936,7 +2927,6 @@ class TidalMigrationManager:
         self.context.add_init_script(STEALTH_SCRIPT)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.client_email = self.client_email
-        self.optimizar_pagina(self.page)
         self.page.bring_to_front()
         print("=" * 70 + "\n")
         
@@ -3119,12 +3109,12 @@ class TidalMigrationManager:
         """)
         time.sleep(1.0)
         
-        # Obtener el ID de correo mas reciente justo ANTES de gatillar el envio del codigo al presionar Suscribete
+        # Obtener el ID de correo mas reciente justo ANTES de gatillar el envio del código al presionar Suscribete
         max_id_previo = obtener_max_email_id(self.client_email)
         print(f"  [Paso 6] ID de correo de Tidal mas reciente antes de gatillar: {max_id_previo}")
         
         # Presionar el botón "Suscríbete" para disparar el código de verificación
-        print("  [Paso 6] Pulsando boton 'Suscribete' para gatillar el envio del codigo...")
+        print("  [Paso 6] Pulsando boton 'Suscríbete' para gatillar el envio del codigo...")
         btn_subscribe_clicked = self.page.evaluate("""
             () => {
                 const btn = document.querySelector('button[type="submit"]') || 
@@ -3201,8 +3191,7 @@ class TidalMigrationManager:
             else:
                 if codigo.startswith("http"):
                     reg_page = self.context.new_page()
-                    self.optimizar_pagina(reg_page)
-                    reg_page.goto(codigo)
+                    reg_page.goto("https://login.tidal.com/", wait_until="domcontentloaded", timeout=12000)
                     time.sleep(4.0)
                     reg_page.close()
                     
@@ -3270,7 +3259,6 @@ class TidalMigrationManager:
         self.registrar_contador_datos(self.context)
         self.context.add_init_script(STEALTH_SCRIPT)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-        self.optimizar_pagina(self.page)
         self.page.bring_to_front()
 
     def rotar_proxy_contexto(self, tipo="PE"):
@@ -3370,6 +3358,8 @@ class TidalMigrationManager:
                     btn_pwd_mode = esperar_locator_en_frames(
                         self.page,
                         ["a:has-text('contraseña')", "button:has-text('contraseña')",
+                         "a:has-text('código')", "button:has-text('código')",
+                         "a:has-text('code')", "button:has-text('code')",
                          "a:has-text('password')", "button:has-text('password')",
                          "text='Inicia sesión con contraseña'", "text='Sign in with password'"],
                         text_regex=re.compile(r"con contrase|with password|iniciar.*contrase|sign.*password", re.I),
@@ -3463,7 +3453,6 @@ class TidalMigrationManager:
         except Exception as e:
             print(f"  [Paso 7] [WARN] No se pudo realizar el inicio de sesión automático previo: {e}. Se intentará continuar...")
         tmm_page = self.page
-        self.optimizar_pagina(tmm_page, es_tmm=True)
         try:
             # Cancelar de forma proactiva cualquier redirección o navegación en segundo plano 
             # de Tidal que haya quedado pendiente (evita el error de navegación interrumpida)
@@ -3641,36 +3630,17 @@ class TidalMigrationManager:
             temp_context.add_init_script(STEALTH_SCRIPT)
             temp_page = temp_context.new_page()
             temp_page.client_email = self.client_email
-            self.optimizar_pagina(temp_page)
             try:
                 # Inicializar cookies de Datadome y sesión base
                 print("  [Paso 8] Inicializando sesión base de Tidal para evitar sospechas de Datadome...")
-                for intento_base in range(1, 4):
-                    try:
-                        temp_page.goto("https://account.tidal.com/", wait_until="domcontentloaded", timeout=30000)
-                        time.sleep(2.0)
-                        aceptar_cookies_con_espera(temp_page)
-                        break
-                    except Exception as e:
-                        print(f"  [Paso 8] [WARN] Intento {intento_base}/3 falló cargando base de Tidal: {e}")
-                        if intento_base == 3:
-                            pass
-                        else:
-                            time.sleep(3.0)
+                temp_page.goto("https://account.tidal.com/", wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2.0)
+                aceptar_cookies_con_espera(temp_page)
                 
                 print("  [Paso 8] Navegando a la página de restablecimiento de contraseña...")
-                for intento_reset in range(1, 4):
-                    try:
-                        temp_page.goto("https://login.tidal.com/resetpass", wait_until="domcontentloaded", timeout=30000)
-                        time.sleep(2.0)
-                        aceptar_cookies_con_espera(temp_page)
-                        break
-                    except Exception as e:
-                        print(f"  [Paso 8] [WARN] Intento {intento_reset}/3 falló cargando resetpass: {e}")
-                        if intento_reset == 3:
-                            raise e
-                        else:
-                            time.sleep(3.0)
+                temp_page.goto("https://login.tidal.com/resetpass", wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2.0)
+                aceptar_cookies_con_espera(temp_page)
                 
                 manejar_bloqueos_e_intervencion(temp_page, "Restablecer Contraseña (Carga)")
                 
@@ -3698,24 +3668,10 @@ class TidalMigrationManager:
                     raise RuntimeError("No se encontró el botón 'Continuar' en resetpass.")
                 
                 # Pulsar el botón Continuar de forma robusta
-                clicado_continue = False
-                for intento_cont in range(1, 3):
-                    try:
-                        btn_continue.evaluate("el => el.click()")
-                    except Exception:
-                        try:
-                            btn_continue.click(force=True, timeout=3000)
-                        except Exception:
-                            pass
-                    time.sleep(2.0)
-                    # Si el botón ya no está visible o cambió la página, parar
-                    try:
-                        if not btn_continue.is_visible():
-                            clicado_continue = True
-                            break
-                    except Exception:
-                        clicado_continue = True
-                        break
+                try:
+                    btn_continue.evaluate("el => el.click()")
+                except Exception:
+                    btn_continue.click(force=True, timeout=3000)
                 
                 manejar_bloqueos_e_intervencion(temp_page, "Restablecer Contraseña (Envío)")
                 time.sleep(3.0)
@@ -4088,7 +4044,6 @@ class TidalMigrationManager:
                         self.registrar_contador_datos(parent_context)
                         
                         parent_page = parent_context.pages[0] if parent_context.pages else parent_context.new_page()
-                        self.optimizar_pagina(parent_page)
                         
                         # 3. Comprobar si ya está logueado en la cuenta titular seleccionada
                         email_activo = self.obtener_email_logueado_tidal(parent_page)
@@ -4226,7 +4181,7 @@ class TidalMigrationManager:
         print("\n--- PASO 10: Buscando enlace de reinicio de contraseña y cambiando contraseña ---")
         
         enlace_reset = None
-        max_reintentos_solicitud = 3
+        max_reintentos_solicitud = 1
         
         for intento_solicitud in range(1, max_reintentos_solicitud + 1):
             print(f"  [Paso 10] Esperando enlace de reinicio en el correo (intento de espera {intento_solicitud}/{max_reintentos_solicitud})...")
@@ -4270,7 +4225,6 @@ class TidalMigrationManager:
             
         if enlace_reset:
             reset_page = self.context.new_page()
-            self.optimizar_pagina(reset_page)
             reset_page.goto(enlace_reset, wait_until="domcontentloaded")
             time.sleep(3.0)
             
