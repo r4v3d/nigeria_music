@@ -249,6 +249,66 @@ STEALTH_SCRIPT = """
 """
 
 # Coordenadas y selectores para captcha de arrastre (DataDome)
+
+def reparar_perfil_corrupto(profile_dir):
+    """Repara un perfil de Chrome corrupto eliminando los archivos de estado que causan crash.
+    
+    Cuando Chrome crashea (exitCode=2147483651), el perfil queda con archivos de estado
+    corruptos que impiden volver a abrir el navegador sobre ese mismo directorio.
+    Esta función elimina SOLO los archivos problemáticos, preservando cookies y datos útiles.
+    """
+    import shutil
+    profile_path = Path(profile_dir)
+    if not profile_path.exists():
+        profile_path.mkdir(parents=True, exist_ok=True)
+        return
+    
+    # Archivos/directorios que pueden quedar corruptos tras un crash y causar exitCode=2147483651
+    archivos_problematicos = [
+        "SingletonLock", "SingletonCookie", "SingletonSocket",
+        "lockfile", "LOCK",
+        "DevToolsActivePort",
+        "BrowserMetrics", "BrowserMetrics-spare.pma",
+        "chrome_debug.log",
+        "Crashpad",  # directorio de crash reports
+        "ShaderCache",  # cache de GPU que puede quedar corrupto
+        "GPUCache",
+        "GrShaderCache",
+        "GraphiteDawnCache",
+    ]
+    
+    reparados = 0
+    for nombre in archivos_problematicos:
+        target = profile_path / nombre
+        try:
+            if target.is_file():
+                target.unlink()
+                reparados += 1
+            elif target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+                reparados += 1
+        except Exception:
+            pass
+    
+    # También limpiar en subdirectorios Default, Profile 1, etc.
+    for subdir in profile_path.iterdir():
+        if subdir.is_dir() and (subdir.name.startswith("Default") or subdir.name.startswith("Profile")):
+            for nombre in ["LOCK", "lockfile", "CURRENT"]:
+                target = subdir / nombre
+                try:
+                    # CURRENT es necesario para LevelDB; solo borrar LOCK y lockfile
+                    if nombre != "CURRENT" and target.exists():
+                        target.unlink()
+                        reparados += 1
+                except Exception:
+                    pass
+    
+    if reparados > 0:
+        print(f"  [Perfil] Reparados {reparados} archivos corruptos en {profile_path.name}")
+    else:
+        print(f"  [Perfil] Perfil {profile_path.name} parece limpio, no se encontraron archivos corruptos")
+
+
 def resolver_slider_captcha_playwright(page) -> bool:
     """Intenta resolver el slider captcha en Playwright usando simulación humana."""
     try:
@@ -1576,7 +1636,7 @@ class TidalMigrationManager:
         except Exception:
             pass
         
-        # Matar procesos Chrome huérfanos y limpiar locks del perfil
+        # Matar procesos Chrome huérfanos y limpiar locks del perfil de forma profunda
         import subprocess as _sp
         try:
             _sp.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True, timeout=5)
@@ -1584,23 +1644,7 @@ class TidalMigrationManager:
             pass
         time.sleep(2.0)
         
-        import glob
-        profile_path = Path(self.main_profile)
-        for lock_file in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
-            lock_path = profile_path / lock_file
-            try:
-                if lock_path.exists():
-                    lock_path.unlink()
-                    print(f"  [Modo Headless] Eliminado archivo de bloqueo: {lock_file}")
-            except Exception:
-                pass
-        for pattern in [str(profile_path / "**" / "SingletonLock"), str(profile_path / "**" / "lockfile")]:
-            for f in glob.glob(pattern, recursive=True):
-                try:
-                    Path(f).unlink()
-                except Exception:
-                    pass
-        
+        reparar_perfil_corrupto(self.main_profile)
         time.sleep(1.0)
         
         # Crear una instancia NUEVA y FRESCA de Playwright y levantar el navegador headed
@@ -3573,7 +3617,13 @@ class TidalMigrationManager:
             launch_kwargs["channel"] = "chrome"
         if self.headless:
             launch_kwargs["user_agent"] = self.user_agent
-        self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        try:
+            self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as e:
+            print(f"  [Navegador] [WARN] Falló el lanzamiento inicial del navegador: {e}. Reparando perfil y reintentando...")
+            reparar_perfil_corrupto(self.main_profile)
+            time.sleep(2.0)
+            self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         self.context.set_default_navigation_timeout(45000)
         self.context.set_default_timeout(35000)
         self.registrar_contador_datos(self.context)
@@ -3602,22 +3652,7 @@ class TidalMigrationManager:
         except Exception:
             pass
         time.sleep(2.0)
-        
-        import glob
-        profile_path = Path(self.main_profile)
-        for lock_file in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
-            lock_path = profile_path / lock_file
-            try:
-                if lock_path.exists():
-                    lock_path.unlink()
-            except Exception:
-                pass
-        for pattern in [str(profile_path / "**" / "SingletonLock"), str(profile_path / "**" / "lockfile")]:
-            for f in glob.glob(pattern, recursive=True):
-                try:
-                    Path(f).unlink()
-                except Exception:
-                    pass
+        reparar_perfil_corrupto(self.main_profile)
         
         if tipo == "PE":
             if valid_pe_list:
