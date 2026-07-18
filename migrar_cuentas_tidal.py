@@ -47,6 +47,8 @@ family_invite_queue = []
 BATCH_MODE = False
 BATCH_MODE_VPN = False
 NORMAL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+valid_pe_list = []
+valid_ng_list = []
 barrier_step1 = None
 barrier_step2 = None
 barrier_step3_4 = None
@@ -342,7 +344,9 @@ def detectar_pantalla_antirobot(page) -> bool:
             "checking your browser", "comprobando si la conexión", "comprobando que la conexión",
             "access denied", "error code 1020", "ray id", "secure connection", "unusual activity",
             "bot detection", "please turn on javascript", "enable cookies",
-            "please enable JS", "enable JS", "disable any ad blocker", "ad blocker", "enable javascript"
+            "please enable JS", "enable JS", "disable any ad blocker", "ad blocker", "enable javascript",
+            "acceso está restringido", "acceso restringido", "restringido temporalmente",
+            "se encuentra en la misma red", "comportamiento del navegador nos ha intrigado"
         ]
         
         for frame in page.frames:
@@ -390,14 +394,24 @@ def manejar_bloqueos_e_intervencion(page, subtitulo: str = "") -> None:
     time.sleep(1.0)
     
     intentos_bucle = 0
+    rotaciones_realizadas = 0
     while detectar_pantalla_antirobot(page):
         intentos_bucle += 1
         print(f"\n[BLOQUEO DETECTADO] -> {subtitulo}")
         
-        # Si la página tiene un manager asociado y está en modo headless, forzar transición a visual
         manager = getattr(page, "manager", None)
-        if manager and getattr(manager, "headless", False):
-            manager.forzar_modo_visual()
+        if manager:
+            # 1. Si la página tiene un manager asociado y está en modo headless, forzar transición a visual
+            if getattr(manager, "headless", False):
+                manager.forzar_modo_visual()
+                
+            # 2. Si se usan proxies y no hemos excedido el límite de rotaciones en este bloqueo
+            if getattr(manager, "use_proxy", False) and rotaciones_realizadas < 3:
+                rotaciones_realizadas += 1
+                print(f"  [Auto-Proxy] [BLOQUEO] Rotación de proxy automática {rotaciones_realizadas}/3...")
+                manager.ejecutar_rotacion_proxy_y_recargar()
+                time.sleep(2.0)
+                continue
         
         # Intentar auto-resolver slider en el primer intento
         if intentos_bucle == 1:
@@ -1524,6 +1538,35 @@ class TidalMigrationManager:
     def input_concurrente(self, prompt):
         self.forzar_modo_visual()
         return input_concurrente(prompt, self.client_email)
+
+    def ejecutar_rotacion_proxy_y_recargar(self):
+        """Rotará la IP del proxy y volverá a cargar la página actual con la nueva IP."""
+        # Determinar si estamos usando el proxy de Nigeria o Perú en esta instancia
+        tipo = "PE"
+        if getattr(self, "proxy_ng_server", None) and self.start_step == 6:
+            tipo = "NG"
+            
+        print(f"\n  [Auto-Proxy] Bloqueo detectado en {self.client_email}. Rotando proxy de tipo {tipo}...")
+        
+        # Guardar URL actual
+        current_url = "https://account.tidal.com/"
+        try:
+            if self.page:
+                current_url = self.page.url
+        except Exception:
+            pass
+            
+        # Rotar el proxy (esto cierra el contexto y llama a asegurar_navegador_abierto)
+        self.rotar_proxy_contexto(tipo=tipo)
+        
+        # Re-navegar a la URL original con el nuevo proxy
+        if current_url and current_url.startswith("http"):
+            print(f"  [Auto-Proxy] Recargando página con el nuevo proxy en: {current_url}")
+            try:
+                self.page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2.0)
+            except Exception as e:
+                print(f"  [Auto-Proxy] [WARN] Error al recargar con la nueva IP: {e}")
 
     def registrar_contador_datos(self, context):
         """Registra un listener en el contexto para sumar los bytes transferidos de forma exacta."""
@@ -3363,6 +3406,7 @@ class TidalMigrationManager:
 
     def rotar_proxy_contexto(self, tipo="PE"):
         """Cierra el navegador actual, selecciona otro proxy de la lista y vuelve a abrirlo con el mismo perfil."""
+        global valid_pe_list, valid_ng_list
         print(f"\n  [Proxy Rotation] Rotando proxy de tipo {tipo} por uno nuevo debido a bloqueos...")
         try:
             if self.context:
@@ -3372,10 +3416,7 @@ class TidalMigrationManager:
         self.context = None
         self.page = None
         
-        import sys
-        main_module = sys.modules['__main__']
         if tipo == "PE":
-            valid_pe_list = getattr(main_module, 'valid_pe_list', [])
             if valid_pe_list:
                 import random
                 p_pe = random.choice(valid_pe_list)
@@ -3386,7 +3427,6 @@ class TidalMigrationManager:
             else:
                 print("  [Proxy Rotation] No hay más proxies PE disponibles.")
         else:
-            valid_ng_list = getattr(main_module, 'valid_ng_list', [])
             if valid_ng_list:
                 import random
                 p_ng = random.choice(valid_ng_list)
@@ -4104,10 +4144,9 @@ class TidalMigrationManager:
                             print(f"  [Paso 9] [Reintento {intento_conexion}/3] Rotando proxy PE para restablecer conexión...")
                             
                             # Obtener una rotación de proxy PE de forma manual (sin tocar el self.context principal)
-                            import sys, random
-                            main_module = sys.modules['__main__']
-                            valid_pe_list = getattr(main_module, 'valid_pe_list', [])
+                            global valid_pe_list
                             if valid_pe_list:
+                                import random
                                 p_pe = random.choice(valid_pe_list)
                                 self.proxy_pe_server = p_pe["server"]
                                 self.proxy_pe_user = p_pe["username"]
@@ -4741,6 +4780,7 @@ def probar_y_seleccionar_mejor_proxy(proxy_list, region="Peru", cantidad_necesar
 
 
 def main():
+    global valid_pe_list, valid_ng_list
     valid_pe_list = []
     valid_ng_list = []
     
