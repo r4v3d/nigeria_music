@@ -1632,7 +1632,9 @@ class TidalMigrationManager:
                 "--credentials-enable-service=false",
                 "--password-store=basic",
                 "--disable-autofill",
-                "--disable-save-password-bubble"
+                "--disable-save-password-bubble",
+                "--disable-gpu",
+                "--disable-software-rasterizer"
             ]
             
             proxy_dict = None
@@ -3047,7 +3049,9 @@ class TidalMigrationManager:
             "--credentials-enable-service=false",
             "--password-store=basic",
             "--disable-autofill",
-            "--disable-save-password-bubble"
+            "--disable-save-password-bubble",
+            "--disable-gpu",
+            "--disable-software-rasterizer"
         ]
         proxy_dict = None
         if self.use_proxy and self.proxy_ng_server:
@@ -3385,7 +3389,9 @@ class TidalMigrationManager:
             "--credentials-enable-service=false",
             "--password-store=basic",
             "--disable-autofill",
-            "--disable-save-password-bubble"
+            "--disable-save-password-bubble",
+            "--disable-gpu",
+            "--disable-software-rasterizer"
         ]
         proxy_dict = None
         if self.use_proxy and self.proxy_pe_server:
@@ -4169,7 +4175,11 @@ class TidalMigrationManager:
                                 print(f"  [Paso 9] Nuevo proxy PE seleccionado: {self.proxy_pe_server}")
                         
                         # 2. Abrir navegador con perfil del plan familiar titular
-                        launch_args = ["--disable-blink-features=AutomationControlled"]
+                        launch_args = [
+                            "--disable-blink-features=AutomationControlled",
+                            "--disable-gpu",
+                            "--disable-software-rasterizer"
+                        ]
                         proxy_dict = None
                         if self.use_proxy and self.proxy_pe_server:
                             proxy_dict = {"server": self.proxy_pe_server}
@@ -4532,7 +4542,11 @@ def configurar_perfiles():
         print("  (Se abrirá el navegador para Gmail y TuneMyMusic)")
         print("="*70)
         
-        launch_args = ["--disable-blink-features=AutomationControlled"]
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-gpu",
+            "--disable-software-rasterizer"
+        ]
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR_MAIN),
             channel="chrome",
