@@ -42,6 +42,7 @@ tmm_lock = SystemLock(Path.home() / ".tidal_migrator" / "tmm_system_lock")
 parent_lock = threading.Lock()
 reset_lock = threading.Lock()
 stdin_lock = threading.Lock()
+progreso_lock = threading.Lock()
 family_invite_queue = []
 BATCH_MODE = False
 BATCH_MODE_VPN = False
@@ -66,6 +67,25 @@ def input_concurrente(prompt, identificador=None):
         res = input(prompt)
         print("!" * 80 + "\n")
         return res
+
+def guardar_progreso_migracion(email: str, step: int):
+    import json
+    from pathlib import Path
+    
+    file_path = Path("progreso_migraciones.json")
+    with progreso_lock:
+        data = {}
+        if file_path.exists():
+            try:
+                data = json.loads(file_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        data[email.lower().strip()] = step
+        try:
+            file_path.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+            print(f"  [Progreso] Guardado paso {step} para {email} en progreso_migraciones.json")
+        except Exception as e:
+            print(f"  [Progreso] [WARN] No se pudo guardar progreso en JSON: {e}")
 
 def preparar_perfil_temporal(origen_path, email_sanitized):
     # Generar un nombre de carpeta único usando un timestamp y un número aleatorio para evitar colisiones de bloqueos en Windows
@@ -1590,6 +1610,8 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                if not self.cuenta_abortada and self.start_step <= 1:
+                    guardar_progreso_migracion(self.client_email, 1)
                 self.esperar_sincronizacion(barrier_step1, "Paso 1 (Login)")
                 
                 # Paso 2
@@ -1610,6 +1632,8 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                if not self.cuenta_abortada and self.start_step <= 2:
+                    guardar_progreso_migracion(self.client_email, 2)
                 self.esperar_sincronizacion(barrier_step2, "Paso 2 (Cambio de email)")
                 
                 # Paso 3 & 4
@@ -1630,6 +1654,8 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                if not self.cuenta_abortada and self.start_step <= 4:
+                    guardar_progreso_migracion(self.client_email, 4)
                 self.esperar_sincronizacion(barrier_step3_4, "Paso 3 & 4 (Exportación)")
                 
                 # Paso 5
@@ -1651,6 +1677,8 @@ class TidalMigrationManager:
                                 pass
                             time.sleep(3.0)
                 
+                if not self.cuenta_abortada and self.start_step <= 5:
+                    guardar_progreso_migracion(self.client_email, 5)
                 # Sincronizar antes de activar la VPN global para el Paso 6
                 self.esperar_sincronizacion(barrier_step5, "Paso 5 (Eliminar cuenta)")
 
@@ -1673,6 +1701,8 @@ class TidalMigrationManager:
                                 pass
                             time.sleep(3.0)
                 
+                if not self.cuenta_abortada and self.start_step <= 6:
+                    guardar_progreso_migracion(self.client_email, 6)
                 # Sincronizar antes de desactivar la VPN global para volver a IP local
                 self.esperar_sincronizacion(barrier_step6, "Paso 6 (Crear nueva cuenta)")
 
@@ -1684,8 +1714,12 @@ class TidalMigrationManager:
                         if self.start_step == 7 and getattr(self, "reset_password_first", False):
                             print("\n--- [Paso 7 - Restablecimiento Previo] Iniciando restablecimiento de contraseña solicitado... ---")
                             self.step8_request_password_reset()
+                            if not self.cuenta_abortada:
+                                guardar_progreso_migracion(self.client_email, 8)
                             self.esperar_sincronizacion(barrier_step8, "Paso 8 Previo (Solicitar reset)")
                             self.step10_complete_password_reset()
+                            if not self.cuenta_abortada:
+                                guardar_progreso_migracion(self.client_email, 10)
                             self.esperar_sincronizacion(barrier_step10, "Paso 10 Previo (Completar reset)")
                             print("\n--- [Paso 7 - Restablecimiento Previo] Contraseña restablecida con éxito. Iniciando transferencia... ---")
                         break
@@ -1718,6 +1752,8 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                if not self.cuenta_abortada and self.start_step <= 7:
+                    guardar_progreso_migracion(self.client_email, 7)
                 self.esperar_sincronizacion(barrier_step7, "Paso 7 (Importación)")
                 
                 # Paso 8
@@ -1739,6 +1775,8 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                if not self.cuenta_abortada and self.start_step <= 8 and not getattr(self, "reset_password_first", False):
+                    guardar_progreso_migracion(self.client_email, 8)
                 if not getattr(self, "reset_password_first", False) or self.cuenta_abortada:
                     self.esperar_sincronizacion(barrier_step8, "Paso 8 (Solicitar reset de clave)")
                 
@@ -1760,6 +1798,8 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                if not self.cuenta_abortada and self.start_step <= 9:
+                    guardar_progreso_migracion(self.client_email, 9)
                 self.esperar_sincronizacion(barrier_step9, "Paso 9 (Invitar a plan familiar)")
                 
                 # Paso 10
@@ -1781,6 +1821,8 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                if not self.cuenta_abortada and self.start_step <= 10 and not getattr(self, "reset_password_first", False):
+                    guardar_progreso_migracion(self.client_email, 10)
                 if not getattr(self, "reset_password_first", False) or self.cuenta_abortada:
                     self.esperar_sincronizacion(barrier_step10, "Paso 10 (Completar reset de clave)")
                 
@@ -1802,6 +1844,9 @@ class TidalMigrationManager:
                             except Exception:
                                 pass
                             time.sleep(3.0)
+                
+                if not self.cuenta_abortada and self.start_step <= 11:
+                    guardar_progreso_migracion(self.client_email, 11)
                 
                 if not self.cuenta_abortada:
                     print("\n[EXITO] ¡PROCESO DE MIGRACIÓN COMPLETADO CON ÉXITO! [EXITO]")
@@ -4916,6 +4961,29 @@ def main():
     if proxy_ng_server and not proxy_ng_server.startswith("http"):
         proxy_ng_server = "http://" + proxy_ng_server
 
+    # Filtrar cuentas ya completadas en el progreso
+    cuentas_filtradas = []
+    import json
+    progreso_file = Path("progreso_migraciones.json")
+    progreso_data = {}
+    if progreso_file.exists():
+        try:
+            progreso_data = json.loads(progreso_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  [Progreso] [WARN] No se pudo leer 'progreso_migraciones.json' al iniciar: {e}")
+            
+    for c_email, c_pwd, c_target_pwd in cuentas:
+        email_key = c_email.lower().strip()
+        if email_key in progreso_data and progreso_data[email_key] >= 11:
+            print(f"  [Progreso] Cuenta {c_email} ya completó la migración (Paso 11). Se excluye de la cola.")
+        else:
+            cuentas_filtradas.append((c_email, c_pwd, c_target_pwd))
+            
+    cuentas = cuentas_filtradas
+    if not cuentas:
+        print("\n[INFO] Todas las cuentas en la lista ya han completado la migración (Paso 11).")
+        sys.exit(0)
+
     print(f"\n[INFO] Se detectaron {len(cuentas)} cuenta(s) a procesar en cola.")
     print("Asegúrate de haber completado la opción 2 (Configurar perfiles) antes.")
     input(">>> Presiona Enter para iniciar el proceso de migración <<<")
@@ -5038,6 +5106,24 @@ def main():
                     thread_proxy_ng_user = None
                     thread_proxy_ng_pass = None
             
+            # Obtener paso de inicio dinámico para esta cuenta específica
+            cuenta_start_step = start_step
+            if start_step == 1:
+                progreso_file = Path("progreso_migraciones.json")
+                if progreso_file.exists():
+                    try:
+                        import json
+                        progreso_data = json.loads(progreso_file.read_text(encoding="utf-8"))
+                        email_key = c_email.lower().strip()
+                        if email_key in progreso_data:
+                            paso_completado = progreso_data[email_key]
+                            if paso_completado >= 11:
+                                return c_email, True, 0, None
+                            cuenta_start_step = paso_completado + 1
+                            print(f"  [Lote] Cuenta {c_email} reanudará desde el Paso {cuenta_start_step} (último paso completado: {paso_completado} según progreso_migraciones.json)")
+                    except Exception as e:
+                        print(f"  [Lote] [WARN] Error al leer progreso_migraciones.json para {c_email}: {e}")
+
             manager = TidalMigrationManager(
                 main_profile=PROFILE_DIR_MAIN,
                 parent_profile=PROFILE_DIR_PARENT,
@@ -5052,7 +5138,7 @@ def main():
                 proxy_ng_user=thread_proxy_ng_user,
                 proxy_ng_pass=thread_proxy_ng_pass,
                 batch_mode=BATCH_MODE,
-                start_step=start_step,
+                start_step=cuenta_start_step,
                 reset_password_first=reset_password_first
             )
             
