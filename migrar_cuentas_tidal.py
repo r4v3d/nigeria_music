@@ -5008,10 +5008,14 @@ def main():
                 proxy_pe_user = valid_pe_list[0]["username"]
                 proxy_pe_pass = valid_pe_list[0]["password"]
             else:
+                print("\n[ERROR] No se pudo encontrar ningún proxy de PERÚ funcional en 'proxies.txt'.")
+                confirm = input("Como tu IP local/VPN está bloqueada por Tidal, continuar sin proxy fallará. ¿Deseas forzar continuar de todas formas con tu IP local? (s/n): ").strip().lower()
+                if confirm not in ('s', 'si', 'yes', 'y'):
+                    print("Abortando la migración por seguridad.")
+                    sys.exit(1)
                 proxy_pe_server = None
                 proxy_pe_user = None
                 proxy_pe_pass = None
-                print("  [WARN] Se usará la IP local/VPN para Perú porque ningún proxy funcionó o no se configuró ninguno.")
                 
             # Probar y seleccionar los proxies de Nigeria en paralelo
             ng_list = proxies_desde_txt.get("proxy_ng_list", [])
@@ -5021,10 +5025,14 @@ def main():
                 proxy_ng_user = valid_ng_list[0]["username"]
                 proxy_ng_pass = valid_ng_list[0]["password"]
             else:
+                print("\n[ERROR] No se pudo encontrar ningún proxy de NIGERIA funcional en 'proxies.txt'.")
+                confirm = input("Como tu IP local/VPN está bloqueada por Tidal, continuar sin proxy fallará. ¿Deseas forzar continuar de todas formas con tu IP local? (s/n): ").strip().lower()
+                if confirm not in ('s', 'si', 'yes', 'y'):
+                    print("Abortando la migración por seguridad.")
+                    sys.exit(1)
                 proxy_ng_server = None
                 proxy_ng_user = None
                 proxy_ng_pass = None
-                print("  [WARN] Se usará la IP local/VPN para Nigeria porque ningún proxy funcionó o no se configuró ninguno.")
                 
             print("  [INFO] Configuración de proxies residenciales finalizada.")
     else:
