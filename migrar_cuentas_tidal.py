@@ -171,45 +171,81 @@ PROFILE_DIR_PARENT.mkdir(parents=True, exist_ok=True)
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 STEALTH_SCRIPT = """
-    // Ocultar la propiedad navigator.webdriver
+    // Ocultar la propiedad navigator.webdriver de forma limpia
+    try {
+        const newProto = Object.getPrototypeOf(navigator);
+        delete newProto.webdriver;
+    } catch (e) {}
     Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined
+        get: () => undefined,
+        configurable: true
     });
 
     // Simular el objeto window.chrome estándar de Google Chrome
-    window.chrome = {
-        app: {
-            isInstalled: false,
-            InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-            RunningState: { CANNOT_RUN: 'cannot_run', RUNNING: 'running', READY_TO_RUN: 'ready_to_run' }
-        },
-        runtime: {
-            OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-            OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-            PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-            PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-            PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-            RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
-        }
-    };
+    if (!window.chrome) {
+        window.chrome = {
+            app: {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', RUNNING: 'running', READY_TO_RUN: 'ready_to_run' }
+            },
+            runtime: {
+                OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
+            }
+        };
+    }
 
     // Parchear navigator.permissions.query
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(parameters)
-    );
+    try {
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters)
+        );
+    } catch (e) {}
 
     // Asegurar navigator.plugins y navigator.mimeTypes estándar
-    if (!navigator.plugins || navigator.plugins.length === 0) {
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
-            ]
+    try {
+        if (!navigator.plugins || navigator.plugins.length === 0) {
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [
+                    { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                    { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
+                ],
+                configurable: true
+            });
+        }
+    } catch (e) {}
+
+    // Parchear navigator.languages para evitar discrepancias
+    try {
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['es-ES', 'es', 'en'],
+            configurable: true
         });
-    }
+    } catch (e) {}
+
+    // Spoofear WebGL Renderer para ocultar SwiftShader (Headless GPU)
+    try {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            // UNMASKED_VENDOR_WEBGL
+            if (parameter === 37445) {
+                return 'Google Inc. (NVIDIA)';
+            }
+            // UNMASKED_RENDERER_WEBGL
+            if (parameter === 37446) {
+                return 'ANGLE (NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            }
+            return getParameter.apply(this, arguments);
+        };
+    } catch (e) {}
 """
 
 # Coordenadas y selectores para captcha de arrastre (DataDome)
@@ -1499,6 +1535,7 @@ class TidalMigrationManager:
         self.reset_baseline_id = 0
         self.invite_baseline_id = 0
         self.total_bytes_transferred = 0
+        self.user_agent = None
 
     def forzar_modo_visual(self):
         """Si el navegador está en modo headless, lo cierra y lo vuelve a abrir en modo headed (visual) para permitir la intervención del usuario."""
@@ -1626,6 +1663,10 @@ class TidalMigrationManager:
     def run_pipeline(self):
         with sync_playwright() as p:
             self.playwright = p
+            # Determinar canal y User-Agent dinámico limpio para esta sesión
+            channel = None if (self.use_proxy and (self.proxy_pe_server or self.proxy_ng_server)) else "chrome"
+            self.user_agent = obtener_user_agent_limpio(p, channel=channel)
+            print(f"  [User-Agent] UA dinámico detectado y limpio: {self.user_agent}")
             # 1. Lanzar el navegador principal con el perfil persistente
             launch_args = [
                 "--disable-blink-features=AutomationControlled",
@@ -1669,7 +1710,7 @@ class TidalMigrationManager:
             if not proxy_dict:
                 launch_kwargs["channel"] = "chrome"
             if self.headless:
-                launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+                launch_kwargs["user_agent"] = self.user_agent
             self.context = p.chromium.launch_persistent_context(**launch_kwargs)
             self.context.set_default_navigation_timeout(45000)
             self.context.set_default_timeout(35000)
@@ -3074,7 +3115,7 @@ class TidalMigrationManager:
         if not proxy_dict:
             launch_kwargs["channel"] = "chrome"
         if self.headless:
-            launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+            launch_kwargs["user_agent"] = self.user_agent
         self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         self.context.set_default_navigation_timeout(45000)
         self.context.set_default_timeout(35000)
@@ -3414,7 +3455,7 @@ class TidalMigrationManager:
         if not proxy_dict:
             launch_kwargs["channel"] = "chrome"
         if self.headless:
-            launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+            launch_kwargs["user_agent"] = self.user_agent
         self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         self.context.set_default_navigation_timeout(45000)
         self.context.set_default_timeout(35000)
@@ -3778,7 +3819,7 @@ class TidalMigrationManager:
                 "proxy": proxy_dict
             }
             if self.headless:
-                context_kwargs["user_agent"] = NORMAL_USER_AGENT
+                context_kwargs["user_agent"] = self.user_agent
             temp_context = self.context.browser.new_context(**context_kwargs)
             temp_context.set_default_navigation_timeout(45000)
             temp_context.set_default_timeout(35000)
@@ -4201,7 +4242,7 @@ class TidalMigrationManager:
                         if not proxy_dict:
                             launch_kwargs["channel"] = "chrome"
                         if self.headless:
-                            launch_kwargs["user_agent"] = NORMAL_USER_AGENT
+                            launch_kwargs["user_agent"] = self.user_agent
                         parent_context = p.chromium.launch_persistent_context(**launch_kwargs)
                         parent_context.set_default_navigation_timeout(45000)
                         parent_context.set_default_timeout(35000)
@@ -4532,6 +4573,24 @@ class TidalMigrationManager:
             self.input_concurrente(">>> Acepta la invitación manualmente en el navegador y luego pulsa Enter <<<")
             
         print("  [Paso 11] [OK] Invitación familiar aceptada.")
+
+
+def obtener_user_agent_limpio(playwright, channel=None):
+    """Lanza una instancia temporal del navegador en segundo plano para obtener su User-Agent real y limpiar la marca Headless."""
+    try:
+        launch_kwargs = {"headless": True}
+        if channel:
+            launch_kwargs["channel"] = channel
+        browser = playwright.chromium.launch(**launch_kwargs)
+        page = browser.new_page()
+        ua = page.evaluate("navigator.userAgent")
+        browser.close()
+        if "HeadlessChrome" in ua:
+            ua = ua.replace("HeadlessChrome/", "Chrome/")
+        return ua
+    except Exception as e:
+        print(f"  [User-Agent] [WARN] No se pudo obtener el User-Agent dinámico: {e}. Usando fallback.")
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
 def configurar_perfiles():
