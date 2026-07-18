@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Chrome Profiles and Downloads
+perfiles/
+descargas/
+
+# Credentials and sensitive information
+credenciales.json
+cuentas.txt
+passwords.txt
+titular_familiar.txt
+
+# Temp / Debug files
+*.png
+error.txt
+tmm_body.html
+
+# Proxy lists
+lista_proxies_ng.txt
+lista_proxies_pe.txt
+proxies.txt
+
+# Environment / IDE files
+.vscode/
+.idea/
+.agents/
+scratch/

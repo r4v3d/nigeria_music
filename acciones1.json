@@ -1,0 +1,757 @@
+{
+  "fecha": "2025-10-08 18:23:24",
+  "total_acciones": 104,
+  "duracion": 27.65450692176819,
+  "email_ejemplo": null,
+  "password_ejemplo": "*******",
+  "acciones": [
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "Key.enter",
+      "tiempo": 0.06918120384216309
+    },
+    {
+      "tipo": "mover",
+      "x": 1261,
+      "y": 845,
+      "tiempo": 0.5266497135162354
+    },
+    {
+      "tipo": "click",
+      "x": 333,
+      "y": 68,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 2.3025286197662354
+    },
+    {
+      "tipo": "click",
+      "x": 333,
+      "y": 68,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 2.3742830753326416
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "a",
+      "tiempo": 2.677854537963867
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "c",
+      "tiempo": 2.8060834407806396
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "a",
+      "tiempo": 2.8374640941619873
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "c",
+      "tiempo": 2.9254636764526367
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "Key.enter",
+      "tiempo": 3.6697936058044434
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "Key.enter",
+      "tiempo": 3.7572567462921143
+    },
+    {
+      "tipo": "mover",
+      "x": 333,
+      "y": 67,
+      "tiempo": 4.118250846862793
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "Key.ctrl_l",
+      "tiempo": 6.677369594573975
+    },
+    {
+      "tipo": "mover",
+      "x": 883,
+      "y": 435,
+      "tiempo": 6.694297790527344
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "\u0016",
+      "tiempo": 6.837596416473389
+    },
+    {
+      "tipo": "mover",
+      "x": 880,
+      "y": 442,
+      "tiempo": 6.838219881057739
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "\u0016",
+      "tiempo": 6.965774059295654
+    },
+    {
+      "tipo": "mover",
+      "x": 866,
+      "y": 474,
+      "tiempo": 6.966556549072266
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "Key.ctrl_l",
+      "tiempo": 6.989315509796143
+    },
+    {
+      "tipo": "mover",
+      "x": 864,
+      "y": 480,
+      "tiempo": 6.990472078323364
+    },
+    {
+      "tipo": "click",
+      "x": 858,
+      "y": 501,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 7.39106297492981
+    },
+    {
+      "tipo": "click",
+      "x": 858,
+      "y": 501,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 7.478434085845947
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "Key.caps_lock",
+      "tiempo": 8.565466403961182
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "Key.caps_lock",
+      "tiempo": 8.669991493225098
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "s",
+      "tiempo": 9.134404420852661
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "s",
+      "tiempo": 9.229658365249634
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "Key.caps_lock",
+      "tiempo": 9.26944088935852
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "Key.caps_lock",
+      "tiempo": 9.390034437179565
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "l",
+      "tiempo": 9.469659566879272,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "l",
+      "tiempo": 9.533625841140747,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "e",
+      "tiempo": 9.542008399963379,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "e",
+      "tiempo": 9.645671367645264,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "n",
+      "tiempo": 9.701706171035767,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "n",
+      "tiempo": 9.77374267578125,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "d",
+      "tiempo": 9.830416440963745,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "e",
+      "tiempo": 9.94165849685669,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "d",
+      "tiempo": 9.957628965377808,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "r",
+      "tiempo": 10.101882457733154,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "e",
+      "tiempo": 10.158167362213135,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "r",
+      "tiempo": 10.205856561660767,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": null,
+      "tiempo": 10.438673257827759,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": null,
+      "tiempo": 10.542218923568726,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": null,
+      "tiempo": 10.549652338027954,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": null,
+      "tiempo": 10.661759376525879,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": null,
+      "tiempo": 10.726288080215454,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": null,
+      "tiempo": 10.79768443107605,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "*",
+      "tiempo": 10.973577976226807,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_liberada",
+      "tecla": "*",
+      "tiempo": 11.069977045059204,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 858,
+      "y": 501,
+      "tiempo": 11.614425659179688,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 1114,
+      "y": 512,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 12.199403047561646,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 1114,
+      "y": 512,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 12.270612478256226,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 1114,
+      "y": 511,
+      "tiempo": 12.398432731628418,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 835,
+      "y": 570,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 12.918516397476196,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 835,
+      "y": 570,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 12.990710496902466,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 834,
+      "y": 570,
+      "tiempo": 13.158463954925537,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 815,
+      "y": 503,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 13.614847183227539,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 815,
+      "y": 503,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 13.686970233917236,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 816,
+      "y": 503,
+      "tiempo": 13.694456815719604,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 899,
+      "y": 547,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 13.967199563980103,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 899,
+      "y": 547,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 14.038811206817627,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 900,
+      "y": 547,
+      "tiempo": 14.094618797302246,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 914,
+      "y": 569,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 14.279058456420898,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 914,
+      "y": 569,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 14.350648880004883,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 914,
+      "y": 569,
+      "tiempo": 14.438880681991577,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 946,
+      "y": 687,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 14.950550079345703,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 944,
+      "y": 688,
+      "tiempo": 14.966537952423096,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 944,
+      "y": 689,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 14.974834203720093,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 943,
+      "y": 689,
+      "tiempo": 14.990483045578003,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 943,
+      "y": 689,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 14.990741491317749,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 943,
+      "y": 689,
+      "tiempo": 14.998454809188843,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 943,
+      "y": 689,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 15.006562232971191,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 943,
+      "y": 689,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 15.038601398468018,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 942,
+      "y": 691,
+      "tiempo": 15.06251573562622,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 920,
+      "y": 731,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 15.34325623512268,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 920,
+      "y": 731,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 15.414724588394165,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 920,
+      "y": 731,
+      "tiempo": 15.454514026641846,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 1046,
+      "y": 588,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 15.84727430343628,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 1046,
+      "y": 588,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 15.918749332427979,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 1047,
+      "y": 588,
+      "tiempo": 15.966506958007812,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 1084,
+      "y": 522,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 16.279004096984863,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 1084,
+      "y": 522,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 16.318568468093872,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 1084,
+      "y": 522,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 16.342679262161255,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 1084,
+      "y": 522,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 16.367507457733154,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 1084,
+      "y": 522,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 16.414649486541748,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 1084,
+      "y": 522,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 16.64759397506714,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 1084,
+      "y": 522,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 16.703001260757446,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 1084,
+      "y": 522,
+      "tiempo": 16.766985654830933,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 867,
+      "y": 657,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 17.27106738090515,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 867,
+      "y": 657,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 17.35088849067688,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 866,
+      "y": 658,
+      "tiempo": 17.39859366416931,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 838,
+      "y": 702,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 17.695337533950806,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 838,
+      "y": 702,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 17.758981943130493,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 838,
+      "y": 703,
+      "tiempo": 17.886606693267822,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 845,
+      "y": 781,
+      "boton": "Button.left",
+      "presionado": true,
+      "tiempo": 18.83924436569214,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "click",
+      "x": 845,
+      "y": 781,
+      "boton": "Button.left",
+      "presionado": false,
+      "tiempo": 18.91929531097412,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 847,
+      "y": 781,
+      "tiempo": 20.76721429824829,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 988,
+      "y": 668,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 26.262922525405884,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 988,
+      "y": 668,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 26.302875995635986,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 988,
+      "y": 668,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 26.342915534973145,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 988,
+      "y": 668,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 26.366876363754272,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "mover",
+      "x": 989,
+      "y": 668,
+      "tiempo": 26.527519464492798,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 990,
+      "y": 668,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 26.662853956222534,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 990,
+      "y": 668,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 26.703030586242676,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "scroll",
+      "x": 990,
+      "y": 668,
+      "dx": 0,
+      "dy": -1,
+      "tiempo": 26.790897130966187,
+      "es_credencial": "password"
+    },
+    {
+      "tipo": "tecla_presionada",
+      "tecla": "Key.esc",
+      "tiempo": 27.65450692176819
+    }
+  ]
+}
