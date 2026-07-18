@@ -393,6 +393,11 @@ def manejar_bloqueos_e_intervencion(page, subtitulo: str = "") -> None:
         intentos_bucle += 1
         print(f"\n[BLOQUEO DETECTADO] -> {subtitulo}")
         
+        # Si la página tiene un manager asociado y está en modo headless, forzar transición a visual
+        manager = getattr(page, "manager", None)
+        if manager and getattr(manager, "headless", False):
+            manager.forzar_modo_visual()
+        
         # Intentar auto-resolver slider en el primer intento
         if intentos_bucle == 1:
             if resolver_slider_captcha_playwright(page):
@@ -1454,7 +1459,7 @@ class TidalMigrationManager:
     def __init__(self, main_profile, parent_profile, client_email, client_pwd, target_pwd,
                  use_proxy=False, proxy_pe_server=None, proxy_pe_user=None, proxy_pe_pass=None,
                  proxy_ng_server=None, proxy_ng_user=None, proxy_ng_pass=None, batch_mode=False,
-                 start_step=1, reset_password_first=False):
+                 start_step=1, reset_password_first=False, headless=False):
         self.main_profile = main_profile
         self.parent_profile = parent_profile
         self.client_email = client_email
@@ -1470,6 +1475,7 @@ class TidalMigrationManager:
         self.batch_mode = batch_mode
         self.start_step = start_step
         self.reset_password_first = reset_password_first
+        self.headless = headless
         self.new_email_temp = None
         self.cuenta_abortada = False
         self.abort_reason = None
@@ -1479,7 +1485,43 @@ class TidalMigrationManager:
         self.invite_baseline_id = 0
         self.total_bytes_transferred = 0
 
+    def forzar_modo_visual(self):
+        """Si el navegador está en modo headless, lo cierra y lo vuelve a abrir en modo headed (visual) para permitir la intervención del usuario."""
+        if not getattr(self, "headless", False):
+            return  # Ya es visual, no hace falta hacer nada
+            
+        print(f"\n  [Modo Headless] Intervención requerida para {self.client_email}. Transicionando a modo visual (Headed)...")
+        
+        # Guardar URL actual
+        current_url = "https://account.tidal.com/"
+        try:
+            if self.page:
+                current_url = self.page.url
+        except Exception:
+            pass
+            
+        # Cambiar el flag a headed
+        self.headless = False
+        
+        # Cerrar el contexto actual de forma segura
+        try:
+            if self.context:
+                self.context.close()
+        except Exception:
+            pass
+            
+        # Re-levantar el navegador principal en modo visual
+        print("  [Modo Headless] Levantando navegador headed...")
+        try:
+            self.asegurar_navegador_abierto()
+            if current_url and current_url.startswith("http"):
+                self.page.goto(current_url, wait_until="domcontentloaded", timeout=25000)
+                time.sleep(2.0)
+        except Exception as e:
+            print(f"  [Modo Headless] [WARN] Error al levantar navegador headed o navegar: {e}")
+
     def input_concurrente(self, prompt):
+        self.forzar_modo_visual()
         return input_concurrente(prompt, self.client_email)
 
     def registrar_contador_datos(self, context):
@@ -1561,7 +1603,7 @@ class TidalMigrationManager:
             self.context = p.chromium.launch_persistent_context(
                 user_data_dir=str(actual_profile),
                 channel="chrome",
-                headless=False,
+                headless=self.headless,
                 args=launch_args,
                 ignore_default_args=["--enable-automation"],
                 viewport={"width": 1280, "height": 800},
@@ -1584,6 +1626,7 @@ class TidalMigrationManager:
             
             self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
             self.page.client_email = self.client_email
+            self.page.manager = self
             self.page.bring_to_front()
             
             try:
@@ -2959,7 +3002,7 @@ class TidalMigrationManager:
         self.context = self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(self.main_profile),
             channel="chrome",
-            headless=False,
+            headless=self.headless,
             args=launch_args,
             ignore_default_args=["--enable-automation"],
             viewport={"width": 1280, "height": 800},
@@ -2972,6 +3015,7 @@ class TidalMigrationManager:
         self.context.add_init_script(STEALTH_SCRIPT)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.client_email = self.client_email
+        self.page.manager = self
         self.page.bring_to_front()
         print("=" * 70 + "\n")
         
@@ -3292,7 +3336,7 @@ class TidalMigrationManager:
         self.context = self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(self.main_profile),
             channel="chrome",
-            headless=False,
+            headless=self.headless,
             args=launch_args,
             ignore_default_args=["--enable-automation"],
             viewport={"width": 1280, "height": 800},
@@ -3304,6 +3348,7 @@ class TidalMigrationManager:
         self.registrar_contador_datos(self.context)
         self.context.add_init_script(STEALTH_SCRIPT)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        self.page.manager = self
         self.page.bring_to_front()
 
     def rotar_proxy_contexto(self, tipo="PE"):
@@ -3675,6 +3720,7 @@ class TidalMigrationManager:
             temp_context.add_init_script(STEALTH_SCRIPT)
             temp_page = temp_context.new_page()
             temp_page.client_email = self.client_email
+            temp_page.manager = self
             try:
                 # Inicializar cookies de Datadome y sesión base
                 print("  [Paso 8] Inicializando sesión base de Tidal para evitar sospechas de Datadome...")
@@ -4077,7 +4123,7 @@ class TidalMigrationManager:
                         parent_context = p.chromium.launch_persistent_context(
                             user_data_dir=str(self.parent_profile),
                             channel="chrome",
-                            headless=False,
+                            headless=self.headless,
                             args=launch_args,
                             ignore_default_args=["--enable-automation"],
                             viewport={"width": 1280, "height": 800},
@@ -4089,6 +4135,7 @@ class TidalMigrationManager:
                         self.registrar_contador_datos(parent_context)
                         
                         parent_page = parent_context.pages[0] if parent_context.pages else parent_context.new_page()
+                        parent_page.manager = self
                         
                         # 3. Comprobar si ya está logueado en la cuenta titular seleccionada
                         email_activo = self.obtener_email_logueado_tidal(parent_page)
@@ -4713,6 +4760,7 @@ def main():
     parser.add_argument("--setup", action="store_true", help="Iniciar el asistente de inicio de sesión manual para configurar perfiles.")
     parser.add_argument("--batch-file", "-f", type=str, help="Ruta de un archivo .txt con la lista de cuentas a migrar en lote.")
     parser.add_argument("--start-step", type=int, default=1, choices=range(1, 12), help="Paso desde el que iniciar la migración (1-11).")
+    parser.add_argument("--headless", action="store_true", help="Ejecutar el navegador en segundo plano (headless) para ahorrar RAM.")
     
     # Argumentos de proxy residencial general/fallback
     parser.add_argument("--use-proxy", action="store_true", help="Usar proxy residencial y activar optimización de ancho de banda.")
@@ -4760,6 +4808,13 @@ def main():
                 start_step = 1
         except Exception:
             start_step = 1
+
+    # Preguntar si desean ejecutar en segundo plano (headless)
+    headless = args.headless
+    if not headless:
+        headless_opt = input("\n¿Deseas ejecutar los navegadores en segundo plano (headless) para ahorrar RAM? (s/n, por defecto 's'): ").strip().lower()
+        if headless_opt in ('', 's', 'si', 'yes', 'y'):
+            headless = True
 
     # Si se elige el paso 7, dar la opción de restablecer la contraseña primero
     reset_password_first = False
@@ -5139,7 +5194,8 @@ def main():
                 proxy_ng_pass=thread_proxy_ng_pass,
                 batch_mode=BATCH_MODE,
                 start_step=cuenta_start_step,
-                reset_password_first=reset_password_first
+                reset_password_first=reset_password_first,
+                headless=headless
             )
             
             try:
