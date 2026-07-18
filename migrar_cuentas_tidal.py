@@ -891,23 +891,14 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             envelope_to = (msg.get("Envelope-To") or "").lower()
             destinatario_limpio = gmail_user.lower().strip()
             
-            # Si es el correo de migración cakeseller1234, debemos ser estrictos con los puntos para separar hilos.
-            # Si es una cuenta titular u otra cuenta, podemos ser más laxos ignorando los puntos.
-            if "cakeseller1234" in destinatario_limpio.replace(".", ""):
-                recipients = f"{to_header} {delivered_to} {envelope_to}"
-                if destinatario_limpio not in recipients:
-                    # El correo es para otra variación con puntos o alias running en otro hilo
-                    continue
-            else:
-                def remove_dots_from_email(e):
-                    if "@" in e:
-                        u, d = e.split("@", 1)
-                        return u.replace(".", "") + "@" + d
-                    return e.replace(".", "")
-                dest_no_dots = remove_dots_from_email(destinatario_limpio)
-                recipients_no_dots = remove_dots_from_email(f"{to_header} {delivered_to} {envelope_to}")
-                if dest_no_dots not in recipients_no_dots:
-                    continue
+            # Para evitar mezclar códigos o enlaces de cuentas paralelas que comparten la misma
+            # bandeja de entrada (por usar alias o variaciones de puntos de Gmail),
+            # exigimos que la dirección de correo con sus puntos exactos esté presente
+            # en los campos de destinatario del correo (To, Delivered-To, Envelope-To).
+            recipients = f"{to_header} {delivered_to} {envelope_to}"
+            if destinatario_limpio not in recipients:
+                # El correo es para otra variación con puntos o alias running en otro hilo
+                continue
             
             # Extraer el cuerpo del correo
             body_text = ""
