@@ -1522,6 +1522,7 @@ class TidalMigrationManager:
         try:
             if self.context:
                 self.context.close()
+                time.sleep(3.0)
         except Exception:
             pass
             
@@ -3424,6 +3425,7 @@ class TidalMigrationManager:
         try:
             if self.context:
                 self.context.close()
+                time.sleep(3.0)
         except Exception:
             pass
         self.context = None
