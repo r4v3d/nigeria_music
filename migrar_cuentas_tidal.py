@@ -4819,6 +4819,7 @@ def main():
     parser.add_argument("--batch-file", "-f", type=str, help="Ruta de un archivo .txt con la lista de cuentas a migrar en lote.")
     parser.add_argument("--start-step", type=int, default=1, choices=range(1, 12), help="Paso desde el que iniciar la migración (1-11).")
     parser.add_argument("--headless", action="store_true", help="Ejecutar el navegador en segundo plano (headless) para ahorrar RAM.")
+    parser.add_argument("--clear-profiles", action="store_true", help="Borrar los perfiles persistentes de Chrome guardados para iniciar con una sesión limpia.")
     
     # Argumentos de proxy residencial general/fallback
     parser.add_argument("--use-proxy", action="store_true", help="Usar proxy residencial y activar optimización de ancho de banda.")
@@ -4835,6 +4836,17 @@ def main():
     parser.add_argument("--proxy-ng-pass", type=str, help="Contraseña del proxy de Nigeria.")
     
     args = parser.parse_args()
+
+    if args.clear_profiles:
+        print("\n[Limpieza] Borrando perfiles persistentes de Chrome por solicitud del usuario...")
+        try:
+            if PROFILE_DIR_MAIN.exists():
+                shutil.rmtree(PROFILE_DIR_MAIN, ignore_errors=True)
+            if PROFILE_DIR_PARENT.exists():
+                shutil.rmtree(PROFILE_DIR_PARENT, ignore_errors=True)
+            print("  [Limpieza] [OK] Perfiles borrados con éxito.")
+        except Exception as e:
+            print(f"  [Limpieza] [WARN] Error al borrar perfiles: {e}")
 
     if args.setup:
         configurar_perfiles()
