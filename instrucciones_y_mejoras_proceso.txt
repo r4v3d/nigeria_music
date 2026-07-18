@@ -1,14 +1,34 @@
 ================================================================================
-GUÍA TÉCNICA DETALLADA: CONFIGURACIONES, PASOS Y MEJORAS DE MIGRACIÓN TIDAL
+GUÍA COMPLETA Y TÉCNICA: FLUJO DE MIGRACIÓN TIDAL (NIGERIA), REQUISITOS Y MEJORAS
 ================================================================================
 
-Este documento describe con precisión técnica las configuraciones del navegador,
-los scripts de sigilo, las manipulaciones de cookies, los tiempos de espera
-(timeouts), las acciones ocultas y las recomendaciones específicas de qué cambiar, 
-eliminar o mejorar en el script 'migrar_cuentas_tidal.py'.
+Este documento contiene la explicación funcional y los detalles técnicos de bajo 
+nivel de los 11 pasos del script 'migrar_cuentas_tidal.py', sus configuraciones,
+parámetros de tiempo (timeouts), acciones ocultas, y las propuestas de mejora.
 
 --------------------------------------------------------------------------------
-1. CONFIGURACIONES GENERALES DEL NAVEGADOR Y SIGILO (STEALTH)
+1. ARQUITECTURA GENERAL Y ARCHIVOS DE CONFIGURACIÓN
+--------------------------------------------------------------------------------
+
+El sistema de migración se apoya en un conjunto de archivos locales en la raíz:
+
+* cuentas.txt: Contiene la lista de clientes a procesar con el formato:
+  correo, contrasena_actual, nueva_contrasena
+* passwords.txt: Contiene las credenciales del sistema, principalmente las 
+  cuentas de correo Gmail reales y sus respectivas 'App Passwords' de Google 
+  (contraseñas de aplicación de 16 caracteres) para conectar vía IMAP de forma 
+  automatizada.
+* titular_familiar.txt: Contiene la información del administrador del plan 
+  familiar de Nigeria (correo, miembros actuales, estado, detalles de miembros).
+* proxies.txt / lista_proxies_pe.txt / lista_proxies_ng.txt: Listas de proxies
+  residenciales o datacenter para Perú (PE) y Nigeria (NG) que evitan bloqueos 
+  por geolocalización.
+* perfiles/ (Carpeta): Contiene los perfiles de Chrome principales que se copian
+  a carpetas temporales de forma dinámica para evitar bloqueos por uso concurrente
+  de base de datos de Chrome en Windows.
+
+--------------------------------------------------------------------------------
+2. CONFIGURACIONES DE BAJO NIVEL Y SIGILO (STEALTH)
 --------------------------------------------------------------------------------
 
 Para evadir los sistemas anti-bot de TIDAL (como DataDome y Cloudflare), el script
@@ -39,14 +59,15 @@ aplica configuraciones de bajo nivel al instanciar el navegador en Playwright:
     cerrada, evitando la reutilización de cookies de sesiones anteriores entre hilos.
 
 --------------------------------------------------------------------------------
-2. DETALLE TÉCNICO PASO A PASO (TIMEOUTS, PASOS OCULTOS Y FLUJOS)
+3. EXPLICACIÓN DETALLADA PASO A PASO (FUNCIONAL Y TÉCNICA)
 --------------------------------------------------------------------------------
 
 [PASO 1] Iniciar sesión en la cuenta Tidal del cliente (Perú)
-* Navegación inicial: Va a `https://account.tidal.com/profile` (Timeout: 15s, 
-  wait_until="domcontentloaded").
-* Espera de carga: `time.sleep(2.0)` para permitir carga de scripts pesados.
-* Cierre de sesión previo (Oculto): Si detecta una sesión activa incorrecta,
+* Propósito Funcional: Validar las credenciales actuales del cliente y preparar 
+  la sesión para los pasos posteriores.
+* Navegación y Tiempos: Va a `https://account.tidal.com/profile` (Timeout: 15s, 
+  wait_until="domcontentloaded"). Se detiene `time.sleep(2.0)` para esperar scripts.
+* Cierre de sesión previo (Acción Oculta): Si detecta una sesión activa incorrecta,
   ejecuta JS nativo para posicionar el cursor sobre "Mi cuenta" y pulsa 
   "Cerrar sesión". Espera 2.0s a que redireccione.
 * Login: Rellena usuario y contraseña usando velocidad humana. Si el login pide 
@@ -54,32 +75,41 @@ aplica configuraciones de bajo nivel al instanciar el navegador en Playwright:
   "Inicia sesión con contraseña" para forzar el flujo clásico.
 
 [PASO 2] Cambiar correo a cakeseller1234 con puntos aleatorios
-* Objetivo: Asignar un correo temporal para liberar el correo real del cliente.
-* Acción: Genera una combinación aleatoria de puntos en "cakeseller1234@gmail.com".
-* Relleno: Introduce el nuevo correo en la configuración del perfil del cliente.
-* Verificación IMAP: Espera que llegue el código al buzón. 
+* Propósito Funcional: Liberar el correo original del cliente para poder registrar 
+  una nueva cuenta en Nigeria con ese mismo correo.
+* Acción: Genera una combinación aleatoria de puntos en "cakeseller1234@gmail.com"
+  (ej: c.a.k.e.seller1234@gmail.com). Introduce el nuevo correo en la configuración 
+  del perfil del cliente.
+* Verificación IMAP (Timeout y Filtro): Espera que llegue el código al buzón. 
   - Frecuencia de chequeo: Consulta IMAP cada 12 segundos.
   - Reintentos: Máximo 8 reintentos (1.5 minutos de espera total).
   - Filtro estricto: Valida que la combinación exacta de puntos coincida en las 
     cabeceras `To`, `Delivered-To` o `Envelope-To`.
 
 [PASOS 3 & 4] Exportando playlists a CSV vía TuneMyMusic
-* Navegación: Abre `https://www.tunemymusic.com/es/transfer`.
-* Carga de archivos (Oculto):
+* Propósito Funcional: Guardar la biblioteca musical del cliente localmente.
+* Navegación y Tiempos: Abre `https://www.tunemymusic.com/es/transfer`.
+* Carga de archivos (Acción Oculta):
   - Limpia el DOM eliminando banners molestos con JS.
   - Sube automáticamente las cookies del perfil.
   - Al pulsar en la exportación, Playwright maneja el evento de descarga 
     (`page.expect_download()`) y guarda el archivo CSV en la carpeta 
     `descargas/` con el nombre formateado del cliente.
 * Timeout crítico: Espera de carga de la lista de reproducción (hasta 30 segundos).
+* Sincronización: Este paso utiliza un bloqueo exclusivo de sistema operativo
+  (SystemLock) para evitar que varios hilos interactúen con TMM al mismo tiempo
+  y evitar colisiones de cookies.
 
 [PASO 5] Eliminando la cuenta Tidal del cliente
+* Propósito Funcional: Borrar de forma definitiva la cuenta antigua (que ahora tiene 
+  el correo temporal c.a.k.e.seller...) para que el correo original del cliente 
+  deje de estar registrado en la base de datos de Tidal.
 * Navegación: `https://login.tidal.com/delete-account` (o ruta equivalente).
-* Confirmaciones (Oculto): Pasa a través del asistente de 4 pasos de confirmación.
+* Confirmaciones (Acción Oculta): Pasa a través del asistente de 4 pasos de confirmación.
   - Paso 1: Activa el checkbox "He leído lo anterior" vía JS nativo.
   - Paso 2 a 4: Clica en "Continuar" usando evaluates nativos si los elementos 
     están dentro de Shadow DOMs u overlays.
-* IMAP Código de Eliminación:
+* IMAP Código de Eliminación (Timeout):
   - Conecta a `cakeseller1234@gmail.com` via IMAP.
   - Espera un código de 5 dígitos (ej: 28728).
   - Timeout: Máximo 8 reintentos con 12 segundos de pausa entre ellos (1.5 min total).
@@ -87,18 +117,21 @@ aplica configuraciones de bajo nivel al instanciar el navegador en Playwright:
     de teclado numérico para burlar detectores de pegado.
 
 [PASO 6] Creando nueva cuenta Tidal del cliente (Nigeria)
+* Propósito Funcional: Registrar al cliente en la región de Nigeria para pagar 
+  tarifas bajas.
 * Conexión: Se configura el proxy residencial de Nigeria.
 * Reputación previa (Acción Oculta): Abre primero `tidal.com/pricing` y espera 3.5s
   para simular navegación de un usuario interesado antes de ir a registrarse.
 * Registro: Registra el correo real del cliente con contraseña temporal.
-* Verificación IMAP: 
+* Verificación IMAP (Timeout): 
   - Busca el correo de bienvenida/registro de Tidal.
   - Frecuencia: Cada 12 segundos, máximo 5 intentos (1 minuto).
   - Rellena el código de 6 dígitos simulando teclado.
 
 [PASO 7] Transfiriendo música del CSV a la nueva cuenta Tidal
+* Propósito Funcional: Importar la música respaldada a la nueva cuenta de Nigeria.
 * Navegación: Abre TMM en Perú (PE).
-* Login en TMM (Paso Oculto):
+* Login en TMM (Acción Oculta):
   - Clica en "Subir archivo" y carga el CSV temporal.
   - Clica en "Elige destino" -> "Tidal".
   - Si aparece el popup de autenticación de Tidal, Playwright captura la ventana
@@ -109,14 +142,16 @@ aplica configuraciones de bajo nivel al instanciar el navegador en Playwright:
 * Transferencia: Clica en "Comenzar a transferir música" (Timeout de espera: 20s).
 
 [PASO 8] Solicitando restablecimiento de contraseña para la nueva cuenta
+* Propósito Funcional: Disparar el flujo para definir la nueva contraseña final.
 * Navegación: `https://login.tidal.com/resetpass`.
 * Envío: Introduce el correo real del cliente y presiona enviar.
 * Bloqueo serializado: Utiliza `reset_lock` para evitar que varios hilos envíen
   solicitudes de restablecimiento al mismo tiempo, previniendo el rate limiting de Tidal.
 
 [PASO 9] Creando invitación familiar en la cuenta del titular
+* Propósito Funcional: Vincular la nueva cuenta del cliente al plan familiar de Nigeria.
 * Navegación: Inicia sesión con la cuenta titular en `https://account.tidal.com/family`.
-* Envío de invitación (Oculto): Detecta cuántos espacios libres quedan (máx 5).
+* Envío de invitación (Acción Oculta): Detecta cuántos espacios libres quedan (máx 5).
   - Clica en "Invitar".
   - Rellena el correo real del cliente y envía.
 * Sincronización: El primer hilo que toma el control del navegador familiar
@@ -124,7 +159,8 @@ aplica configuraciones de bajo nivel al instanciar el navegador en Playwright:
   y los demás hilos simplemente saltan este paso marcándolo como "ya invitado".
 
 [PASO 10] Buscando enlace de reinicio de contraseña y cambiando contraseña
-* IMAP Enlace de Reset:
+* Propósito Funcional: Configurar la contraseña final ('nueva_contrasena') provista.
+* IMAP Enlace de Reset (Timeout):
   - Busca el correo de reset de Tidal.
   - Frecuencia: Cada 15 segundos, con un máximo de 8 intentos.
   - Extrae el enlace del cuerpo del correo (ej: `https://login.tidal.com/resetpass/...`).
@@ -133,7 +169,8 @@ aplica configuraciones de bajo nivel al instanciar el navegador en Playwright:
 * Cambio de contraseña: Abre el enlace e introduce `nueva_contrasena`.
 
 [PASO 11] Aceptando invitación familiar en el correo del cliente
-* IMAP Enlace de Invitación:
+* Propósito Funcional: Completar la migración agregando la cuenta al plan familiar.
+* IMAP Enlace de Invitación (Timeout):
   - Conecta a la cuenta de Gmail del cliente.
   - Busca el correo de invitación con el enlace "Join Family".
   - Frecuencia: Cada 12 segundos, máximo 5 intentos (1 minuto).
@@ -141,10 +178,8 @@ aplica configuraciones de bajo nivel al instanciar el navegador en Playwright:
     e inicia sesión para aceptar la vinculación al grupo familiar.
 
 --------------------------------------------------------------------------------
-3. QUÉ MANTENER, ELIMINAR, CAMBIAR O MEJORAR
+4. ANÁLISIS TÉCNICO: QUÉ MANTENER, ELIMINAR, CAMBIAR O MEJORAR
 --------------------------------------------------------------------------------
-
-A nivel de código, estas son las instrucciones concretas para optimizar el script:
 
 ### A MANTENER (No tocar):
 1. SQLite cookie cleaner: La limpieza de la base de datos de cookies de Chrome 
@@ -166,9 +201,11 @@ A nivel de código, estas son las instrucciones concretas para optimizar el scri
      perfil temporal copiado.
 
 ### A CAMBIAR (Modificar lógica existente):
-1. Activar el aborto de barreras en fallos:
+1. Activar el aborto de barreras en fallos (Deadlock de Barreras):
    - Modificar la función `registrar_error_y_abortar` para invocar 
      `self.abort_all_barriers()`.
+   - Si un hilo tiene un error y aborta en medio de un paso, los demás hilos se 
+     quedarán esperando indefinidamente en `barrier.wait()` y el programa se colgará.
    - Código actual:
      ```python
      def registrar_error_y_abortar(self, exception, paso_nombre):
@@ -201,12 +238,23 @@ A nivel de código, estas son las instrucciones concretas para optimizar el scri
    - Al iniciar, el script debe leer este archivo y asignar dinámicamente el 
      `start_step` de cada cuenta individualmente, en lugar de forzar a que todo 
      el lote inicie desde el mismo paso con `--start-step`.
-2. Manejador de Salida Limpia (Signal Handler):
+2. Detección Inteligente de Bloqueos de Proxy/Cloudflare (DataDome):
+   - Tidal utiliza DataDome para detectar bots. Si un proxy es marcado, la carga 
+     de la página se detiene o pide un captcha imposible.
+   - Integrar un servicio de resolución de captchas automático (como 2Captcha o 
+     CapSolver) o mejorar la detección de páginas bloqueadas para rotar el proxy 
+     de forma agresiva de inmediato sin esperar a que termine el timeout de 30 segundos.
+3. Manejador de Salida Limpia (Signal Handler):
    - Importar `signal` y registrar `signal.SIGINT` (Ctrl+C).
    - Al detectar la interrupción, ejecutar una función que barra la carpeta 
      `C:\Users\prett\.tidal_migrator\perfiles` buscando directorios que comiencen 
      con `temp_profile_*` y eliminarlos, evitando dejar gigabytes de basura.
-3. Alertas por webhook (Telegram/Discord):
+4. Optimización del Uso de Memoria (Playwright Headless):
+   - Correr 5 navegadores en modo no-headless consume bastante memoria RAM.
+   - Probar y configurar una bandera para correr en modo `headless` (segundo plano) 
+     siempre que sea posible, habilitando el modo visual solo cuando se detecte 
+     un problema que requiera intervención.
+5. Alertas por webhook (Telegram/Discord):
    - Al ser un proceso largo (casi 50 minutos para 5 cuentas), añadir una función
      opcional para enviar una notificación cuando una cuenta falle o complete
      exitosamente todo el proceso.
