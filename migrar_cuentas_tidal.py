@@ -171,15 +171,15 @@ PROFILE_DIR_PARENT.mkdir(parents=True, exist_ok=True)
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 STEALTH_SCRIPT = """
-    // Ocultar la propiedad navigator.webdriver de forma limpia
+    // Ocultar la propiedad navigator.webdriver de forma limpia en el prototipo
     try {
         const newProto = Object.getPrototypeOf(navigator);
-        delete newProto.webdriver;
+        Object.defineProperty(newProto, 'webdriver', {
+            get: () => false,
+            configurable: true,
+            enumerable: true
+        });
     } catch (e) {}
-    Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined,
-        configurable: true
-    });
 
     // Simular el objeto window.chrome estándar de Google Chrome
     if (!window.chrome) {
@@ -1742,18 +1742,15 @@ class TidalMigrationManager:
         with sync_playwright() as p:
             self.playwright = p
             # Determinar canal y User-Agent dinámico limpio para esta sesión
-            channel = None if (self.use_proxy and (self.proxy_pe_server or self.proxy_ng_server)) else "chrome"
+            channel = "chrome"
             self.user_agent = obtener_user_agent_limpio(p, channel=channel)
             print(f"  [User-Agent] UA dinámico detectado y limpio: {self.user_agent}")
             # 1. Lanzar el navegador principal con el perfil persistente
             launch_args = [
-                "--disable-blink-features=AutomationControlled",
                 "--credentials-enable-service=false",
                 "--password-store=basic",
                 "--disable-autofill",
-                "--disable-save-password-bubble",
-                "--disable-gpu",
-                "--disable-software-rasterizer"
+                "--disable-save-password-bubble"
             ]
             
             proxy_dict = None
@@ -1780,13 +1777,12 @@ class TidalMigrationManager:
                 "user_data_dir": str(actual_profile),
                 "headless": self.headless,
                 "args": launch_args,
-                "ignore_default_args": ["--enable-automation"],
+                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
                 "viewport": {"width": 1280, "height": 800},
                 "locale": "es-ES",
-                "proxy": proxy_dict
+                "proxy": proxy_dict,
+                "channel": "chrome"
             }
-            if not proxy_dict:
-                launch_kwargs["channel"] = "chrome"
             if self.headless:
                 launch_kwargs["user_agent"] = self.user_agent
             self.context = p.chromium.launch_persistent_context(**launch_kwargs)
@@ -3163,14 +3159,11 @@ class TidalMigrationManager:
             
         # Re-lanzar navegador principal con el proxy de Nigeria
         launch_args = [
-            "--disable-blink-features=AutomationControlled",
             "--dns-prefetch-disable",
             "--credentials-enable-service=false",
             "--password-store=basic",
             "--disable-autofill",
-            "--disable-save-password-bubble",
-            "--disable-gpu",
-            "--disable-software-rasterizer"
+            "--disable-save-password-bubble"
         ]
         proxy_dict = None
         if self.use_proxy and self.proxy_ng_server:
@@ -3185,13 +3178,12 @@ class TidalMigrationManager:
             "user_data_dir": str(self.main_profile),
             "headless": self.headless,
             "args": launch_args,
-            "ignore_default_args": ["--enable-automation"],
+            "ignore_default_args": ["--enable-automation", "--no-sandbox"],
             "viewport": {"width": 1280, "height": 800},
             "locale": "es-ES",
-            "proxy": proxy_dict
+            "proxy": proxy_dict,
+            "channel": "chrome"
         }
-        if not proxy_dict:
-            launch_kwargs["channel"] = "chrome"
         if self.headless:
             launch_kwargs["user_agent"] = self.user_agent
         self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -3510,13 +3502,10 @@ class TidalMigrationManager:
             
         print("  [Navegador] Lanzando navegador principal con perfil local...")
         launch_args = [
-            "--disable-blink-features=AutomationControlled",
             "--credentials-enable-service=false",
             "--password-store=basic",
             "--disable-autofill",
-            "--disable-save-password-bubble",
-            "--disable-gpu",
-            "--disable-software-rasterizer"
+            "--disable-save-password-bubble"
         ]
         proxy_dict = None
         if self.use_proxy and self.proxy_pe_server:
@@ -3531,13 +3520,12 @@ class TidalMigrationManager:
             "user_data_dir": str(self.main_profile),
             "headless": self.headless,
             "args": launch_args,
-            "ignore_default_args": ["--enable-automation"],
+            "ignore_default_args": ["--enable-automation", "--no-sandbox"],
             "viewport": {"width": 1280, "height": 800},
             "locale": "es-ES",
-            "proxy": proxy_dict
+            "proxy": proxy_dict,
+            "channel": "chrome"
         }
-        if not proxy_dict:
-            launch_kwargs["channel"] = "chrome"
         if self.headless:
             launch_kwargs["user_agent"] = self.user_agent
         try:
@@ -4315,11 +4303,7 @@ class TidalMigrationManager:
                                 print(f"  [Paso 9] Nuevo proxy PE seleccionado: {self.proxy_pe_server}")
                         
                         # 2. Abrir navegador con perfil del plan familiar titular
-                        launch_args = [
-                            "--disable-blink-features=AutomationControlled",
-                            "--disable-gpu",
-                            "--disable-software-rasterizer"
-                        ]
+                        launch_args = []
                         proxy_dict = None
                         if self.use_proxy and self.proxy_pe_server:
                             proxy_dict = {"server": self.proxy_pe_server}
@@ -4333,13 +4317,12 @@ class TidalMigrationManager:
                             "user_data_dir": str(self.parent_profile),
                             "headless": self.headless,
                             "args": launch_args,
-                            "ignore_default_args": ["--enable-automation"],
+                            "ignore_default_args": ["--enable-automation", "--no-sandbox"],
                             "viewport": {"width": 1280, "height": 800},
                             "locale": "es-ES",
-                            "proxy": proxy_dict
+                            "proxy": proxy_dict,
+                            "channel": "chrome"
                         }
-                        if not proxy_dict:
-                            launch_kwargs["channel"] = "chrome"
                         if self.headless:
                             launch_kwargs["user_agent"] = self.user_agent
                         parent_context = p.chromium.launch_persistent_context(**launch_kwargs)
@@ -4700,17 +4683,13 @@ def configurar_perfiles():
         print("  (Se abrirá el navegador para Gmail y TuneMyMusic)")
         print("="*70)
         
-        launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-gpu",
-            "--disable-software-rasterizer"
-        ]
+        launch_args = []
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR_MAIN),
             channel="chrome",
             headless=False,
             args=launch_args,
-            ignore_default_args=["--enable-automation"],
+            ignore_default_args=["--enable-automation", "--no-sandbox"],
             viewport={"width": 1280, "height": 800},
             locale="es-ES"
         )
@@ -4741,7 +4720,7 @@ def configurar_perfiles():
             channel="chrome",
             headless=False,
             args=launch_args,
-            ignore_default_args=["--enable-automation"],
+            ignore_default_args=["--enable-automation", "--no-sandbox"],
             viewport={"width": 1280, "height": 800},
             locale="es-ES"
         )

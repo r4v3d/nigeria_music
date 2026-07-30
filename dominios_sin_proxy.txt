@@ -1,0 +1,23 @@
+# Dominios que NO deben pasar por el proxy (salen por tu conexión directa).
+#
+# Para qué sirve:
+#   El proveedor de proxies residenciales deniega los dominios de pago con
+#   "503 Target host denied". Los campos de tarjeta de Tidal son iframes de Adyen,
+#   así que a través del proxy nunca cargan y aparecen como cajas grises que no se
+#   pueden rellenar. Excluyendo esos dominios el formulario carga con normalidad,
+#   mientras el tráfico de Tidal sigue saliendo por el proxy (que es el que define
+#   el geo de la oferta).
+#
+# Las pasarelas conocidas (Adyen, Stripe, PayPal, Braintree...) y los proveedores
+# habituales de 3D Secure ya están incluidos en el script. Este fichero es solo para
+# añadir alguno que falte, típicamente el 3D Secure de tu banco.
+#
+# Cuándo añadir uno:
+#   Si durante el checkout ves un aviso como
+#     [Checkout] El navegador no pudo cargar la pasarela de pago (acs.mibanco.com)
+#   añade ese host aquí abajo, en una línea, y vuelve a lanzar la opción 14.
+#
+# Formato: un dominio por línea. Un punto inicial incluye los subdominios.
+#   .mibanco.com        -> mibanco.com y todos sus subdominios
+#   acs.mibanco.com     -> solo ese host
+#   https://acs.mibanco.com/3ds  -> también válido, se queda con el host

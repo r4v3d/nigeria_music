@@ -1,0 +1,5 @@
+4. Optimización del Uso de Memoria (Playwright Headless):
+   - Correr 5 navegadores en modo no-headless consume bastante memoria RAM.
+   - Probar y configurar una opción para correr en modo `headless` (segundo plano)
+     siempre que sea posible, habilitando el modo visual solo cuando se detecte
+     un problema que requiera intervención.

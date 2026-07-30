@@ -27,8 +27,11 @@ def login_tidal_cliente(context, client_email, client_pwd):
     # 1. Cerrar sesion actual de TIDAL
     print("  [Login] Cerrando sesion anterior de TIDAL...")
     try:
-        page.goto("https://account.tidal.com/logout", wait_until="domcontentloaded", timeout=15000)
-        time.sleep(2.0)
+        context.clear_cookies()
+    except Exception:
+        pass
+    try:
+        page.evaluate("() => { try { localStorage.clear(); } catch(e){} try { sessionStorage.clear(); } catch(e){} }")
     except Exception:
         pass
     
