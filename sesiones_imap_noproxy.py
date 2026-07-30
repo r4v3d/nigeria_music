@@ -93,6 +93,8 @@ class BarreraTolerante:
 # Protege 'tmm_cookies.json' de escrituras solapadas entre ventanas simultáneas.
 TMM_COOKIES_LOCK = threading.Lock()
 TMM_COOKIES_PATH = SCRIPT_DIR / "tmm_cookies.json"
+# Cookies que identifican la sesión de TuneMyMusic (no analytics).
+TMM_AUTH_COOKIE_NAMES = frozenset({"PHPSESSID", "ttune", "TMM_Unique_Cross"})
 
 # Serializa escrituras de CSV en descargas/ (OneDrive + varias ventanas a la vez).
 DESCARGAS_CSV_LOCK = threading.Lock()
@@ -118,8 +120,66 @@ class Color:
     UNDERLINE = '\033[4m'
 
 
+def _cookie_es_tmm(c: dict) -> bool:
+    return "tunemymusic.com" in (c.get("domain") or "")
+
+
+def _cookie_tmm_vigente(c: dict, ahora: float | None = None) -> bool:
+    """True si la cookie sigue válida. expires=-1 (sesión) NO cuenta como expirada."""
+    if "expires" not in c or c.get("expires") is None:
+        return True
+    try:
+        exp = float(c["expires"])
+    except (TypeError, ValueError):
+        return True
+    # Playwright marca cookies de sesión con expires == -1
+    if exp < 0:
+        return True
+    return exp >= (ahora if ahora is not None else time.time())
+
+
+def _cookie_tmm_para_playwright(c: dict) -> dict | None:
+    """Normaliza una cookie TMM para context.add_cookies (omite expires de sesión)."""
+    if not _cookie_es_tmm(c) or not c.get("name"):
+        return None
+    out = {
+        "name": c["name"],
+        "value": c.get("value", ""),
+        "domain": c.get("domain") or "",
+        "path": c.get("path") or "/",
+        "httpOnly": bool(c.get("httpOnly", False)),
+        "secure": bool(c.get("secure", False)),
+    }
+    ss = c.get("sameSite")
+    if isinstance(ss, str):
+        ss_norm = ss.strip().capitalize() if ss.strip().lower() != "none" else "None"
+        if ss_norm in ("Strict", "Lax", "None"):
+            out["sameSite"] = ss_norm
+    try:
+        exp = float(c["expires"]) if c.get("expires") is not None else None
+    except (TypeError, ValueError):
+        exp = None
+    if exp is not None and exp > 0:
+        out["expires"] = exp
+    if out.get("sameSite") == "None":
+        out["secure"] = True
+    return out
+
+
+def _sesion_tmm_en_cookies(cookies: list) -> bool:
+    """Heurística: hay señales de login TMM (no solo _ga / consent)."""
+    by_name = {}
+    for c in cookies or []:
+        if _cookie_es_tmm(c) and c.get("name"):
+            by_name[c["name"]] = c.get("value") or ""
+    ttune = by_name.get("ttune", "")
+    cross = by_name.get("TMM_Unique_Cross", "")
+    php = by_name.get("PHPSESSID", "")
+    return (len(ttune) > 20) or (len(cross) > 15 and len(php) > 8) or (len(php) > 8 and len(ttune) > 10)
+
+
 def cargar_cookies_tmm() -> list:
-    """Lee las cookies de TuneMyMusic descartando las expiradas, tolerando lecturas parciales."""
+    """Lee cookies TMM vigentes (incluye sesión expires=-1) normalizadas para Playwright."""
     with TMM_COOKIES_LOCK:
         if not TMM_COOKIES_PATH.exists():
             return []
@@ -127,24 +187,50 @@ def cargar_cookies_tmm() -> list:
             cookies_data = json.loads(TMM_COOKIES_PATH.read_text(encoding="utf-8"))
         except Exception:
             return []
+    if not isinstance(cookies_data, list):
+        return []
     ahora = time.time()
-    return [c for c in cookies_data if not ("expires" in c and c["expires"] < ahora)]
+    out = []
+    for c in cookies_data:
+        if not isinstance(c, dict):
+            continue
+        if not _cookie_es_tmm(c) or not _cookie_tmm_vigente(c, ahora):
+            continue
+        norm = _cookie_tmm_para_playwright(c)
+        if norm:
+            out.append(norm)
+    return out
 
 
-def guardar_cookies_tmm(cookies_context: list) -> bool:
-    """Fusiona y guarda las cookies de TuneMyMusic de forma atómica y serializada entre hilos."""
+def guardar_cookies_tmm(cookies_context: list, forzar: bool = False) -> bool:
+    """Fusiona y guarda cookies TMM. No deja que una ventana anónima pise la sesión logueada."""
     with TMM_COOKIES_LOCK:
         fusionadas = {}
         if TMM_COOKIES_PATH.exists():
             try:
                 for c in json.loads(TMM_COOKIES_PATH.read_text(encoding="utf-8")):
-                    if "tunemymusic.com" in c.get("domain", ""):
-                        fusionadas[f"{c.get('domain','')}:{c.get('name','')}"] = c
+                    if isinstance(c, dict) and _cookie_es_tmm(c):
+                        fusionadas[f"{c.get('domain', '')}:{c.get('name', '')}"] = c
             except Exception:
                 pass
-        for c in cookies_context or []:
-            if "tunemymusic.com" in c.get("domain", ""):
-                fusionadas[f"{c.get('domain','')}:{c.get('name','')}"] = c
+
+        incoming = [c for c in (cookies_context or []) if isinstance(c, dict) and _cookie_es_tmm(c)]
+        disco_tiene_sesion = _sesion_tmm_en_cookies(list(fusionadas.values()))
+        incoming_tiene_sesion = _sesion_tmm_en_cookies(incoming)
+
+        for c in incoming:
+            key = f"{c.get('domain', '')}:{c.get('name', '')}"
+            name = c.get("name") or ""
+            # Ventana sin login no debe sobrescribir PHPSESSID/ttune de una sesión guardada
+            if (
+                not forzar
+                and disco_tiene_sesion
+                and not incoming_tiene_sesion
+                and name in TMM_AUTH_COOKIE_NAMES
+            ):
+                continue
+            fusionadas[key] = c
+
         if not fusionadas:
             return False
         try:
@@ -154,6 +240,48 @@ def guardar_cookies_tmm(cookies_context: list) -> bool:
             return True
         except Exception:
             return False
+
+
+def inyectar_cookies_tmm(context, client_email: str = "") -> int:
+    """Carga e inyecta cookies TMM una a una (un fallo no tumba el resto). Devuelve cuántas entraron."""
+    valid_cookies = cargar_cookies_tmm()
+    if not valid_cookies:
+        return 0
+    etiqueta = f" [{client_email}]" if client_email else ""
+    inyectadas = 0
+    for c in valid_cookies:
+        try:
+            context.add_cookies([c])
+            inyectadas += 1
+        except Exception as e_one:
+            print(f"  [TuneMyMusic]{etiqueta} [WARN] Cookie '{c.get('name')}' no inyectada: {e_one}")
+    if inyectadas:
+        sesion = "con sesión" if _sesion_tmm_en_cookies(valid_cookies) else "sin señales claras de login"
+        print(f"  [TuneMyMusic]{etiqueta} Precargadas {inyectadas}/{len(valid_cookies)} cookies "
+              f"desde 'tmm_cookies.json' ({sesion}).")
+    return inyectadas
+
+
+def persistir_cookies_tmm_contexto(context, client_email: str = "", forzar: bool = False) -> bool:
+    """Guarda cookies TMM del contexto si hay algo útil; informa si hay sesión."""
+    if not context:
+        return False
+    try:
+        cookies = context.cookies()
+    except Exception:
+        return False
+    tmm = [c for c in cookies if _cookie_es_tmm(c)]
+    if not tmm:
+        return False
+    ok = guardar_cookies_tmm(cookies, forzar=forzar)
+    if ok:
+        etiqueta = f" [{client_email}]" if client_email else ""
+        if _sesion_tmm_en_cookies(tmm):
+            print(f"  [TuneMyMusic]{etiqueta} Sesión guardada en 'tmm_cookies.json' "
+                  f"({len(tmm)} cookies TMM).")
+        else:
+            print(f"  [TuneMyMusic]{etiqueta} Cookies TMM actualizadas (aún sin señales claras de login).")
+    return ok
 
 
 def csv_parece_valido(path: Path, min_bytes: int = 32) -> bool:
@@ -5155,10 +5283,7 @@ class TidalRegisterManager:
                 ctx.set_default_timeout(45000)
                 ctx.add_init_script(STEALTH_SCRIPT)
                 try:
-                    valid_cookies = cargar_cookies_tmm()
-                    if valid_cookies:
-                        ctx.add_cookies(valid_cookies)
-                        print(f"  [TuneMyMusic] [{self.client_email}] Sesión precargada desde 'tmm_cookies.json'.")
+                    inyectar_cookies_tmm(ctx, self.client_email)
                 except Exception as e:
                     print(f"  [TuneMyMusic] [WARN] Error al cargar cookies de TuneMyMusic: {e}")
                 if getattr(self, "cookies_tidal", None):
@@ -5360,8 +5485,8 @@ class TidalRegisterManager:
         finally:
             # Guardar cookies de TuneMyMusic antes de cerrar
             try:
-                if self.context and guardar_cookies_tmm(self.context.cookies()):
-                    print(f"  [TuneMyMusic] [{self.client_email}] Cookies actualizadas en 'tmm_cookies.json'.")
+                if self.context:
+                    persistir_cookies_tmm_contexto(self.context, self.client_email)
             except Exception as e:
                 print(f"  [TuneMyMusic] [WARN] Error al guardar cookies de TuneMyMusic: {e}")
 
@@ -8059,8 +8184,8 @@ class TidalAutoLoginManager:
 
             # Guardar cookies de TuneMyMusic antes de cerrar
             try:
-                if self.context and guardar_cookies_tmm(self.context.cookies()):
-                    print(f"  [TuneMyMusic] [{self.client_email}] Cookies actualizadas en 'tmm_cookies.json'.")
+                if self.context and persistir_cookies_tmm_contexto(self.context, self.client_email):
+                    pass
             except Exception as ce:
                 print(f"  [TuneMyMusic] [WARN] Falló al guardar cookies para {self.client_email}: {ce}")
 
@@ -8493,17 +8618,38 @@ class TidalAutoLoginManager:
             non_tidal = [c for c in cookies if "tidal.com" not in c.get("domain", "").lower()]
             self.context.clear_cookies()
             if non_tidal:
-                self.context.add_cookies(non_tidal)
+                # Reinyectar una a una por si alguna cookie residual no es válida para Playwright
+                for c in non_tidal:
+                    try:
+                        if "tunemymusic.com" in (c.get("domain") or ""):
+                            continue  # las TMM se inyectan limpias abajo
+                        norm = {
+                            "name": c.get("name", ""),
+                            "value": c.get("value", ""),
+                            "domain": c.get("domain", ""),
+                            "path": c.get("path") or "/",
+                            "httpOnly": bool(c.get("httpOnly", False)),
+                            "secure": bool(c.get("secure", False)),
+                        }
+                        if c.get("sameSite") in ("Strict", "Lax", "None"):
+                            norm["sameSite"] = c["sameSite"]
+                        try:
+                            exp = float(c["expires"]) if c.get("expires") is not None else None
+                        except (TypeError, ValueError):
+                            exp = None
+                        if exp is not None and exp > 0:
+                            norm["expires"] = exp
+                        if norm["name"]:
+                            self.context.add_cookies([norm])
+                    except Exception:
+                        pass
             print(f"  [Perfil Limpio] [{self.client_email}] Sesiones previas de Tidal limpiadas.")
         except Exception:
             pass
 
-        # Cargar cookies de TuneMyMusic si existen
+        # Cargar cookies de TuneMyMusic (incluye PHPSESSID de sesión: expires=-1)
         try:
-            valid_cookies = cargar_cookies_tmm()
-            if valid_cookies:
-                self.context.add_cookies(valid_cookies)
-                print(f"  [TuneMyMusic] [{self.client_email}] Sesión precargada desde 'tmm_cookies.json'.")
+            inyectar_cookies_tmm(self.context, self.client_email)
         except Exception as e:
             print(f"  [TuneMyMusic] [WARN] Error al cargar cookies: {e}")
                 
@@ -9775,12 +9921,20 @@ class TidalAutoLoginManager:
                         
                 if not tmm_loaded:
                     print(f"  [TuneMyMusic] {Color.WARNING}[WARN] [{self.client_email}] No se pudo cargar automáticamente la portada de TuneMyMusic por red/proxy, pero la ventana permanecerá abierta.{Color.ENDC}")
+                else:
+                    # Dar tiempo a que la API refresque PHPSESSID tras inyectar cookies y persistir
+                    time.sleep(2.0)
+                    try:
+                        persistir_cookies_tmm_contexto(self.context, self.client_email)
+                    except Exception:
+                        pass
             except Exception as ex_tmm_init:
                 print(f"  [TuneMyMusic] {Color.WARNING}[WARN] [{self.client_email}] Error al iniciar pestaña TuneMyMusic: {ex_tmm_init}{Color.ENDC}")
             
             # Mantener el hilo de Playwright vivo para procesar eventos de descargas y cierres,
             # y detectar si TuneMyMusic muestra aviso de "No se encontraron listas de reproducción"
             print(f"  [TuneMyMusic] [{self.client_email}] Listo para transferencias. Esperando descargas o aviso de cuenta vacía...")
+            print(f"  [TuneMyMusic] [{self.client_email}] Si inicias sesión en TuneMyMusic, se guardará sola en 'tmm_cookies.json'.")
             self.sin_playlists = False
             # Frases completas: un "sin listas" suelto no basta (falso positivo de cuenta vacía).
             frases_cuenta_vacia = [
@@ -9789,6 +9943,7 @@ class TidalAutoLoginManager:
                 "no tracks found", "no music found"
             ]
             inicio_espera_tmm = time.time()
+            ultimo_guardado_tmm = 0.0
             # Snapshot del CSV exacto de ESTA cuenta (no alias): un archivo viejo no cuenta como éxito
             csv_exacto = DESCARGAS_DIR / f"{self.client_email}.csv"
             prev_mtime = 0.0
@@ -9861,6 +10016,15 @@ class TidalAutoLoginManager:
                             print(f"  {Color.WARNING}[TuneMyMusic] [{self.client_email}] La cuenta no contiene playlists/canciones ('No se encontraron listas de reproducción').{Color.ENDC}")
                             self.sin_playlists = True
                             break
+
+                        # Persistir sesión TMM cada ~20s (tras login manual o refresh de PHPSESSID)
+                        ahora_tmm = time.time()
+                        if ahora_tmm - ultimo_guardado_tmm >= 20.0:
+                            try:
+                                if persistir_cookies_tmm_contexto(self.context, self.client_email):
+                                    ultimo_guardado_tmm = ahora_tmm
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     self.tmm_page.wait_for_timeout(500)
@@ -9899,7 +10063,7 @@ class TidalAutoLoginManager:
             # Guardar cookies de TuneMyMusic como respaldo antes de finalizar el hilo
             try:
                 if self.context:
-                    guardar_cookies_tmm(self.context.cookies())
+                    persistir_cookies_tmm_contexto(self.context, self.client_email)
             except Exception:
                 pass
 
