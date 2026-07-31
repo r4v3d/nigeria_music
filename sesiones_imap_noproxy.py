@@ -674,6 +674,11 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
                     p = parts[1].strip().strip('"').strip("'")
                     if clean_email(c) == correo_clean:
                         return p
+                    try:
+                        if son_correos_equivalentes(c, correo_solicitado) and p:
+                            return p
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -694,6 +699,90 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
             pass
 
     return None
+
+
+def cargar_mapa_cuentas_sesiones() -> dict[str, str]:
+    """Lee sesiones_imap_cuentas.txt → {correo: contraseña} (orden de archivo)."""
+    path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+    cuentas_map: dict[str, str] = {}
+    if not path_cuentas.exists():
+        return cuentas_map
+    try:
+        for line in path_cuentas.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line_normalized = line.replace(",", " ").replace("=", " ")
+            parts = line_normalized.split()
+            if len(parts) >= 2:
+                correo = parts[0].strip().strip('"').strip("'")
+                pwd = parts[1].strip().strip('"').strip("'")
+                if correo and "@" in correo and pwd:
+                    cuentas_map[correo] = pwd
+    except Exception:
+        pass
+    return cuentas_map
+
+
+def filtrar_cuentas_por_correos_activos(
+    cuentas_map: dict[str, str],
+    correos_activos: list[str] | None,
+) -> dict[str, str] | None:
+    """Deja solo las cuentas del archivo que coinciden con los correos activos del menú.
+
+    Los correos activos se fijan al inicio o con la opción 6. Así varias instancias del
+    script pueden compartir el mismo sesiones_imap_cuentas.txt y procesar subsets distintos
+    en paralelo, sin preguntar.
+
+    Devuelve None si había activos pero ninguno está en el archivo (caller debe abortar).
+    Si correos_activos está vacío/None, devuelve el mapa completo.
+    """
+    if not cuentas_map:
+        return {}
+    if not correos_activos:
+        return dict(cuentas_map)
+
+    filtrado: dict[str, str] = {}
+    usados_arch: set[str] = set()
+    sin_match: list[str] = []
+
+    for c_menu in correos_activos:
+        c_menu = (c_menu or "").strip()
+        if not c_menu or "@" not in c_menu:
+            continue
+        elegido = None
+        for c_arch, pwd in cuentas_map.items():
+            if c_arch in usados_arch:
+                continue
+            if clean_email(c_arch) == clean_email(c_menu) or son_correos_equivalentes(c_arch, c_menu):
+                elegido = c_arch
+                break
+        if elegido is None:
+            sin_match.append(c_menu)
+            continue
+        filtrado[elegido] = cuentas_map[elegido]
+        usados_arch.add(elegido)
+
+    total_arch = len(cuentas_map)
+    print(f"\n{Color.CYAN}[Correos activos]{Color.ENDC} Menú: {len(correos_activos)} | "
+          f"Archivo: {total_arch} | A procesar: {len(filtrado)}")
+    for c_arch in filtrado:
+        print(f"  {Color.GREEN}✓{Color.ENDC} {c_arch}")
+    if sin_match:
+        print(f"{Color.WARNING}[Correos activos] Sin fila en sesiones_imap_cuentas.txt "
+              f"(se omiten):{Color.ENDC}")
+        for c in sin_match:
+            print(f"  {Color.FAIL}✗{Color.ENDC} {c}")
+
+    if not filtrado:
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} Ningún correo activo del menú está en "
+              f"sesiones_imap_cuentas.txt. Usa la opción 6 o anota correo+contraseña en el archivo.")
+        return None
+
+    if len(filtrado) < total_arch:
+        print(f"{Color.CYAN}[Correos activos]{Color.ENDC} Se omiten {total_arch - len(filtrado)} "
+              f"cuenta(s) del archivo que no están en el menú (otras instancias pueden usarlas).")
+    return filtrado
 
 
 def guardar_credencial_cuenta(correo: str, pwd: str) -> bool:
@@ -2252,11 +2341,13 @@ def _destinatario_es_para_alias(gmail_user: str, recipients_text: str, cuerpo_te
     return True
 
 
-def _extraer_codigos_otp(texto: str) -> list[str]:
+def _extraer_codigos_otp(texto: str, preferir_len: int | None = None) -> list[str]:
     """Extrae códigos OTP de 5–6 dígitos priorizando los junto a 'code'/'código'.
 
     Antes devolvía el primer número de 6 dígitos del HTML (fechas, tracking, etc.) y
     descartaba OTP reales tipo 202431 por parecer un año → Tidal rechazaba el código.
+
+    preferir_len: si es 5 o 6, esos códigos van primero (p. ej. 6 cajas en eliminación).
     """
     if not texto:
         return []
@@ -2297,19 +2388,39 @@ def _extraer_codigos_otp(texto: str) -> list[str]:
     ):
         _add(m.group(1), prioritario=True)
 
-    # 2) Dígitos partidos por HTML/espacios: "1 2 3 4 5 6"
-    for m in re.finditer(r"(?<!\d)(?:\d[\s\-]){4,5}\d(?!\d)", texto):
+    # 2) Dígitos partidos por HTML/espacios: "1 2 3 4 5 6" o spans sueltos
+    for m in re.finditer(r"(?<!\d)(?:\d[\s\-\u00a0]){4,5}\d(?!\d)", texto):
+        _add(re.sub(r"\D", "", m.group(0)), prioritario=True)
+    # Dígitos separados solo por etiquetas HTML: >1</span><span>2</...
+    solo_digitos_html = re.sub(r"(?<=>)\s+(\d)\s+(?=<)", r"\1", texto)
+    for m in re.finditer(
+        r"(?<!\d)(?:\d(?:\s*</?(?:span|b|strong|td|font)[^>]*>\s*)+){4,5}\d(?!\d)",
+        solo_digitos_html,
+        flags=re.I,
+    ):
         _add(re.sub(r"\D", "", m.group(0)), prioritario=True)
 
     # 3) Cualquier 5–6 dígitos suelto (menor prioridad)
     for m in re.findall(r"\b(\d{5,6})\b", texto):
         _add(m, prioritario=False)
 
-    # Preferir 6 dígitos (Tidal sign-up) dentro de cada grupo
+    # Preferir longitud pedida (6 en eliminación) y luego 6 dígitos genéricos
     def _ordenar(grupo: list[str]) -> list[str]:
-        return sorted(grupo, key=lambda c: (0 if len(c) == 6 else 1, grupo.index(c)))
+        pref = int(preferir_len) if preferir_len in (5, 6) else 6
 
-    return _ordenar(prioritarios) + _ordenar(normales)
+        def _clave(c: str):
+            return (0 if len(c) == pref else 1, 0 if len(c) == 6 else 1, grupo.index(c))
+
+        return sorted(grupo, key=_clave)
+
+    combined = _ordenar(prioritarios) + _ordenar(normales)
+    # Reordenar el resultado global: un 6 dígitos "normal" debe ganar a un 5 prioritario
+    # cuando preferir_len=6 (asistente de eliminación con 6 cajas).
+    if preferir_len in (5, 6):
+        pref = [c for c in combined if len(c) == preferir_len]
+        otros = [c for c in combined if len(c) != preferir_len]
+        return pref + otros
+    return combined
 
 
 def _texto_indica_codigo_invalido(texto: str) -> bool:
@@ -2716,13 +2827,14 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
 def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_password=None, 
                              query_from="tidal", required_keywords=None, query_exclude=None, 
                              max_age_minutes=15, after_email_id=0, solo_link=False,
-                             aliases_extra=None) -> str | None:
+                             aliases_extra=None, preferir_otp_len: int | None = None) -> str | None:
     """Lee correos de Gmail via IMAP sin necesidad de abrir el navegador.
     Requiere una 'App Password' de Google.
     Busca dinámicamente en passwords.txt la contraseña específica del correo.
 
     aliases_extra: otros correos/alias que también cuentan como destinatario válido
     (p. ej. nombre de acceso + correo registrado en opción 15).
+    preferir_otp_len: 5 o 6 para priorizar esa longitud (p. ej. 6 cajas en eliminación).
     """
     import imaplib
     import email
@@ -2901,7 +3013,7 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             
             # Buscar codigo OTP (juntos o partidos por HTML) en asunto + cuerpo
             if not solo_link:
-                codigos = _extraer_codigos_otp(text_to_check)
+                codigos = _extraer_codigos_otp(text_to_check, preferir_len=preferir_otp_len)
                 if codigos:
                     if not _reclamar_uid_correo(buzon_clave, msg_id_int):
                         continue
@@ -4062,16 +4174,252 @@ def hacer_click_por_textos(page, textos: list) -> bool:
             pass
     return False
 
+def contar_cajas_otp_visibles(page) -> int:
+    """Cuenta inputs OTP visibles (maxlength=1 / one-time-code) en la página actual."""
+    try:
+        page = pagina_vigente(page)
+        n = page.evaluate("""() => {
+            const esOtp = (el) => {
+                const max = (el.getAttribute('maxlength') || '').trim();
+                const ac = (el.autocomplete || '').toLowerCase();
+                const mode = (el.inputMode || '').toLowerCase();
+                const name = (el.name || '').toLowerCase();
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
+                    return false;
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) return false;
+                // Solo cajas de un dígito (asistente de eliminación Tidal) o one-time-code único
+                return max === '1' || ac === 'one-time-code'
+                    || (mode === 'numeric' && max === '1')
+                    || ((name.includes('code') || name.includes('otp')) && max === '1');
+            };
+            return Array.from(document.querySelectorAll('input')).filter(esOtp).length;
+        }""")
+        return int(n or 0)
+    except Exception:
+        return 0
+
+
+def leer_otp_cajas_visibles(page) -> str:
+    """Lee el valor concatenado de las cajas OTP visibles."""
+    try:
+        page = pagina_vigente(page)
+        return page.evaluate("""() => {
+            const esOtp = (el) => {
+                const max = (el.getAttribute('maxlength') || '').trim();
+                const ac = (el.autocomplete || '').toLowerCase();
+                const mode = (el.inputMode || '').toLowerCase();
+                const name = (el.name || '').toLowerCase();
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
+                    return false;
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) return false;
+                return max === '1' || ac === 'one-time-code'
+                    || (mode === 'numeric' && max === '1')
+                    || ((name.includes('code') || name.includes('otp')) && max === '1');
+            };
+            return Array.from(document.querySelectorAll('input'))
+                .filter(esOtp)
+                .map(el => (el.value || '').trim())
+                .join('');
+        }""") or ""
+    except Exception:
+        return ""
+
+
+def boton_eliminar_cuenta_habilitado(page):
+    """Localiza el botón rosa del asistente ('delete-button') habilitado.
+
+    NO usa enlaces genéricos 'Eliminar cuenta' del menú/sidebar: esos están siempre
+    clicables y al pulsarlos se sale del paso de verificación hacia el inicio sin borrar.
+    """
+    page = pagina_vigente(page)
+    for frame in page.frames:
+        try:
+            loc = frame.locator("button.delete-button")
+            cnt = loc.count()
+            for idx in range(cnt):
+                btn = loc.nth(idx)
+                try:
+                    if not btn.is_visible():
+                        continue
+                    if btn.is_disabled():
+                        continue
+                    # Preferir el CTA ancho del asistente
+                    return btn
+                except Exception:
+                    continue
+        except Exception:
+            continue
+        # Fallback estricto: botón cuyo texto exacto es Eliminar cuenta / Delete account
+        # y que NO esté en el nav lateral (sin .delete-button a veces en A/B).
+        try:
+            clicked_info = frame.evaluate("""() => {
+                const isVisible = (e) => {
+                    const st = window.getComputedStyle(e);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    const r = e.getBoundingClientRect();
+                    return r.width > 40 && r.height > 20;
+                };
+                const inNav = (e) => !!(e.closest('nav, aside, [class*="sidebar"], [class*="SideBar"], header'));
+                const cand = Array.from(document.querySelectorAll('button'))
+                    .filter(b => {
+                        if (b.disabled || !isVisible(b) || inNav(b)) return false;
+                        const t = (b.textContent || '').trim().toLowerCase();
+                        return t === 'eliminar cuenta' || t === 'delete account';
+                    });
+                if (!cand.length) return null;
+                // Preferir fullwidth / delete-button
+                cand.sort((a, b) => {
+                    const score = (el) => (el.classList.contains('delete-button') ? 0 : 1)
+                        + (el.classList.contains('fullwidth') ? 0 : 1);
+                    return score(a) - score(b);
+                });
+                const el = cand[0];
+                el.setAttribute('data-tidal-del-btn', '1');
+                return true;
+            }""")
+            if clicked_info:
+                btn = frame.locator('button[data-tidal-del-btn="1"]').first
+                if btn.count() > 0 and btn.is_visible() and not btn.is_disabled():
+                    return btn
+        except Exception:
+            continue
+    return None
+
+
+def esperar_boton_eliminar_cuenta_habilitado(page, timeout_s: float = 12.0):
+    """Espera a que el botón delete-button del asistente se habilite tras un OTP válido."""
+    limite = time.time() + max(1.0, float(timeout_s))
+    while time.time() < limite:
+        page = pagina_vigente(page)
+        btn = boton_eliminar_cuenta_habilitado(page)
+        if btn:
+            return btn
+        time.sleep(0.35)
+    return None
+
+
+def clic_confirmar_eliminacion_asistente(page) -> bool:
+    """Pulsa el CTA real del asistente de borrado (nunca el enlace del menú)."""
+    page = pagina_vigente(page)
+    btn = boton_eliminar_cuenta_habilitado(page)
+    if btn:
+        try:
+            btn.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        try:
+            btn.click(timeout=8000)
+            return True
+        except Exception:
+            try:
+                btn.click(force=True, timeout=5000)
+                return True
+            except Exception:
+                pass
+    # JS: solo button.delete-button enabled, fuera del nav
+    try:
+        return bool(page.evaluate("""() => {
+            const isVisible = (e) => {
+                const st = window.getComputedStyle(e);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                const r = e.getBoundingClientRect();
+                return r.width > 40 && r.height > 20;
+            };
+            const inNav = (e) => !!(e.closest('nav, aside, [class*="sidebar"], [class*="SideBar"], header'));
+            const btns = Array.from(document.querySelectorAll('button.delete-button, button'))
+                .filter(b => {
+                    if (b.disabled || !isVisible(b) || inNav(b)) return false;
+                    if (b.classList.contains('delete-button')) return true;
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    return t === 'eliminar cuenta' || t === 'delete account';
+                });
+            if (!btns.length) return false;
+            btns.sort((a, b) => (b.classList.contains('delete-button') ? 1 : 0)
+                - (a.classList.contains('delete-button') ? 1 : 0));
+            btns[0].click();
+            return true;
+        }"""))
+    except Exception:
+        return False
+
+
+def url_parece_exito_o_fin_eliminacion(url: str) -> bool:
+    u = (url or "").lower()
+    if not u:
+        return False
+    if "account-deleted" in u or "deletion-success" in u or "deleted=true" in u:
+        return True
+    if "login.tidal.com" in u or "/authorize" in u:
+        return True
+    return False
+
+
+def url_parece_abandono_eliminacion(url: str) -> bool:
+    """True si salimos del asistente hacia el inicio/overview sin completar el borrado."""
+    u = (url or "").lower()
+    if not u:
+        return False
+    if "account-deletion" in u:
+        return False
+    if url_parece_exito_o_fin_eliminacion(u):
+        return False
+    # tidal.com marketing / overview de cuenta = se salió del wizard
+    if u.rstrip("/") in ("https://tidal.com", "http://tidal.com", "https://www.tidal.com"):
+        return True
+    if "tidal.com" in u and "account.tidal.com" not in u and "login.tidal.com" not in u:
+        return True
+    if "account.tidal.com" in u and any(x in u for x in (
+        "/profile", "/subscription", "/overview", "/payment", "/family", "/store"
+    )):
+        return True
+    if u.rstrip("/").endswith("account.tidal.com"):
+        return True
+    return False
+
+
 def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
-    """Ingresa un código de verificación (una caja o 6 cajas OTP). Exige lectura == código."""
+    """Ingresa un código de verificación (una caja o N cajas OTP). Exige lectura == código.
+
+    Crítico en eliminación (opción 15): hay que rellenar TODAS las cajas visibles.
+    Nunca acepta éxito solo porque JS escribió en el DOM (React dejaría el botón disabled).
+    """
     codigo = re.sub(r"\D", "", str(codigo or ""))
     if not codigo:
         return False
 
+    page = pagina_vigente(page)
+    n_cajas = contar_cajas_otp_visibles(page)
+    codigos_a_probar = [codigo]
+    if n_cajas >= 4:
+        if len(codigo) > n_cajas:
+            codigos_a_probar = [codigo[:n_cajas]]
+        elif len(codigo) < n_cajas:
+            pad = ("0" * (n_cajas - len(codigo))) + codigo
+            codigos_a_probar = [pad, codigo]
+            print(f"  [OTP] Código de {len(codigo)} dígitos con {n_cajas} cajas; "
+                  f"se probará también '{pad}'.")
+
+    for codigo_try in codigos_a_probar:
+        if _escribir_codigo_otp_intento(page, codigo_try):
+            return True
+    return False
+
+
+def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
+    """Un intento de escritura OTP (longitud fija)."""
+    codigo = re.sub(r"\D", "", str(codigo or ""))
+    if not codigo:
+        return False
+    page = pagina_vigente(page)
+
     for frame in page.frames:
         try:
             code_inputs = []
-            for poll in range(10):
+            for _poll in range(10):
                 inputs = frame.locator('input').all()
                 code_inputs = []
                 otp_estrictos = []
@@ -4090,7 +4438,6 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                         autocomplete = (ip.get_attribute("autocomplete") or "").lower()
                         maxlength = (ip.get_attribute("maxlength") or "").strip()
                         aria = (ip.get_attribute("aria-label") or "").lower()
-
                         es_otp_estricto = (
                             maxlength == "1"
                             or autocomplete == "one-time-code"
@@ -4114,7 +4461,6 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                                 otp_estrictos.append(ip)
                     except Exception:
                         pass
-                # Preferir solo cajas OTP reales (evita rellenar otros inputs del asistente).
                 if len(otp_estrictos) >= min(4, len(codigo)):
                     code_inputs = otp_estrictos
                 elif len(otp_estrictos) == 1 and len(codigo) >= 4:
@@ -4147,13 +4493,49 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                         except Exception:
                             pass
 
-            # Varias cajas (Tidal: 6 inputs maxlength=1)
-            if len(code_inputs) >= 4:
-                objetivos = code_inputs[:len(codigo)]
-                if len(objetivos) < len(codigo):
-                    continue
+            def _exito_completo(objetivos, esperado: str) -> bool:
+                if leer_cajas(objetivos) == esperado:
+                    return True
+                return leer_otp_cajas_visibles(page) == esperado
 
-                # 1) JS solo sobre maxlength=1 / one-time-code (React controlado)
+            # Varias cajas OTP
+            if len(code_inputs) >= 4:
+                if len(code_inputs) < len(codigo):
+                    continue
+                objetivos = code_inputs[:len(codigo)]
+
+                # 1) Teclado humano (mejor con React)
+                limpiar_cajas(code_inputs[:len(codigo)])
+                try:
+                    objetivos[0].click(timeout=800)
+                except Exception:
+                    pass
+                time.sleep(0.15)
+                try:
+                    page.keyboard.type(codigo, delay=90)
+                except Exception:
+                    pass
+                time.sleep(0.3)
+                if _exito_completo(objetivos, codigo):
+                    return True
+
+                # 2) Caja por caja
+                limpiar_cajas(objetivos)
+                for idx, digit in enumerate(codigo):
+                    try:
+                        objetivos[idx].click(timeout=800)
+                        objetivos[idx].fill("")
+                        objetivos[idx].type(digit, delay=80)
+                    except Exception:
+                        try:
+                            objetivos[idx].fill(digit)
+                        except Exception:
+                            pass
+                    time.sleep(0.05)
+                if _exito_completo(objetivos, codigo):
+                    return True
+
+                # 3) JS + InputEvent — éxito solo si la lectura coincide
                 try:
                     ok_js = frame.evaluate(
                         """([digitos]) => {
@@ -4176,57 +4558,29 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                             const targets = inputs.slice(0, digitos.length);
                             targets.forEach((el, i) => {
                                 el.focus();
-                                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                                const setter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'value')?.set;
                                 if (setter) setter.call(el, digitos[i]);
                                 else el.value = digitos[i];
                                 el.dispatchEvent(new Event('input', { bubbles: true }));
+                                try {
+                                    el.dispatchEvent(new InputEvent('input', {
+                                        bubbles: true, data: digitos[i], inputType: 'insertText'
+                                    }));
+                                } catch (e) {}
                                 el.dispatchEvent(new Event('change', { bubbles: true }));
-                                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: digitos[i] }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', {
+                                    bubbles: true, key: digitos[i]
+                                }));
                             });
                             return targets.every((el, i) => (el.value || '') === digitos[i]);
                         }""",
                         list(codigo),
                     )
-                    if ok_js and leer_cajas(objetivos) == codigo:
-                        return True
-                    if ok_js:
-                        # JS dice OK aunque Playwright lea distinto (shadow/React): aceptar
+                    if ok_js and _exito_completo(objetivos, codigo):
                         return True
                 except Exception:
                     pass
-
-                # 2) Caja por caja con type()
-                limpiar_cajas(objetivos)
-                for idx, digit in enumerate(codigo):
-                    try:
-                        objetivos[idx].click(timeout=800)
-                        objetivos[idx].fill("")
-                        objetivos[idx].type(digit, delay=80)
-                    except Exception:
-                        try:
-                            objetivos[idx].fill(digit)
-                        except Exception:
-                            pass
-                    time.sleep(0.05)
-                if leer_cajas(objetivos) == codigo:
-                    return True
-
-                # 3) Secuencia de teclado desde la primera caja
-                limpiar_cajas(objetivos)
-                try:
-                    objetivos[0].click(timeout=800)
-                except Exception:
-                    pass
-                time.sleep(0.2)
-                for digit in codigo:
-                    try:
-                        page.keyboard.type(digit, delay=100)
-                    except Exception:
-                        break
-                    time.sleep(0.08)
-                if leer_cajas(objetivos) == codigo:
-                    return True
-                # Nunca tratar cajas vacías como éxito
                 continue
 
             # Una sola caja
@@ -4245,7 +4599,6 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                     return True
             except Exception:
                 pass
-            # Fallback JS
             try:
                 ok = frame.evaluate(
                     """(code) => {
@@ -4263,13 +4616,14 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                     }""",
                     codigo,
                 )
-                if ok:
+                if ok and (target.input_value() or "").strip() == codigo:
                     return True
             except Exception:
                 pass
         except Exception:
             continue
     return False
+
 
 def encontrar_locator_en_frames(page, selectors: list, label_regex=None, text_regex=None):
     """Busca en todos los frames el primer localizador visible.
@@ -9611,24 +9965,19 @@ def restablecer_contrasenas_tidal(correos=None):
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
         
-    cuentas_map = {}
-    for line in path_cuentas.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            correo = parts[0].strip()
-            pwd = parts[1].strip()
-            cuentas_map[correo] = pwd
-            
+    cuentas_map = cargar_mapa_cuentas_sesiones()
     if not cuentas_map:
         print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
+
+    cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
+    if cuentas_map is None:
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
         
     correos_lista = list(cuentas_map.keys())
-    print(f"\nSe cargaron {len(correos_lista)} cuentas desde 'sesiones_imap_cuentas.txt'.")
+    print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
     headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
     headless = headless_opt in ("s", "si", "yes", "y")
@@ -10189,12 +10538,15 @@ class TidalAutoLoginManager:
             try:
                 btn_clicked = self.page.evaluate("""
                     () => {
-                        const textos = ['Continuar', 'Continue', 'Siguiente', 'Next', 'Confirmar', 'Confirm', 'Eliminar cuenta', 'Delete account', 'Eliminar', 'Delete'];
+                        // Solo avanzar el wizard: NUNCA 'Eliminar cuenta' aquí (eso es el CTA final
+                        // del paso OTP; pulsar enlaces del menú con ese texto saca del asistente).
+                        const textos = ['Continuar', 'Continue', 'Siguiente', 'Next'];
                         const buscar = (root) => {
                             const isVisible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+                            const inNav = (e) => !!(e.closest('nav, aside, [class*="sidebar"], header'));
                             for (const el of root.querySelectorAll('button, a, [role="button"]')) {
                                 const text = (el.textContent || '').trim();
-                                if (textos.includes(text) && isVisible(el) && !el.disabled) {
+                                if (textos.includes(text) && isVisible(el) && !el.disabled && !inNav(el)) {
                                     el.click();
                                     return true;
                                 }
@@ -10684,28 +11036,83 @@ class TidalAutoLoginManager:
                 pass
         return False
 
-    def esperar_y_confirmar_eliminacion(self, timeout_s: float = 15.0) -> bool:
-        """Tras pulsar confirmar: espera señal UI y confirma borrado real vía /profile.
+    def esperar_y_confirmar_eliminacion(self, timeout_s: float = 45.0) -> bool:
+        """Tras pulsar confirmar: permanece en el asistente (Paso 4 si aparece) y luego verifica /profile.
 
-        No trata 'login' en la URL del asistente/OAuth como éxito (falso positivo habitual).
+        Si el clic erróneo manda a tidal.com / overview, NO se marca éxito: se intenta recuperar
+        el asistente. Tampoco se navega a /profile de inmediato (interrumpía el Paso 4).
         """
         self.page = pagina_vigente(self.page)
         senal_ui = False
-        limite = time.time() + timeout_s
+        limite = time.time() + max(15.0, float(timeout_s))
+        ultimo_log = 0.0
+
         while time.time() < limite:
             try:
                 self.page = pagina_vigente(self.page)
                 url = (self.page.url or "").lower()
-                # Solo señales inequívocas en UI; salir de account-deletion puede ser OAuth, no borrado
-                if "deleted" in url or "account-deleted" in url:
+
+                if url_parece_exito_o_fin_eliminacion(url):
                     senal_ui = True
+                    print(f"  [Eliminación] [{self.client_email}] URL post-borrado: {url[:90]}")
                     break
+
                 if self._texto_exito_eliminacion_visible():
                     senal_ui = True
                     break
+
                 if self._error_codigo_eliminacion_visible():
                     print(f"  [Eliminación] [{self.client_email}] Código rechazado en el asistente.")
                     return False
+
+                # Clic erróneo / menú: salió del asistente al inicio sin borrar
+                if url_parece_abandono_eliminacion(url):
+                    print(f"  [Eliminación] [{self.client_email}] {Color.WARNING}Se salió del asistente "
+                          f"hacia '{url[:70]}' sin completar el borrado. Reabriendo...{Color.ENDC}")
+                    try:
+                        self.page.goto(
+                            "https://account.tidal.com/account-deletion",
+                            wait_until="domcontentloaded",
+                            timeout=35000,
+                        )
+                        time.sleep(1.5)
+                        aceptar_cookies_con_espera(self.page)
+                        if self.hay_campo_codigo():
+                            return False  # volver a OTP: el caller debe reintentar
+                        # Posible Paso 4 u otro paso sin OTP
+                        if clic_confirmar_eliminacion_asistente(self.page):
+                            print(f"  [Eliminación] [{self.client_email}] Re-pulsado CTA tras reabrir asistente.")
+                            time.sleep(2.0)
+                        continue
+                    except Exception as e_re:
+                        print(f"  [Eliminación] [{self.client_email}] [WARN] Reabrir asistente: {e_re}")
+                        return False
+
+                # Paso 4 de 4 u otra confirmación final: volver a pulsar delete-button
+                if "account-deletion" in url:
+                    try:
+                        body = (self.page.evaluate(
+                            "() => document.body ? document.body.innerText : ''"
+                        ) or "").lower()
+                    except Exception:
+                        body = ""
+                    es_paso_final = (
+                        "paso 4" in body or "step 4" in body
+                        or "última confirmación" in body or "last confirmation" in body
+                        or ("confirm" in body and "eliminar" in body and not self.hay_campo_codigo())
+                    )
+                    if es_paso_final or (
+                        not self.hay_campo_codigo()
+                        and boton_eliminar_cuenta_habilitado(self.page)
+                    ):
+                        ahora = time.time()
+                        if ahora - ultimo_log > 4.0:
+                            print(f"  [Eliminación] [{self.client_email}] Posible Paso 4 / "
+                                  f"confirmación final; pulsando 'Eliminar cuenta' de nuevo...")
+                            ultimo_log = ahora
+                        if clic_confirmar_eliminacion_asistente(self.page):
+                            time.sleep(2.0)
+                            continue
             except Exception:
                 pass
             time.sleep(0.5)
@@ -10713,9 +11120,10 @@ class TidalAutoLoginManager:
         if senal_ui:
             print(f"  [Eliminación] [{self.client_email}] Señal de éxito en UI; confirmando en /profile...")
         else:
-            print(f"  [Eliminación] [{self.client_email}] Sin señal UI clara; confirmando borrado en /profile...")
+            print(f"  [Eliminación] [{self.client_email}] Sin señal UI clara tras el asistente; "
+                  f"confirmando borrado en /profile...")
 
-        return self.confirmar_cuenta_eliminada(20.0)
+        return self.confirmar_cuenta_eliminada(25.0)
 
     def esperar_redireccion_login_o_sesion(self, timeout_s: float = 12.0) -> None:
         """Tras abrir account.tidal.com/, espera a que Tidal decida: login OAuth o sesión real."""
@@ -12117,6 +12525,12 @@ class TidalAutoLoginManager:
                 if tiene_contrasena_imap_registrada(self.client_email):
                     buzones_a_probar.append(self.client_email)
 
+            # Cuántas cajas OTP hay (Tidal eliminación suele ser 5 dígitos). Guía la extracción IMAP.
+            n_cajas_otp = contar_cajas_otp_visibles(self.page)
+            prefer_len = n_cajas_otp if n_cajas_otp in (5, 6) else 5
+            print(f"  [Eliminación] [{self.client_email}] Cajas OTP visibles: {n_cajas_otp or '?'}; "
+                  f"se prioriza código de {prefer_len} dígitos.")
+
             print(f"  [Eliminación] [{self.client_email}] Buscando código en IMAP "
                   f"({', '.join(buzones_a_probar)})...")
             for intento in range(1, 19):
@@ -12136,6 +12550,7 @@ class TidalAutoLoginManager:
                         after_email_id=usar_baseline,
                         max_age_minutes=45,
                         aliases_extra=aliases_imap,
+                        preferir_otp_len=prefer_len,
                     )
                     if codigo_eliminacion:
                         if not son_correos_equivalentes(buzon, self.correo_registrado_perfil):
@@ -12143,6 +12558,12 @@ class TidalAutoLoginManager:
                                   f"de acceso '{buzon}' (no en el registrado).")
                         break
                 if codigo_eliminacion:
+                    digs = re.sub(r"\D", "", str(codigo_eliminacion))
+                    n_ahora = contar_cajas_otp_visibles(self.page) or prefer_len
+                    if n_ahora >= 5 and len(digs) != n_ahora:
+                        print(f"  [Eliminación] [{self.client_email}] OTP '{digs}' "
+                              f"({len(digs)} dígitos) vs {n_ahora} cajas visibles; "
+                              f"se intentará escribir/adaptar de todos modos.")
                     break
                 if intento < 18:
                     time.sleep(8.0)
@@ -12175,36 +12596,52 @@ class TidalAutoLoginManager:
                         print(f"  [Eliminación] [{self.client_email}] [WARN] Reapertura: {e_re}")
 
                 codigo_escrito = False
-                for intento_write in range(1, 4):
+                for intento_write in range(1, 5):
                     if not self.hay_campo_codigo():
                         print(f"  [Eliminación] [{self.client_email}] [WARN] Intento escritura "
-                              f"{intento_write}/3: aún no hay campo de código.")
+                              f"{intento_write}/4: aún no hay campo de código.")
                         time.sleep(1.0)
                         continue
                     if escribir_codigo_verificacion_inteligente(self.page, codigo_eliminacion):
-                        codigo_escrito = True
-                        break
+                        # Éxito real = delete-button del asistente habilitado (NO el menú lateral)
+                        btn_ready = esperar_boton_eliminar_cuenta_habilitado(self.page, timeout_s=8.0)
+                        if btn_ready:
+                            codigo_escrito = True
+                            break
+                        print(f"  [Eliminación] [{self.client_email}] [WARN] OTP escrito pero "
+                              f"button.delete-button sigue deshabilitado (intento {intento_write}/4). "
+                              f"Reescribiendo...")
+                        time.sleep(0.8)
+                        continue
                     print(f"  [Eliminación] [{self.client_email}] [WARN] Escritura OTP falló "
-                          f"({intento_write}/3). Reintentando...")
+                          f"({intento_write}/4). Reintentando...")
                     time.sleep(1.2)
 
                 if codigo_escrito:
-                    print(f"  [Eliminación] [{self.client_email}] Código ingresado correctamente.")
-                    time.sleep(2.0)
-                    btn_confirmar = esperar_locator_en_frames(
-                        self.page,
-                        [
-                            "button[type='submit']",
-                            "button:has-text('Eliminar cuenta')", "button:has-text('Delete account')",
-                            "button:has-text('Confirmar')", "button:has-text('Confirm')",
-                            "button:has-text('Eliminar')", "button:has-text('Delete')",
-                        ],
-                        timeout_s=15.0,
-                    )
-                    if btn_confirmar:
-                        print(f"  [Eliminación] [{self.client_email}] Confirmando eliminación...")
-                        btn_confirmar.click()
-                        if self.esperar_y_confirmar_eliminacion(20.0):
+                    print(f"  [Eliminación] [{self.client_email}] Código ingresado correctamente "
+                          f"(CTA delete-button habilitado).")
+                    time.sleep(0.6)
+                    print(f"  [Eliminación] [{self.client_email}] Confirmando eliminación "
+                          f"(asistente, no menú)...")
+                    clicked = clic_confirmar_eliminacion_asistente(self.page)
+                    if not clicked:
+                        print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo pulsar "
+                              f"button.delete-button del asistente.{Color.ENDC}")
+                    else:
+                        time.sleep(1.5)
+                        # Si tras el clic seguimos en verify con OTP, el clic no aplicó
+                        try:
+                            url_mid = (pagina_vigente(self.page).url or "").lower()
+                        except Exception:
+                            url_mid = ""
+                        if "view=verify" in url_mid and self.hay_campo_codigo():
+                            print(f"  [Eliminación] [{self.client_email}] [WARN] Seguimos en "
+                                  f"view=verify tras el clic; reintentando CTA...")
+                            time.sleep(1.0)
+                            clic_confirmar_eliminacion_asistente(self.page)
+                            time.sleep(1.5)
+
+                        if self.esperar_y_confirmar_eliminacion(45.0):
                             print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
                                   f"eliminada correctamente.{Color.ENDC}")
                             exito_eliminacion = True
@@ -12214,43 +12651,26 @@ class TidalAutoLoginManager:
                                 url_post = (pagina_vigente(self.page).url or "").lower()
                             except Exception:
                                 pass
-                            if "login.tidal.com" in url_post or "/authorize" in url_post:
+                            if url_parece_exito_o_fin_eliminacion(url_post):
                                 print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
-                                      f"eliminada (pestaña en login/authorize).{Color.ENDC}")
+                                      f"eliminada (URL login/authorize).{Color.ENDC}")
                                 exito_eliminacion = True
+                            elif url_parece_abandono_eliminacion(url_post):
+                                print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] El flujo "
+                                      f"terminó en inicio/overview ({url_post[:70]}) sin borrar la cuenta."
+                                      f"{Color.ENDC}")
                             else:
-                                btn_final = esperar_locator_en_frames(
-                                    self.page,
-                                    [
-                                        "button:has-text('Eliminar cuenta')",
-                                        "button:has-text('Delete account')",
-                                        "button:has-text('Confirmar')",
-                                        "button:has-text('Confirm')",
-                                    ],
-                                    timeout_s=5.0,
-                                )
-                                if btn_final:
-                                    btn_final.click()
-                                    if self.esperar_y_confirmar_eliminacion(20.0):
+                                # Último intento: Paso 4 residual
+                                if clic_confirmar_eliminacion_asistente(self.page):
+                                    if self.esperar_y_confirmar_eliminacion(30.0):
                                         print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta "
                                               f"{self.client_email} eliminada (confirmación "
                                               f"secundaria).{Color.ENDC}")
                                         exito_eliminacion = True
-                                    else:
-                                        try:
-                                            url_post2 = (pagina_vigente(self.page).url or "").lower()
-                                        except Exception:
-                                            url_post2 = ""
-                                        if "login.tidal.com" in url_post2 or "/authorize" in url_post2:
-                                            print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta "
-                                                  f"{self.client_email} eliminada (authorize).{Color.ENDC}")
-                                            exito_eliminacion = True
-                    else:
-                        print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se encontró "
-                              f"el botón de confirmación.{Color.ENDC}")
                 else:
                     print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo ingresar "
-                          f"el código de verificación tras varios intentos.{Color.ENDC}")
+                          f"el código de forma que habilite button.delete-button del asistente."
+                          f"{Color.ENDC}")
         except Exception as ex_el:
             print(f"  {Color.FAIL}[Eliminación] [ERROR] [{self.client_email}] {ex_el}{Color.ENDC}")
 
@@ -12340,36 +12760,19 @@ def iniciar_sesion_automatico_tidal(correos):
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
         
-    cuentas_map = {}
-    for line in path_cuentas.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            correo = parts[0].strip()
-            pwd = parts[1].strip()
-            cuentas_map[correo] = pwd
-            
+    cuentas_map = cargar_mapa_cuentas_sesiones()
     if not cuentas_map:
         print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
+
+    cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
+    if cuentas_map is None:
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
         
     correos_lista = list(cuentas_map.keys())
-    print(f"\nSe cargaron {len(correos_lista)} cuentas desde 'sesiones_imap_cuentas.txt'.")
-
-    # Los correos activos del menú no son la fuente de credenciales, pero sí pueden acotar el lote
-    activos_en_archivo = []
-    for c_menu in (correos or []):
-        for c_arch in correos_lista:
-            if son_correos_equivalentes(c_menu, c_arch) and c_arch not in activos_en_archivo:
-                activos_en_archivo.append(c_arch)
-    if activos_en_archivo and len(activos_en_archivo) < len(correos_lista):
-        print(f"\n{Color.WARNING}[Info]{Color.ENDC} {len(activos_en_archivo)} de los {len(correos_lista)} correos del archivo coinciden con los correos activos del menú.")
-        resp_sel = input("¿Procesar solo los correos activos del menú? (s/n, por defecto 'n' = todas las del archivo): ").strip().lower()
-        if resp_sel in ("s", "si", "sí", "yes", "y"):
-            correos_lista = activos_en_archivo
+    print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
     headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
     headless = headless_opt in ("s", "si", "yes", "y")
@@ -12530,35 +12933,20 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
 
-    cuentas_map = {}
-    for line in path_cuentas.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            cuentas_map[parts[0].strip()] = parts[1].strip()
-
+    cuentas_map = cargar_mapa_cuentas_sesiones()
     if not cuentas_map:
         print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en "
               f"'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
 
-    correos_lista = list(cuentas_map.keys())
-    print(f"\nSe cargaron {len(correos_lista)} cuentas desde 'sesiones_imap_cuentas.txt'.")
+    cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
+    if cuentas_map is None:
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
 
-    activos_en_archivo = []
-    for c_menu in (correos or []):
-        for c_arch in correos_lista:
-            if son_correos_equivalentes(c_menu, c_arch) and c_arch not in activos_en_archivo:
-                activos_en_archivo.append(c_arch)
-    if activos_en_archivo and len(activos_en_archivo) < len(correos_lista):
-        print(f"\n{Color.WARNING}[Info]{Color.ENDC} {len(activos_en_archivo)} de los {len(correos_lista)} "
-              f"correos del archivo coinciden con los correos activos del menú.")
-        resp_sel = input("¿Procesar solo los correos activos del menú? (s/n, por defecto 'n' = todas): ").strip().lower()
-        if resp_sel in ("s", "si", "sí", "yes", "y"):
-            correos_lista = activos_en_archivo
+    correos_lista = list(cuentas_map.keys())
+    print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
     headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
     headless = headless_opt in ("s", "si", "yes", "y")
@@ -13538,7 +13926,7 @@ def menu_principal():
         print(" 3. Obtener CÓDIGO DE INICIO DE SESIÓN (Login Verification)")
         print(" 4. Buscar y aceptar ENLACE DE INVITACIÓN (auto-login + cerrar Chrome)")
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
-        print(" 6. Cambiar de correo electrónico")
+        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en 8–15)")
         print(" 7. Salir")
         print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
@@ -13734,6 +14122,8 @@ def menu_principal():
             print()
 
         elif opcion == "6":
+            print(f"\n{Color.CYAN}Introduce solo los correos que esta instancia debe procesar "
+                  f"(el resto del archivo queda para otras ventanas del script).{Color.ENDC}")
             correos = ingresar_correos()
                     
         elif opcion == "7":

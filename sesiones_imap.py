@@ -579,6 +579,90 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
     return None
 
 
+def cargar_mapa_cuentas_sesiones() -> dict[str, str]:
+    """Lee sesiones_imap_cuentas.txt → {correo: contraseña} (orden de archivo)."""
+    path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+    cuentas_map: dict[str, str] = {}
+    if not path_cuentas.exists():
+        return cuentas_map
+    try:
+        for line in path_cuentas.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line_normalized = line.replace(",", " ").replace("=", " ")
+            parts = line_normalized.split()
+            if len(parts) >= 2:
+                correo = parts[0].strip().strip('"').strip("'")
+                pwd = parts[1].strip().strip('"').strip("'")
+                if correo and "@" in correo and pwd:
+                    cuentas_map[correo] = pwd
+    except Exception:
+        pass
+    return cuentas_map
+
+
+def filtrar_cuentas_por_correos_activos(
+    cuentas_map: dict[str, str],
+    correos_activos: list[str] | None,
+) -> dict[str, str] | None:
+    """Deja solo las cuentas del archivo que coinciden con los correos activos del menú.
+
+    Los correos activos se fijan al inicio o con la opción 6. Así varias instancias del
+    script pueden compartir el mismo sesiones_imap_cuentas.txt y procesar subsets distintos
+    en paralelo, sin preguntar.
+
+    Devuelve None si había activos pero ninguno está en el archivo (caller debe abortar).
+    Si correos_activos está vacío/None, devuelve el mapa completo.
+    """
+    if not cuentas_map:
+        return {}
+    if not correos_activos:
+        return dict(cuentas_map)
+
+    filtrado: dict[str, str] = {}
+    usados_arch: set[str] = set()
+    sin_match: list[str] = []
+
+    for c_menu in correos_activos:
+        c_menu = (c_menu or "").strip()
+        if not c_menu or "@" not in c_menu:
+            continue
+        elegido = None
+        for c_arch in cuentas_map:
+            if c_arch in usados_arch:
+                continue
+            if clean_email(c_arch) == clean_email(c_menu) or son_correos_equivalentes(c_arch, c_menu):
+                elegido = c_arch
+                break
+        if elegido is None:
+            sin_match.append(c_menu)
+            continue
+        filtrado[elegido] = cuentas_map[elegido]
+        usados_arch.add(elegido)
+
+    total_arch = len(cuentas_map)
+    print(f"\n{Color.CYAN}[Correos activos]{Color.ENDC} Menú: {len(correos_activos)} | "
+          f"Archivo: {total_arch} | A procesar: {len(filtrado)}")
+    for c_arch in filtrado:
+        print(f"  {Color.GREEN}✓{Color.ENDC} {c_arch}")
+    if sin_match:
+        print(f"{Color.WARNING}[Correos activos] Sin fila en sesiones_imap_cuentas.txt "
+              f"(se omiten):{Color.ENDC}")
+        for c in sin_match:
+            print(f"  {Color.FAIL}✗{Color.ENDC} {c}")
+
+    if not filtrado:
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} Ningún correo activo del menú está en "
+              f"sesiones_imap_cuentas.txt. Usa la opción 6 o anota correo+contraseña en el archivo.")
+        return None
+
+    if len(filtrado) < total_arch:
+        print(f"{Color.CYAN}[Correos activos]{Color.ENDC} Se omiten {total_arch - len(filtrado)} "
+              f"cuenta(s) del archivo que no están en el menú (otras instancias pueden usarlas).")
+    return filtrado
+
+
 def guardar_credencial_cuenta(correo: str, pwd: str) -> bool:
     """Registra 'correo<TAB>contraseña' en sesiones_imap_cuentas.txt si aún no está.
 
@@ -9232,24 +9316,19 @@ def restablecer_contrasenas_tidal(correos=None):
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
         
-    cuentas_map = {}
-    for line in path_cuentas.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            correo = parts[0].strip()
-            pwd = parts[1].strip()
-            cuentas_map[correo] = pwd
-            
+    cuentas_map = cargar_mapa_cuentas_sesiones()
     if not cuentas_map:
         print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
+
+    cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
+    if cuentas_map is None:
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
         
     correos_lista = list(cuentas_map.keys())
-    print(f"\nSe cargaron {len(correos_lista)} cuentas desde 'sesiones_imap_cuentas.txt'.")
+    print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
     headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
     headless = headless_opt in ("s", "si", "yes", "y")
@@ -11813,36 +11892,19 @@ def iniciar_sesion_automatico_tidal(correos):
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
         
-    cuentas_map = {}
-    for line in path_cuentas.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            correo = parts[0].strip()
-            pwd = parts[1].strip()
-            cuentas_map[correo] = pwd
-            
+    cuentas_map = cargar_mapa_cuentas_sesiones()
     if not cuentas_map:
         print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
+
+    cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
+    if cuentas_map is None:
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
         
     correos_lista = list(cuentas_map.keys())
-    print(f"\nSe cargaron {len(correos_lista)} cuentas desde 'sesiones_imap_cuentas.txt'.")
-
-    # Los correos activos del menú no son la fuente de credenciales, pero sí pueden acotar el lote
-    activos_en_archivo = []
-    for c_menu in (correos or []):
-        for c_arch in correos_lista:
-            if son_correos_equivalentes(c_menu, c_arch) and c_arch not in activos_en_archivo:
-                activos_en_archivo.append(c_arch)
-    if activos_en_archivo and len(activos_en_archivo) < len(correos_lista):
-        print(f"\n{Color.WARNING}[Info]{Color.ENDC} {len(activos_en_archivo)} de los {len(correos_lista)} correos del archivo coinciden con los correos activos del menú.")
-        resp_sel = input("¿Procesar solo los correos activos del menú? (s/n, por defecto 'n' = todas las del archivo): ").strip().lower()
-        if resp_sel in ("s", "si", "sí", "yes", "y"):
-            correos_lista = activos_en_archivo
+    print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
     headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
     headless = headless_opt in ("s", "si", "yes", "y")
@@ -12753,7 +12815,7 @@ def menu_principal():
         print(" 3. Obtener CÓDIGO DE INICIO DE SESIÓN (Login Verification)")
         print(" 4. Buscar y aceptar ENLACE DE INVITACIÓN (auto-login + cerrar Chrome)")
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
-        print(" 6. Cambiar de correo electrónico")
+        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en el menú)")
         print(" 7. Salir")
         print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
@@ -12941,6 +13003,8 @@ def menu_principal():
             print()
             
         elif opcion == "6":
+            print(f"\n{Color.CYAN}Introduce solo los correos que esta instancia debe procesar "
+                  f"(el resto del archivo queda para otras ventanas del script).{Color.ENDC}")
             correos = ingresar_correos()
                     
         elif opcion == "7":
