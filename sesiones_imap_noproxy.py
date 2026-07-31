@@ -8516,6 +8516,54 @@ def guardar_titulares_familiares(titulares: list[dict], path: Path):
         lines.append("")
 
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def agrupar_miembros_por_titular_familiar(
+    correos_miembros: list[str],
+    path: Path | None = None,
+) -> tuple[list[dict], list[str], Path]:
+    """Agrupa correos de miembros según bloques TITULAR / MIEMBROS de titular_familiar.txt.
+
+    Cada trabajo: {"correo_titular": str, "miembros": [str, ...]}.
+    Un miembro solo se asigna al primer titular cuyo bloque MIEMBROS lo liste
+    (comparación EXACTA con puntos).
+    """
+    if path is None:
+        path = SCRIPT_DIR / "titular_familiar.txt"
+        if not path.exists():
+            path = SCRIPT_DIR / "perfiles" / "familiar_titular.txt"
+
+    titulares, _ = parsear_titular_familiar_txt_opcion11(path)
+    trabajos: list[dict] = []
+    asignados: list[str] = []
+
+    for t in titulares:
+        plan = list(t.get("miembros_invitar") or [])
+        if not plan:
+            continue
+        miembros_t: list[str] = []
+        for m in correos_miembros:
+            if not m or "@" not in str(m):
+                continue
+            if any(correos_iguales_exacto(m, a) for a in asignados):
+                continue
+            if any(correos_iguales_exacto(m, p) for p in plan):
+                miembros_t.append(str(m).strip())
+                asignados.append(str(m).strip())
+        if miembros_t:
+            trabajos.append({
+                "correo_titular": (t.get("correo") or "").strip(),
+                "miembros": miembros_t,
+            })
+
+    sin_mapa = [
+        str(m).strip()
+        for m in correos_miembros
+        if m and "@" in str(m) and not any(correos_iguales_exacto(m, a) for a in asignados)
+    ]
+    return trabajos, sin_mapa, path
+
+
 def _pw_error_types():
     from playwright.sync_api import Error as PlaywrightError
     return (PlaywrightError,)
@@ -9022,9 +9070,16 @@ def invitar_miembro_plan_familiar_con_reintentos(
     return False
 
 class TidalFamilyInviter:
-    def __init__(self, queue_miembros: queue.Queue, client_email: str = "titular_familiar",
-                 perfil_dir: Path | None = None):
+    def __init__(
+        self,
+        queue_miembros: queue.Queue,
+        client_email: str = "titular_familiar",
+        perfil_dir: Path | None = None,
+        trabajos_por_titular: list[dict] | None = None,
+    ):
         self.queue_miembros = queue_miembros
+        # Trabajos explícitos opción 9: [{correo_titular, miembros}, ...] según titular_familiar.txt
+        self.trabajos_por_titular = list(trabajos_por_titular or [])
         self.playwright = None
         self.context = None
         self.page = None
@@ -10179,123 +10234,144 @@ class TidalFamilyInviter:
         try:
             titulares, path = cargar_titulares_familiares()
             if not titulares:
-                print(f"  {Color.FAIL}[Inviter] ERROR: No se encontraron titulares en perfiles/familiar_titular.txt ni titular_familiar.txt{Color.ENDC}")
+                print(f"  {Color.FAIL}[Inviter] ERROR: No se encontraron titulares en "
+                      f"perfiles/familiar_titular.txt ni titular_familiar.txt{Color.ENDC}")
                 return
-                
-            idx_titular = -1
-            for i, t in enumerate(titulares):
-                if t["estado"] == "disponible" and t["usados"] < 5:
-                    idx_titular = i
-                    break
-                    
-            if idx_titular == -1:
-                print(f"  {Color.FAIL}[Inviter] ERROR: No hay titulares con cupos libres en {path.name}{Color.ENDC}")
-                return
-                
-            titular = titulares[idx_titular]
-            self.abrir_navegador()
-            print(f"  [Inviter] {Color.CYAN}Iniciando Paso 9 con login limpio del perfil de Chrome para la cuenta titular ({titular['correo']})...{Color.ENDC}")
-            self.logout_titular()
-            
-            while True:
-                miembro_correo = self.queue_miembros.get()
-                if miembro_correo is None:
-                    self.queue_miembros.task_done()
-                    break
-                    
-                print(f"\n  [Inviter] Procesando invitación para: {miembro_correo}...")
-                
-                logeado = self.asegurar_login_titular(titular)
-                if not logeado:
-                    print(f"  {Color.FAIL}[Inviter] ERROR al logearse en titular: {titular['correo']}{Color.ENDC}")
-                    self.queue_miembros.task_done()
-                    continue
-                    
-                # Sincronizar y validar cupos reales en Tidal
-                tiene_cupos = self.sincronizar_y_validar_cupos_titular(titular, titulares, path)
-                if not tiene_cupos:
-                    # Buscar el siguiente titular disponible
-                    idx_titular = -1
-                    for i, t in enumerate(titulares):
-                        if t["estado"] == "disponible" and t["usados"] < 5:
-                            idx_titular = i
-                            break
-                    if idx_titular != -1:
-                        titular = titulares[idx_titular]
-                        print(f"  [Inviter] Cambiando al siguiente titular disponible: {titular['correo']}")
-                        self.queue_miembros.put(miembro_correo)
-                        self.queue_miembros.task_done()
-                        continue
-                    else:
-                        print(f"  {Color.FAIL}[Inviter] ADVERTENCIA: No quedan más titulares disponibles en la lista.{Color.ENDC}")
+
+            # Preferir trabajos ya mapeados (opción 9: miembro → titular de titular_familiar.txt).
+            trabajos = list(self.trabajos_por_titular or [])
+            if not trabajos:
+                # Compatibilidad: cola plana → resolver contra bloques MIEMBROS del archivo.
+                miembros_cola: list[str] = []
+                while True:
+                    item = self.queue_miembros.get()
+                    if item is None:
                         self.queue_miembros.task_done()
                         break
-                    
-                invitado_ok = self.enviar_invitacion_familiar(titular, miembro_correo)
-                if invitado_ok:
-                    miembro_clean = miembro_correo.strip().rstrip('.').lower()
-                    miembros_unicos = []
-                    for m in titular.get("miembros", []):
-                        m_c = m.strip().rstrip('.').lower()
-                        if m_c and m_c not in miembros_unicos and m_c != titular["correo"].strip().lower():
-                            miembros_unicos.append(m_c)
-                    if miembro_clean not in miembros_unicos:
-                        miembros_unicos.append(miembro_clean)
+                    miembros_cola.append(str(item).strip())
+                    self.queue_miembros.task_done()
+                trabajos, sin_mapa, path = agrupar_miembros_por_titular_familiar(miembros_cola, path)
+                for m in sin_mapa:
+                    print(f"  {Color.WARNING}[Inviter] '{m}' no aparece en ningún bloque MIEMBROS "
+                          f"de {path.name}; se omite.{Color.ENDC}")
 
-                    titular["miembros"] = miembros_unicos
-                    titular["usados"] = len(titular["miembros"])
+            if not trabajos:
+                print(f"  {Color.FAIL}[Inviter] ERROR: No hay miembros asignados a ningún titular "
+                      f"en {path.name}.{Color.ENDC}")
+                return
 
-                    esta_lleno_real = False
-                    if titular["usados"] >= 5:
-                        time.sleep(1.0)
-                        esta_lleno_real = self.page.evaluate("""() => {
-                            const bodyText = document.body ? document.body.innerText : '';
-                            if (/\\b5\\s*(?:de|of)\\s*5\\b/i.test(bodyText)) return true;
+            print(f"  [Inviter] {Color.CYAN}Plan de invitaciones según {path.name}:{Color.ENDC}")
+            for tj in trabajos:
+                print(f"    • Titular {tj['correo_titular']} → {len(tj['miembros'])} miembro(s): "
+                      f"{tj['miembros']}")
 
-                            const addKws = ['invitar a un familiar', 'invitar familiar', 'invitar miembro', 'agregar miembro', 'add family member', 'add member'];
-                            const buttons = Array.from(document.querySelectorAll('button, a, div, span, p, [role="button"]'));
-                            const hasAddBtn = buttons.some(el => {
-                                const t = (el.textContent || '').trim().toLowerCase();
-                                return addKws.some(kw => t.includes(kw));
-                            });
-                            return !hasAddBtn;
-                        }""")
+            self.abrir_navegador()
+            self.logout_titular()
 
-                    if esta_lleno_real:
-                        titular["estado"] = "lleno"
-                        print(f"  [Inviter] {Color.WARNING}El plan familiar de {titular['correo']} se ha llenado (5/5). Cerrando sesión...{Color.ENDC}")
-                        self.logout_titular()
+            for tj in trabajos:
+                correo_titular = (tj.get("correo_titular") or "").strip()
+                miembros = list(tj.get("miembros") or [])
+                if not correo_titular or not miembros:
+                    continue
 
-                        idx_titular = -1
-                        for i, t in enumerate(titulares):
-                            if t["estado"] == "disponible" and t["usados"] < 5:
-                                idx_titular = i
-                                break
-                        if idx_titular != -1:
-                            titular = titulares[idx_titular]
-                            print(f"  [Inviter] Cambiando al siguiente titular disponible: {titular['correo']}")
-                        else:
-                            print(f"  {Color.FAIL}[Inviter] ADVERTENCIA: No quedan más titulares disponibles en la lista.{Color.ENDC}")
-                            guardar_titulares_familiares(titulares, path)
-                            self.queue_miembros.task_done()
-                            break
+                titular = next(
+                    (t for t in titulares if correos_iguales_exacto(t.get("correo") or "", correo_titular)),
+                    None,
+                )
+                if titular is None:
+                    print(f"  {Color.FAIL}[Inviter] Titular '{correo_titular}' no está en "
+                          f"{path.name}. Se omiten: {miembros}{Color.ENDC}")
+                    continue
 
-                    guardar_titulares_familiares(titulares, path)
-                else:
-                    # No descartar del todo: a veces Tidal añade al miembro segundos después.
-                    # Se deja constancia; el siguiente ciclo de sincronización lo detectará.
-                    print(f"  [Inviter] {Color.WARNING}Invitación no confirmada para {miembro_correo}; se continúa con el siguiente.{Color.ENDC}")
+                print(f"\n  [Inviter] {Color.CYAN}{Color.BOLD}=== Titular {titular['correo']} "
+                      f"({len(miembros)} invitación/es) ==={Color.ENDC}")
+                self.logout_titular()
 
-                # Pausa entre invitaciones: invitaciones seguidas disparan el "error inesperado" de Tidal
-                time.sleep(random.uniform(2.0, 3.5))
+                logeado = self.asegurar_login_titular(titular)
+                if not logeado:
+                    print(f"  {Color.FAIL}[Inviter] ERROR al logearse en titular: "
+                          f"{titular['correo']}. Se omiten sus miembros.{Color.ENDC}")
+                    continue
 
-                self.queue_miembros.task_done()
-                
+                tiene_cupos = self.sincronizar_y_validar_cupos_titular(titular, titulares, path)
+                if not tiene_cupos:
+                    print(f"  {Color.WARNING}[Inviter] Titular {titular['correo']} sin cupos "
+                          f"(lleno). No se reasignan miembros a otro titular.{Color.ENDC}")
+                    continue
+
+                for miembro_correo in miembros:
+                    print(f"\n  [Inviter] Procesando invitación para: {miembro_correo} "
+                          f"(titular {titular['correo']})...")
+
+                    # Revalidar cupos antes de cada invitación
+                    if int(titular.get("usados") or 0) >= 5 or titular.get("estado") == "lleno":
+                        print(f"  {Color.WARNING}[Inviter] Titular {titular['correo']} ya está "
+                              f"lleno; se detienen el resto de sus invitaciones.{Color.ENDC}")
+                        break
+
+                    if not self.asegurar_login_titular(titular):
+                        print(f"  {Color.FAIL}[Inviter] Se perdió la sesión del titular "
+                              f"{titular['correo']}.{Color.ENDC}")
+                        break
+
+                    invitado_ok = self.enviar_invitacion_familiar(titular, miembro_correo)
+                    if invitado_ok:
+                        miembro_clean = miembro_correo.strip().rstrip('.').lower()
+                        miembros_unicos = []
+                        for m in titular.get("miembros", []):
+                            m_c = m.strip().rstrip('.').lower()
+                            if (
+                                m_c
+                                and m_c not in miembros_unicos
+                                and m_c != titular["correo"].strip().lower()
+                            ):
+                                miembros_unicos.append(m_c)
+                        if miembro_clean not in miembros_unicos:
+                            miembros_unicos.append(miembro_clean)
+
+                        titular["miembros"] = miembros_unicos
+                        titular["usados"] = len(titular["miembros"])
+
+                        esta_lleno_real = False
+                        if titular["usados"] >= 5:
+                            time.sleep(1.0)
+                            try:
+                                esta_lleno_real = self.page.evaluate("""() => {
+                                    const bodyText = document.body ? document.body.innerText : '';
+                                    if (/\\b5\\s*(?:de|of)\\s*5\\b/i.test(bodyText)) return true;
+                                    const addKws = ['invitar a un familiar', 'invitar familiar',
+                                        'invitar miembro', 'agregar miembro', 'add family member',
+                                        'add member'];
+                                    const buttons = Array.from(document.querySelectorAll(
+                                        'button, a, div, span, p, [role="button"]'));
+                                    const hasAddBtn = buttons.some(el => {
+                                        const t = (el.textContent || '').trim().toLowerCase();
+                                        return addKws.some(kw => t.includes(kw));
+                                    });
+                                    return !hasAddBtn;
+                                }""")
+                            except Exception:
+                                esta_lleno_real = titular["usados"] >= 5
+
+                        if esta_lleno_real:
+                            titular["estado"] = "lleno"
+                            print(f"  [Inviter] {Color.WARNING}El plan familiar de "
+                                  f"{titular['correo']} se ha llenado (5/5).{Color.ENDC}")
+
+                        guardar_titulares_familiares(titulares, path)
+                    else:
+                        print(f"  [Inviter] {Color.WARNING}Invitación no confirmada para "
+                              f"{miembro_correo}; se continúa con el siguiente.{Color.ENDC}")
+
+                    time.sleep(random.uniform(2.0, 3.5))
+
+                # Cerrar sesión antes del siguiente titular (puntos distintos = cuenta distinta)
+                self.logout_titular()
+
         except Exception as ex:
             print(f"  {Color.FAIL}[Inviter] ERROR crítico en hilo inviter: {ex}{Color.ENDC}")
         finally:
             self.cerrar_recursos()
-            # Cerrar la conexión IMAP reutilizable del hilo para no dejarla abierta contra Gmail
             cerrar_sesion_imap_hilo()
             print("  [Inviter] Hilo de invitación finalizado y ventana de Chrome cerrada.")
 
@@ -10353,26 +10429,38 @@ def restablecer_contrasenas_tidal(correos=None):
 
     inviter = None
     inviter_thread = None
-    if len(correos_lista) >= 6:
-        print(f"\n{Color.WARNING}[Info] Se detectaron {len(correos_lista)} correos (>= 6). Se omite el paso de invitación al plan familiar.{Color.ENDC}")
-    else:
-        path_titular = SCRIPT_DIR / "titular_familiar.txt"
-        if not path_titular.exists():
-            path_titular = SCRIPT_DIR / "perfiles" / "familiar_titular.txt"
+    # Invitar solo los correos procesados, cada uno al titular de su bloque en titular_familiar.txt
+    path_titular = SCRIPT_DIR / "titular_familiar.txt"
+    if not path_titular.exists():
+        path_titular = SCRIPT_DIR / "perfiles" / "familiar_titular.txt"
 
-        _, miembros_anotados = parsear_titular_familiar_txt_opcion11(path_titular)
-        miembros_a_invitar = miembros_anotados if miembros_anotados else correos_lista
-
-        print(f"  [Paso 9] Miembros a invitar al plan familiar ({len(miembros_a_invitar)}): {miembros_a_invitar}")
+    trabajos_inv, sin_mapa_inv, path_titular = agrupar_miembros_por_titular_familiar(
+        correos_lista, path_titular
+    )
+    if sin_mapa_inv:
+        print(f"\n{Color.WARNING}[Paso 9] Sin titular en {path_titular.name} para "
+              f"{len(sin_mapa_inv)} correo(s) (no estánarán a invitación):{Color.ENDC}")
+        for m in sin_mapa_inv:
+            print(f"    ✗ {m}")
+    if trabajos_inv:
+        print(f"\n  [Paso 9] Invitaciones según bloques de {path_titular.name}:")
+        total_m = 0
+        for tj in trabajos_inv:
+            total_m += len(tj["miembros"])
+            print(f"    • {tj['correo_titular']} ← {tj['miembros']}")
+        print(f"  [Paso 9] Total miembros a invitar: {total_m}")
 
         family_invite_queue = queue.Queue()
-        for correo in miembros_a_invitar:
-            family_invite_queue.put(correo)
-        family_invite_queue.put(None)
-
-        inviter = TidalFamilyInviter(family_invite_queue)
+        family_invite_queue.put(None)  # sentinel por si el hilo cae al modo cola
+        inviter = TidalFamilyInviter(
+            family_invite_queue,
+            trabajos_por_titular=trabajos_inv,
+        )
         inviter_thread = threading.Thread(target=inviter.run_inviter, daemon=True)
         inviter_thread.start()
+    else:
+        print(f"\n{Color.WARNING}[Paso 9] Ningún correo procesado figura como MIEMBROS en "
+              f"{path_titular.name}. Se omite la invitación al plan familiar.{Color.ENDC}")
 
     batch_size = 20
     total_cuentas = len(correos_lista)
@@ -10443,7 +10531,10 @@ def restablecer_contrasenas_tidal(correos=None):
 
     if inviter_thread and inviter_thread.is_alive():
         print(f"\n{Color.CYAN}Esperando a que finalice el proceso de invitación familiar...{Color.ENDC}")
-        inviter_thread.join(timeout=15.0)
+        inviter_thread.join(timeout=1200.0)
+        if inviter_thread.is_alive():
+            print(f"  {Color.WARNING}[Paso 9] El invitador sigue en curso tras 20 min; "
+                  f"el hilo daemon terminará al cerrar el proceso.{Color.ENDC}")
     
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL RESTABLECIMIENTO{Color.ENDC}")
@@ -13873,7 +13964,7 @@ def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[
     return titulares, miembros_planos
 
 
-def invitar_al_plan_familiar_opcion11():
+def invitar_al_plan_familiar_opcion11(correos=None):
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   OPCIÓN 11: INVITAR AL PLAN FAMILIAR AUTOMÁTICAMENTE (IMAP CODE){Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
@@ -13890,24 +13981,37 @@ def invitar_al_plan_familiar_opcion11():
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
 
-    # ¿Hay bloques con MIEMBROS por titular?
     hay_asignacion_por_bloque = any(t.get("miembros_invitar") for t in titulares)
+
+    # Correos a invitar: los de la opción 6 (si hay), si no todos los MIEMBROS del archivo.
+    correos_filtro: list[str] = []
+    if correos:
+        correos_filtro = [re.sub(r'^[\s\.]+|[\s\.]+$', '', str(c)).strip() for c in correos if c and "@" in str(c)]
+        print(f"\n  [Opción 11] Filtrando por {len(correos_filtro)} correo(s) activos de la opción 6.")
+    elif hay_asignacion_por_bloque:
+        # Todos los miembros anotados en bloques (orden del archivo, sin duplicar)
+        vistos: list[str] = []
+        for t in titulares:
+            for m in (t.get("miembros_invitar") or []):
+                if m and not any(correos_iguales_exacto(m, v) for v in vistos):
+                    vistos.append(m)
+                    correos_filtro.append(m)
+        print(f"\n  [Opción 11] Sin filtro de opción 6: se usarán todos los MIEMBROS de {path.name} "
+              f"({len(correos_filtro)}).")
+    else:
+        correos_filtro = list(miembros_planos)
+        if not correos_filtro:
+            print(f"\n{Color.WARNING}[Info]{Color.ENDC} No se encontraron miembros en {path.name}.")
+            correos_filtro = ingresar_correos()
 
     if hay_asignacion_por_bloque:
         print(f"\n  [Opción 11] Formato por bloques TITULAR/MIEMBROS en {path.name}.")
-        print(f"  [Opción 11] Titulares cargados ({len(titulares)}):")
         for t in titulares:
-            print(f"    • {t['correo']} → {len(t.get('miembros_invitar') or [])} miembro(s) "
+            print(f"    • {t['correo']} → {len(t.get('miembros_invitar') or [])} en archivo "
                   f"(usados={t['usados']}, estado={t['estado']})")
-            for m in (t.get("miembros_invitar") or []):
-                print(f"        - {m}")
     else:
-        miembros = list(miembros_planos)
-        if not miembros:
-            print(f"\n{Color.WARNING}[Info]{Color.ENDC} No se encontraron miembros en {path.name}.")
-            miembros = ingresar_correos()
         print(f"\n  [Opción 11] Titulares cargados ({len(titulares)}): {[t['correo'] for t in titulares]}")
-        print(f"  [Opción 11] Total de miembros a invitar ({len(miembros)}): {miembros}")
+        print(f"  [Opción 11] Miembros a resolver ({len(correos_filtro)}): {correos_filtro}")
 
     if MODO_SIN_PROXY:
         print(f"\n{Color.CYAN}[Sin Proxy] Opcion 11 con IP real.{Color.ENDC}")
@@ -13932,33 +14036,57 @@ def invitar_al_plan_familiar_opcion11():
 
     def _ya_invitado(titular: dict, miembro: str) -> bool:
         for m in titular.get("miembros") or []:
-            # Exacto con puntos: en Tidal cada variante con puntos es otra cuenta
             if correos_iguales_exacto(m, miembro):
                 return True
         return False
 
+    def _buscar_titular(correo_t: str) -> dict | None:
+        for t in titulares:
+            if correos_iguales_exacto(t.get("correo") or "", correo_t):
+                return t
+        return None
+
     titulares_trabajos = []
 
     if hay_asignacion_por_bloque:
-        for idx_t, titular in enumerate(titulares, 1):
+        # Misma lógica que opción 9: miembro → titular según bloque MIEMBROS (exacto con puntos).
+        trabajos_inv, sin_mapa, path = agrupar_miembros_por_titular_familiar(correos_filtro, path)
+        if sin_mapa:
+            print(f"\n{Color.WARNING}[Opción 11] Sin titular en {path.name} para "
+                  f"{len(sin_mapa)} correo(s):{Color.ENDC}")
+            for m in sin_mapa:
+                print(f"    ✗ {m}")
+
+        print(f"\n  [Opción 11] Asignación según bloques de {path.name}:")
+        for idx_t, tj in enumerate(trabajos_inv, 1):
+            titular = _buscar_titular(tj["correo_titular"])
+            if titular is None:
+                print(f"  {Color.FAIL}[Opción 11] Titular '{tj['correo_titular']}' no encontrado; "
+                      f"se omiten {tj['miembros']}.{Color.ENDC}")
+                continue
             cupos_disponibles = 5 - int(titular.get("usados") or 0)
             if cupos_disponibles <= 0 or titular.get("estado") == "lleno":
                 print(f"  [Opción 11] Titular {titular['correo']} ya se encuentra lleno (5/5). Omitiendo...")
                 continue
-            plan = list(titular.get("miembros_invitar") or [])
-            pendientes = [m for m in plan if not _ya_invitado(titular, m)]
+            pendientes = [m for m in tj["miembros"] if not _ya_invitado(titular, m)]
             miembros_titular = pendientes[:cupos_disponibles]
+            omitidos_ya = [m for m in tj["miembros"] if _ya_invitado(titular, m)]
+            for m in omitidos_ya:
+                print(f"  [Opción 11] {m} ya figura en {titular['correo']}; se omite.")
             if not miembros_titular:
-                print(f"  [Opción 11] Titular {titular['correo']}: sin miembros pendientes en su bloque MIEMBROS.")
+                print(f"  [Opción 11] Titular {titular['correo']}: sin miembros pendientes "
+                      f"de los correos procesados.")
                 continue
+            print(f"    • {titular['correo']} ← {miembros_titular}")
             titulares_trabajos.append({
                 "idx_t": idx_t,
                 "titular": titular,
                 "miembros_titular": miembros_titular,
             })
     else:
+        # Formato antiguo: repartir la lista plana por cupos (sin bloques MIEMBROS).
         idx_miembro = 0
-        total_miembros = len(miembros)
+        total_miembros = len(correos_filtro)
         for idx_t, titular in enumerate(titulares, 1):
             if idx_miembro >= total_miembros:
                 break
@@ -13966,9 +14094,8 @@ def invitar_al_plan_familiar_opcion11():
             if cupos_disponibles <= 0:
                 print(f"  [Opción 11] Titular {titular['correo']} ya se encuentra lleno (5/5). Omitiendo...")
                 continue
-            miembros_titular = miembros[idx_miembro: idx_miembro + cupos_disponibles]
+            miembros_titular = correos_filtro[idx_miembro: idx_miembro + cupos_disponibles]
             idx_miembro += len(miembros_titular)
-            # Guardar plan en el dict para que al guardar se preserve el bloque
             titular["miembros_invitar"] = list(miembros_titular)
             titulares_trabajos.append({
                 "idx_t": idx_t,
@@ -13991,8 +14118,9 @@ def invitar_al_plan_familiar_opcion11():
             time.sleep((idx_t - 1) * 0.35)
 
         print(f"\n{Color.CYAN}{Color.BOLD}" + "-" * 60 + f"{Color.ENDC}")
-        print(f"{Color.CYAN}{Color.BOLD} PROCESANDO TITULAR ({idx_t}/{len(titulares)}): {titular['correo']}{Color.ENDC}")
-        print(f"  Miembros asignados a este titular ({len(miembros_titular)}): {miembros_titular}")
+        print(f"{Color.CYAN}{Color.BOLD} PROCESANDO TITULAR ({idx_t}/{len(titulares_trabajos)}): "
+              f"{titular['correo']}{Color.ENDC}")
+        print(f"  Miembros de su bloque a invitar ({len(miembros_titular)}): {miembros_titular}")
         print(f"{Color.CYAN}{Color.BOLD}" + "-" * 60 + f"{Color.ENDC}")
 
         temp_dir = Path(tempfile.mkdtemp(prefix=f"tidal_inviter_{clean_email_loc(titular['correo'])}_"))
@@ -14004,32 +14132,42 @@ def invitar_al_plan_familiar_opcion11():
 
         try:
             inviter.abrir_navegador()
-            print(f"  [Opción 11] Usando proxy de Perú único para {titular['correo']}: {inviter.proxy_pe_server}")
+            if inviter.proxy_pe_server:
+                print(f"  [Opción 11] Usando proxy de Perú único para {titular['correo']}: "
+                      f"{inviter.proxy_pe_server}")
+            else:
+                print(f"  [Opción 11] [Sin Proxy] IP real para titular {titular['correo']}")
 
             if not inviter.asegurar_login_titular(titular):
-                print(f"  {Color.FAIL}[Opción 11] ERROR: No se pudo iniciar sesión en el titular {titular['correo']}.{Color.ENDC}")
+                print(f"  {Color.FAIL}[Opción 11] ERROR: No se pudo iniciar sesión en el titular "
+                      f"{titular['correo']}.{Color.ENDC}")
                 return
 
-            print(f"  {Color.GREEN}[Opción 11] Sesión iniciada con éxito en la vista de familia para: {titular['correo']}{Color.ENDC}")
+            print(f"  {Color.GREEN}[Opción 11] Sesión iniciada con éxito en la vista de familia para: "
+                  f"{titular['correo']}{Color.ENDC}")
 
             for idx_m, miembro_c in enumerate(miembros_titular):
                 print(f"  [Opción 11] [{titular['correo']}] Invitando a {miembro_c}...")
                 if inviter.enviar_invitacion_familiar(titular, miembro_c):
                     with lock_guardar:
-                        if miembro_c not in titular["miembros"]:
+                        ya = any(correos_iguales_exacto(m, miembro_c) for m in titular.get("miembros") or [])
+                        if not ya:
                             titular["miembros"].append(miembro_c)
                         titular["usados"] = len(titular["miembros"])
                         if titular["usados"] >= 5:
                             titular["estado"] = "lleno"
                         guardar_titulares_familiares(titulares, path)
-                    print(f"    {Color.GREEN}[OK] [{titular['correo']}] Invitación enviada a {miembro_c}.{Color.ENDC}")
+                    print(f"    {Color.GREEN}[OK] [{titular['correo']}] Invitación enviada a "
+                          f"{miembro_c}.{Color.ENDC}")
                 else:
-                    print(f"    {Color.WARNING}[WARN] [{titular['correo']}] No se pudo enviar la invitación a {miembro_c}.{Color.ENDC}")
+                    print(f"    {Color.WARNING}[WARN] [{titular['correo']}] No se pudo enviar la "
+                          f"invitación a {miembro_c}.{Color.ENDC}")
 
                 if idx_m < len(miembros_titular) - 1:
                     time.sleep(random.uniform(2.0, 3.5))
 
-            print(f"  [Opción 11] Completadas las invitaciones para el titular {titular['correo']}. Cerrando ventana...")
+            print(f"  [Opción 11] Completadas las invitaciones para el titular {titular['correo']}. "
+                  f"Cerrando ventana...")
         except Exception as ex:
             print(f"  {Color.FAIL}[Opción 11] Error en titular {titular['correo']}: {ex}{Color.ENDC}")
         finally:
@@ -14048,7 +14186,8 @@ def invitar_al_plan_familiar_opcion11():
 
             threading.Thread(target=_rm_async, args=(temp_dir,), daemon=True).start()
 
-    print(f"\n{Color.CYAN}{Color.BOLD}Iniciando {len(titulares_trabajos)} cuentas titulares en SIMULTÁNEO en ventanas separadas...{Color.ENDC}\n")
+    print(f"\n{Color.CYAN}{Color.BOLD}Iniciando {len(titulares_trabajos)} cuenta(s) titular(es) "
+          f"en SIMULTÁNEO (cada una solo invita a sus MIEMBROS)...{Color.ENDC}\n")
     with ThreadPoolExecutor(max_workers=len(titulares_trabajos)) as executor:
         futures = [executor.submit(procesar_un_titular, t_trabajo) for t_trabajo in titulares_trabajos]
         for future in as_completed(futures):
@@ -14678,7 +14817,7 @@ def menu_principal():
             iniciar_sesion_automatico_tidal(correos)
             
         elif opcion == "11":
-            invitar_al_plan_familiar_opcion11()
+            invitar_al_plan_familiar_opcion11(correos)
 
         elif opcion == "12":
             verificar_contrasenas_imap_opcion12(correos)
