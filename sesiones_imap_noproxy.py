@@ -1058,9 +1058,27 @@ def _invite_hay_pantalla_codigo(page) -> bool:
             const frases = ['revisa tu correo', 'check your email', 'te hemos enviado un código',
                             'te hemos enviado un codigo', "we've sent", 'we have sent',
                             'reenviar código', 'reenviar codigo', 'resend code',
-                            'código de acceso', 'access code', 'one-time'];
+                            'código de acceso', 'access code', 'one-time',
+                            'código de inicio', 'codigo de inicio', 'sign-in code', 'signin code',
+                            'login code', 'enter the code', 'introduce el código', 'introduce el codigo',
+                            'verification code', 'código de verificación', 'codigo de verificacion'];
             if (frases.some(f => txt.includes(f))) return true;
-            return document.querySelectorAll('input[maxlength="1"], input[autocomplete="one-time-code"]').length >= 4;
+            const inputs = Array.from(document.querySelectorAll('input'));
+            let digitos = 0, unica = 0;
+            for (const el of inputs) {
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) continue;
+                const max = (el.getAttribute('maxlength') || '').trim();
+                const ac = (el.autocomplete || '').toLowerCase();
+                const mode = (el.inputMode || '').toLowerCase();
+                if (max === '1') digitos++;
+                if (ac === 'one-time-code') unica++;
+                const mn = Number(max);
+                if (mode === 'numeric' && mn >= 4 && mn <= 8) unica++;
+            }
+            return digitos >= 4 || unica >= 1;
         }"""))
     except Exception:
         return False
@@ -4200,10 +4218,13 @@ def contar_cajas_otp_visibles(page) -> int:
                     return false;
                 const r = el.getBoundingClientRect();
                 if (r.width < 8 || r.height < 8) return false;
-                // Solo cajas de un dígito (asistente de eliminación Tidal) o one-time-code único
+                // Cajas de un dígito, one-time-code, o caja única maxlength 4-8 (login)
+                const mn = Number(max);
                 return max === '1' || ac === 'one-time-code'
                     || (mode === 'numeric' && max === '1')
-                    || ((name.includes('code') || name.includes('otp')) && max === '1');
+                    || ((name.includes('code') || name.includes('otp')) && max === '1')
+                    || (ac === 'one-time-code')
+                    || (mn >= 4 && mn <= 8);
             };
             return Array.from(document.querySelectorAll('input')).filter(esOtp).length;
         }""")
@@ -4430,7 +4451,7 @@ def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
     for frame in page.frames:
         try:
             code_inputs = []
-            for _poll in range(10):
+            for _poll in range(14):
                 inputs = frame.locator('input').all()
                 code_inputs = []
                 otp_estrictos = []
@@ -4449,15 +4470,33 @@ def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
                         autocomplete = (ip.get_attribute("autocomplete") or "").lower()
                         maxlength = (ip.get_attribute("maxlength") or "").strip()
                         aria = (ip.get_attribute("aria-label") or "").lower()
+                        max_n = int(maxlength) if maxlength.isdigit() else 0
+                        es_digito = maxlength == "1"
+                        # Login titular: 1 caja maxlength 4-8 (OTP tipo 009740) o autocomplete OTP
+                        es_caja_unica = (
+                            autocomplete == "one-time-code"
+                            or (4 <= max_n <= 8 and (
+                                "code" in name or "otp" in name
+                                or "code" in placeholder or "código" in placeholder
+                                or "codigo" in placeholder or mode == "numeric"
+                                or type_attr in ["tel", "number", "text", ""]
+                            ))
+                        )
                         es_otp_estricto = (
-                            maxlength == "1"
+                            es_digito
                             or autocomplete == "one-time-code"
                             or "code" in name
                             or "otp" in name
+                            or es_caja_unica
+                        )
+                        es_numerico = (
+                            mode == "numeric"
+                            or type_attr in ["tel", "number"]
+                            or es_digito
                         )
                         es_candidato = (
                             es_otp_estricto
-                            or mode == "numeric"
+                            or es_numerico
                             or "code" in placeholder
                             or "código" in placeholder
                             or "codigo" in placeholder
@@ -4472,19 +4511,44 @@ def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
                                 otp_estrictos.append(ip)
                     except Exception:
                         pass
+
+                otp_numericos = []
+                otp_caja_unica = []
+                digito_boxes = []
+                for ip in list(code_inputs):
+                    try:
+                        ml = (ip.get_attribute("maxlength") or "").strip()
+                        mn = int(ml) if ml.isdigit() else 0
+                        mode2 = (ip.get_attribute("inputmode") or "").lower()
+                        typ2 = (ip.get_attribute("type") or "").lower()
+                        ac2 = (ip.get_attribute("autocomplete") or "").lower()
+                        if ml == "1":
+                            digito_boxes.append(ip)
+                        if ml == "1" or mode2 == "numeric" or typ2 in ["tel", "number"]:
+                            otp_numericos.append(ip)
+                        if ac2 == "one-time-code" or (4 <= mn <= 8 and ml != "1"):
+                            otp_caja_unica.append(ip)
+                    except Exception:
+                        pass
+
+                if len(digito_boxes) >= min(4, len(codigo)):
+                    code_inputs = digito_boxes
+                    break
                 if len(otp_estrictos) >= min(4, len(codigo)):
                     code_inputs = otp_estrictos
-                elif len(otp_estrictos) == 1 and len(codigo) >= 4:
+                    break
+                if len(otp_numericos) >= min(4, len(codigo)):
+                    code_inputs = otp_numericos
+                    break
+                if len(otp_caja_unica) == 1 and len(codigo) >= 4:
+                    code_inputs = otp_caja_unica
+                    break
+                if len(otp_estrictos) == 1 and len(codigo) >= 4:
                     code_inputs = otp_estrictos
-                # Códigos de registro (≥4): exigir cajas OTP reales antes de salir del poll
-                if len(codigo) >= 4:
-                    if len(otp_estrictos) >= min(4, len(codigo)) or (
-                        len(otp_estrictos) == 1 and len(codigo) >= 4
-                    ):
-                        code_inputs = otp_estrictos
-                        break
-                elif len(code_inputs) >= min(4, len(codigo)) or (
-                    code_inputs and len(codigo) <= 8 and len(code_inputs) == 1
+                    break
+                if len(codigo) < 4 and (
+                    len(code_inputs) >= min(4, len(codigo))
+                    or (code_inputs and len(codigo) <= 8 and len(code_inputs) == 1)
                 ):
                     break
                 time.sleep(0.35)
@@ -4492,18 +4556,50 @@ def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
             if not code_inputs:
                 continue
 
-            # Códigos largos (registro/login Tidal): NO usar inputs genéricos type=text.
-            # Si aún no hay cajas OTP estrictas, fallar rápido para que el caller espere la UI.
-            if len(codigo) >= 4:
-                if len(otp_estrictos) >= min(4, len(codigo)):
-                    code_inputs = otp_estrictos
-                elif len(otp_estrictos) == 1:
-                    code_inputs = otp_estrictos
-                else:
-                    # Sin cajas OTP reales todavía → no inventar con campos sueltos
-                    continue
-            elif len(otp_estrictos) >= 1:
+            # Resolver conjunto final (login: 1 caja completa; registro/elim: N cajas)
+            digito_boxes = []
+            otp_numericos = []
+            otp_caja_unica = []
+            for ip in list(code_inputs) + list(otp_estrictos):
+                try:
+                    ml = (ip.get_attribute("maxlength") or "").strip()
+                    mn = int(ml) if ml.isdigit() else 0
+                    mode2 = (ip.get_attribute("inputmode") or "").lower()
+                    typ2 = (ip.get_attribute("type") or "").lower()
+                    ac2 = (ip.get_attribute("autocomplete") or "").lower()
+                    if ml == "1":
+                        digito_boxes.append(ip)
+                    if ml == "1" or mode2 == "numeric" or typ2 in ["tel", "number"]:
+                        otp_numericos.append(ip)
+                    if ac2 == "one-time-code" or (4 <= mn <= 8 and ml != "1"):
+                        otp_caja_unica.append(ip)
+                except Exception:
+                    pass
+
+            def _dedupe(seq):
+                out, seen = [], set()
+                for x in seq:
+                    k = id(x)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(x)
+                return out
+
+            digito_boxes = _dedupe(digito_boxes)
+            otp_numericos = _dedupe(otp_numericos)
+            otp_caja_unica = _dedupe(otp_caja_unica)
+
+            if len(digito_boxes) >= min(4, len(codigo)):
+                code_inputs = digito_boxes
+            elif len(otp_caja_unica) == 1:
+                code_inputs = otp_caja_unica
+            elif len(otp_estrictos) == 1:
                 code_inputs = otp_estrictos
+            elif len(otp_numericos) >= min(4, len(codigo)):
+                code_inputs = otp_numericos
+            elif len(codigo) >= 4 and not otp_estrictos and not otp_numericos and not otp_caja_unica:
+                continue
 
             def leer_cajas(objetivos):
                 leido = ""
@@ -10260,6 +10356,12 @@ class TidalFamilyInviter:
         print(f"  [Inviter] [{titular['correo']}] Esperando enlace/código de inicio de sesión vía IMAP...")
         code_or_link = None
         for intento in range(1, 15):
+            # Si la sesión ya quedó abierta (p.ej. password/sesión residual), no insistir en OTP
+            if self._sesion_cuenta_ya_abierta():
+                print(f"  [Inviter] [{titular['correo']}] Sesión ya activa durante la espera IMAP. "
+                      f"Se omite el código.")
+                return self._abrir_panel_familia(titular) or True
+
             print(f"  [Inviter] [{titular['correo']}] Intento {intento}/14: Buscando correo de inicio de sesión...")
             code_or_link = obtener_codigo_via_imap(
                 gmail_user=titular["correo"],
@@ -10302,6 +10404,9 @@ class TidalFamilyInviter:
             time.sleep(6.0)
 
         if not code_or_link:
+            if self._sesion_cuenta_ya_abierta():
+                print(f"  [Inviter] [{titular['correo']}] Sin código IMAP pero la sesión ya está activa.")
+                return self._abrir_panel_familia(titular) or True
             # Último recurso: password si apareció y tenemos clave
             if pwd_cuenta and encontrar_locator_en_frames(
                 self.page, ['input[type="password"]', 'input[name="password"]']
@@ -10317,20 +10422,119 @@ class TidalFamilyInviter:
             self.page = pagina_vigente(self.page)
             time.sleep(3.0)
         else:
+            # Si ya estamos autenticados, un OTP viejo del buzón NO debe escribirse
+            # (era el bug: login OK → reintento → "No se pudo escribir el código").
+            if self._sesion_cuenta_ya_abierta():
+                print(f"  [Inviter] [{titular['correo']}] Ya hay sesión activa; se ignora OTP "
+                      f"IMAP ({code_or_link}) y se continúa a /family.")
+                return self._abrir_panel_familia(titular) or True
+
             print(f"  [Inviter] [{titular['correo']}] Código de 6 dígitos detectado: {code_or_link}...")
-            escrito = False
-            for reintento in range(1, 4):
+            # Esperar a que Tidal pinte la UI OTP (1 caja maxlength=6 o 6 cajas).
+            limite_ui = time.time() + 25.0
+            ui_otp = False
+            while time.time() < limite_ui:
                 self.page = pagina_vigente(self.page)
+                if self._sesion_cuenta_ya_abierta():
+                    print(f"  [Inviter] [{titular['correo']}] Sesión activa antes de pintar OTP; "
+                          f"se omite la escritura del código.")
+                    return self._abrir_panel_familia(titular) or True
+                if _invite_hay_pantalla_codigo(self.page) or contar_cajas_otp_visibles(self.page) >= 1:
+                    ui_otp = True
+                    break
+                try:
+                    txt = self.page.evaluate(
+                        "() => document.body ? document.body.innerText.toLowerCase() : ''"
+                    )
+                except Exception:
+                    txt = ""
+                if any(k in txt for k in (
+                    "código de inicio", "codigo de inicio", "sign-in code", "login code",
+                    "verification code", "introduce el código", "introduce el codigo",
+                    "enter the code", "reenviar", "resend",
+                )):
+                    ui_otp = True
+                    break
+                if encontrar_locator_en_frames(
+                    self.page,
+                    [
+                        'input[autocomplete="one-time-code"]',
+                        'input[maxlength="1"]',
+                        'input[maxlength="6"]',
+                        'input[maxlength="5"]',
+                        'input[inputmode="numeric"]',
+                    ],
+                ):
+                    ui_otp = True
+                    break
+                time.sleep(0.6)
+
+            if not ui_otp:
+                if self._sesion_cuenta_ya_abierta():
+                    print(f"  [Inviter] [{titular['correo']}] Sin UI OTP y sesión activa; se continúa.")
+                    return self._abrir_panel_familia(titular) or True
+                print(f"  [Inviter] [{titular['correo']}] [WARN] No apareció la pantalla de código; "
+                      f"no se fuerza la escritura (evitar falso fallo tras login OK).")
+                if self._abrir_panel_familia(titular):
+                    return True
+                return False
+
+            escrito = False
+            for reintento in range(1, 6):
+                self.page = pagina_vigente(self.page)
+                if self._sesion_cuenta_ya_abierta():
+                    print(f"  [Inviter] [{titular['correo']}] Sesión activa a mitad de escritura OTP; "
+                          f"se omite.")
+                    return self._abrir_panel_familia(titular) or True
                 try:
                     self.page.bring_to_front()
                 except Exception:
                     pass
-                if escribir_codigo_verificacion_inteligente(self.page, code_or_link):
+                # Reutilizar el mismo OTP (p.ej. 009740): no perder ceros a la izquierda
+                codigo_otp = re.sub(r"\D", "", str(code_or_link or ""))
+                if escribir_codigo_verificacion_inteligente(self.page, codigo_otp):
                     escrito = True
+                    print(f"  [Inviter] [{titular['correo']}] Código OTP escrito correctamente.")
                     break
-                print(f"  [Inviter] [WARN] No se pudo escribir el código (intento {reintento}/3). Reintentando...")
-                time.sleep(2.5)
+                # Fallback: una sola caja visible no-email
+                try:
+                    caja = esperar_locator_en_frames(
+                        self.page,
+                        [
+                            'input[autocomplete="one-time-code"]',
+                            'input[maxlength="6"]',
+                            'input[maxlength="5"]',
+                            'input[inputmode="numeric"]',
+                            'input[name*="code" i]',
+                            'input[type="tel"]',
+                            'input[type="text"]',
+                        ],
+                        timeout_s=3.0,
+                    )
+                    if caja:
+                        caja.click(timeout=800)
+                        caja.fill("")
+                        caja.type(codigo_otp, delay=70)
+                        time.sleep(0.3)
+                        leido = ""
+                        try:
+                            leido = (caja.input_value() or "").strip()
+                        except Exception:
+                            pass
+                        if leido == codigo_otp or leer_otp_cajas_visibles(self.page) == codigo_otp:
+                            escrito = True
+                            print(f"  [Inviter] [{titular['correo']}] Código OTP escrito (fallback 1 caja).")
+                            break
+                except Exception:
+                    pass
+                print(f"  [Inviter] [WARN] No se pudo escribir el código "
+                      f"(intento {reintento}/5). Reintentando...")
+                time.sleep(1.8)
             if not escrito:
+                if self._sesion_cuenta_ya_abierta():
+                    print(f"  [Inviter] [{titular['correo']}] No se escribió OTP pero la sesión "
+                          f"ya está activa; se continúa a /family.")
+                    return self._abrir_panel_familia(titular) or True
                 print(f"  [Inviter] [WARN] La pantalla de código no aceptó el valor para {titular['correo']}.")
                 return False
 
@@ -10338,12 +10542,18 @@ class TidalFamilyInviter:
             btn_login = esperar_locator_en_frames(
                 self.page,
                 ["button[type='submit']", "button:has-text('Iniciar sesión')", "button:has-text('Log in')",
-                 "button:has-text('Continuar')", "button:has-text('Continue')"],
+                 "button:has-text('Continuar')", "button:has-text('Continue')",
+                 "button:has-text('Verificar')", "button:has-text('Verify')"],
                 timeout_s=8.0
             )
             if btn_login:
                 try:
                     btn_login.click()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.page.keyboard.press("Enter")
                 except Exception:
                     pass
 
@@ -10352,14 +10562,61 @@ class TidalFamilyInviter:
 
         return self._abrir_panel_familia(titular)
 
+    def _sesion_cuenta_ya_abierta(self) -> bool:
+        """True si la pestaña ya está en cuenta autenticada (sin formulario OAuth/login)."""
+        try:
+            self.page = pagina_vigente(self.page)
+            if not self.page or self.page.is_closed():
+                return False
+            if self._hay_login_titular_visible():
+                return False
+            if _familia_ui_lista_para_invitar(self.page):
+                return True
+            url = (self.page.url or "").lower()
+            if "account.tidal.com" in url and "/login" not in url and "authorize" not in url:
+                return True
+            if "listen.tidal.com" in url or "my.tidal.com" in url:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def asegurar_familia_para_invitar(self, titular) -> bool:
+        """Tras un login OK: solo asegura /family. NO relanza OTP/IMAP."""
+        self.client_email = titular.get("correo") or self.client_email
+        try:
+            if self._sesion_cuenta_ya_abierta() or self._sesion_titular_activa(titular):
+                if self._abrir_panel_familia(titular):
+                    return True
+                # Sesión viva pero CTA lento: recargar family sin destruir cookies
+                if _recargar_pagina_familia(self.page):
+                    return True
+                print(f"  [Inviter] {Color.WARNING}[{titular['correo']}] Sesión activa pero /family "
+                      f"no muestra CTA; se intenta invitar igual.{Color.ENDC}")
+                return True
+        except Exception as e:
+            print(f"  [Inviter] [WARN] No se pudo reafirmar /family: {e}")
+        return False
+
     def asegurar_login_titular(self, titular) -> bool:
         self.client_email = titular.get("correo") or self.client_email
+
+        # 1) Ya logueado (caso típico tras el primer miembro / falso negativo de email en /profile)
+        if self._sesion_cuenta_ya_abierta():
+            print(f"  [Inviter] [{titular['correo']}] Sesión de cuenta ya abierta. "
+                  f"Se omite nuevo login/OTP y se va a /family...")
+            if self._abrir_panel_familia(titular) or _recargar_pagina_familia(self.page):
+                return True
+            return True  # no destruir sesión con logout+IMAP
+
         if self._sesion_titular_activa(titular):
-            # Asegurar /family antes de invitar (antes devolvía True y a veces seguía en /profile)
             if self._abrir_panel_familia(titular):
                 return True
-            print(f"  [Inviter] {Color.WARNING}Sesión OK pero no se abrió /family; "
-                  f"se reintentará el login completo...{Color.ENDC}")
+            print(f"  [Inviter] {Color.WARNING}Sesión OK pero /family tardó; "
+                  f"NO se relanza login por código (evita 'No se pudo escribir el código' "
+                  f"con la cuenta ya autenticada).{Color.ENDC}")
+            _recargar_pagina_familia(self.page)
+            return True
 
         print(f"  [Inviter] No se detectó sesión activa o es incorrecta. Iniciando sesión en titular: {titular['correo']}...")
         pwd = buscar_contrasena_cuenta(titular["correo"])
@@ -10370,25 +10627,32 @@ class TidalFamilyInviter:
                   f"{titular['correo']}; se usará login por código IMAP.{Color.ENDC}")
         for intento_login in range(1, 4):
             if intento_login > 1:
+                # Solo logout si REALMENTE seguimos en pantalla de login (no si ya hay sesión)
+                if self._sesion_cuenta_ya_abierta():
+                    print(f"  [Inviter] [{titular['correo']}] Sesión apareció entre reintentos; "
+                          f"se continúa sin nuevo OTP.")
+                    return self._abrir_panel_familia(titular) or True
                 print(f"  [Inviter] {Color.WARNING}Reintentando inicio de sesión del titular ({intento_login}/3)...{Color.ENDC}")
                 self.logout_titular()
                 time.sleep(random.uniform(3.0, 6.0))
             try:
                 if self._login_titular_una_vez(titular):
                     return True
-                # Si el login "falló" pero la sesión quedó activa (falso negativo típico), continuar
-                if self._sesion_titular_activa(titular) and self._abrir_panel_familia(titular):
+                if self._sesion_cuenta_ya_abierta() or (
+                    self._sesion_titular_activa(titular) and self._abrir_panel_familia(titular)
+                ):
                     print(f"  [Inviter] {Color.GREEN}[{titular['correo']}] Login detectado tras "
                           f"falso negativo. Se continúa con las invitaciones.{Color.ENDC}")
                     return True
             except RuntimeError as e:
-                # Bloqueo antirobot insuperable o sin proxies limpios: no tiene sentido insistir.
                 print(f"  [Inviter] {Color.FAIL}Login del titular abortado: {e}{Color.ENDC}")
                 return False
             except Exception as e:
                 print(f"  [Inviter] Excepción al iniciar sesión (intento {intento_login}/3): {e}")
                 try:
-                    if self._sesion_titular_activa(titular) and self._abrir_panel_familia(titular):
+                    if self._sesion_cuenta_ya_abierta() or (
+                        self._sesion_titular_activa(titular) and self._abrir_panel_familia(titular)
+                    ):
                         print(f"  [Inviter] {Color.GREEN}[{titular['correo']}] Pese a la excepción, "
                               f"hay sesión activa. Se continúa.{Color.ENDC}")
                         return True
@@ -10526,10 +10790,15 @@ class TidalFamilyInviter:
                               f"lleno; se detienen el resto de sus invitaciones.{Color.ENDC}")
                         break
 
-                    if not self.asegurar_login_titular(titular):
-                        print(f"  {Color.FAIL}[Inviter] Se perdió la sesión del titular "
-                              f"{titular['correo']}.{Color.ENDC}")
-                        break
+                    # Solo reafirmar /family; NO relanzar IMAP/OTP (causa el WARN
+                    # "No se pudo escribir el código" con la sesión ya abierta).
+                    if not self.asegurar_familia_para_invitar(titular):
+                        if self._hay_login_titular_visible():
+                            print(f"  {Color.FAIL}[Inviter] Se perdió la sesión del titular "
+                                  f"{titular['correo']}.{Color.ENDC}")
+                            break
+                        print(f"  {Color.WARNING}[Inviter] /family inestable para "
+                              f"{titular['correo']}; se intenta invitar igual.{Color.ENDC}")
 
                     invitado_ok = self.enviar_invitacion_familiar(titular, miembro_correo)
                     if invitado_ok:
