@@ -99,6 +99,9 @@ TMM_AUTH_COOKIE_NAMES = frozenset({"PHPSESSID", "ttune", "TMM_Unique_Cross"})
 # Serializa escrituras de CSV en descargas/ (OneDrive + varias ventanas a la vez).
 DESCARGAS_CSV_LOCK = threading.Lock()
 DESCARGAS_DIR = SCRIPT_DIR / "descargas"
+# Reserva exclusiva archivo→cuenta (opción 8): evita que dos ventanas suban el mismo CSV.
+CSV_RESERVAS_LOCK = threading.Lock()
+CSV_RESERVAS: dict[str, str] = {}  # str(Path.resolve()) -> email dueño
 
 # Protege el fichero de titulares familiares: varias ventanas terminan su upgrade a la vez y
 # leer/escribir sin sincronizar hacía que unas cuentas sobrescribieran a otras.
@@ -302,29 +305,217 @@ def csv_parece_valido(path: Path, min_bytes: int = 32) -> bool:
         return False
 
 
-def resolver_csv_cuenta(client_email: str) -> Path | None:
-    """Localiza el CSV de una cuenta en descargas/ (nombre exacto o alias Gmail equivalente)."""
+def _csv_clave_reserva(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
+def csv_pertenece_a_cuenta(path: Path | None, client_email: str) -> bool:
+    """True solo si el nombre del CSV es el correo (o alias Gmail inequívoco)."""
+    if not path or not client_email:
+        return False
+    stem = path.stem.strip().lower()
+    email_l = client_email.strip().lower()
+    if not stem or "@" not in stem:
+        return False
+    return stem == email_l or son_correos_equivalentes(stem, email_l)
+
+
+def reservar_csv_para_cuenta(path: Path, client_email: str) -> bool:
+    """Reserva exclusiva del archivo para una cuenta. False si otra cuenta ya lo tiene."""
+    if not path or not client_email:
+        return False
+    email_l = client_email.strip().lower()
+    clave = _csv_clave_reserva(path)
+    with CSV_RESERVAS_LOCK:
+        dueño = CSV_RESERVAS.get(clave)
+        if dueño and dueño != email_l:
+            return False
+        CSV_RESERVAS[clave] = email_l
+        return True
+
+
+def liberar_reservas_csv_cuenta(client_email: str) -> None:
+    email_l = (client_email or "").strip().lower()
+    if not email_l:
+        return
+    with CSV_RESERVAS_LOCK:
+        for clave in [k for k, v in CSV_RESERVAS.items() if v == email_l]:
+            CSV_RESERVAS.pop(clave, None)
+
+
+def _csv_reservado_por_otra(path: Path, client_email: str) -> bool:
+    email_l = (client_email or "").strip().lower()
+    with CSV_RESERVAS_LOCK:
+        dueño = CSV_RESERVAS.get(_csv_clave_reserva(path))
+    return bool(dueño and dueño != email_l)
+
+
+def _listar_csvs_descargas() -> list[Path]:
     dest_dir = DESCARGAS_DIR
     if not dest_dir.exists():
+        return []
+    out = []
+    for f in dest_dir.glob("*.csv"):
+        # Ignorar temporales de escritura (.email.csv.part.NNNN)
+        if f.name.startswith("."):
+            continue
+        if csv_parece_valido(f):
+            out.append(f)
+    return out
+
+
+def _elegir_csv_preferido(candidatos: list[Path], client_email: str) -> Path | None:
+    if not candidatos:
         return None
+    email_l = client_email.strip().lower()
+
+    def _clave(p: Path):
+        try:
+            mtime = p.stat().st_mtime
+        except Exception:
+            mtime = 0.0
+        # Preferir stem exacto (misma capitalización) y el más reciente
+        exact_case = 0 if p.stem == client_email else (1 if p.stem.lower() == email_l else 2)
+        return (exact_case, -mtime)
+
+    return sorted(candidatos, key=_clave)[0]
+
+
+def resolver_csv_cuenta(
+    client_email: str,
+    *,
+    permitir_alias: bool = True,
+    respetar_reservas: bool = True,
+) -> Path | None:
+    """Localiza el CSV de UNA cuenta en descargas/.
+
+    Orden: nombre exacto (case-insensitive) → alias Gmail solo si hay un único candidato
+    libre. Nunca usa startswith. Respeta reservas exclusivas de otras cuentas.
+    """
     email_l = (client_email or "").strip().lower()
     if not email_l:
         return None
-    exacto = dest_dir / f"{client_email}.csv"
-    if csv_parece_valido(exacto):
-        return exacto
-    # Exacto sin distinguir mayúsculas
-    for f in dest_dir.glob("*.csv"):
-        if f.stem.lower() == email_l and csv_parece_valido(f):
-            return f
-    # Alias Gmail (puntos / mayúsculas) — evita el startswith frágil que mezclaba cuentas
-    for f in dest_dir.glob("*.csv"):
-        stem = f.stem.strip().lower()
-        if "@" not in stem:
+    archivos = _listar_csvs_descargas()
+    if not archivos:
+        return None
+
+    exactos = []
+    aliases = []
+    for f in archivos:
+        if respetar_reservas and _csv_reservado_por_otra(f, email_l):
             continue
-        if son_correos_equivalentes(stem, email_l) and csv_parece_valido(f):
-            return f
+        stem = f.stem.strip().lower()
+        if stem == email_l:
+            exactos.append(f)
+        elif permitir_alias and "@" in stem and son_correos_equivalentes(stem, email_l):
+            aliases.append(f)
+
+    if exactos:
+        return _elegir_csv_preferido(exactos, client_email)
+    # Alias solo si es inequívoco (1 archivo). Si hay varios, no adivinar.
+    if permitir_alias and len(aliases) == 1:
+        return aliases[0]
     return None
+
+
+def asignar_csvs_a_cuentas(correos: list[str]) -> dict[str, Path | None]:
+    """Asigna CSV↔cuenta 1:1 para un lote (opción 8). Exacto primero; alias Gmail solo si único.
+
+    Un mismo archivo nunca se asigna a dos cuentas. Devuelve dict correo → Path|None.
+    """
+    resultado: dict[str, Path | None] = {c: None for c in correos}
+    if not correos:
+        return resultado
+
+    usados: set[str] = set()
+    archivos = _listar_csvs_descargas()
+
+    # Pasada 1: coincidencia exacta del stem (case-insensitive)
+    for correo in correos:
+        email_l = correo.strip().lower()
+        exactos = [
+            f for f in archivos
+            if f.stem.strip().lower() == email_l and _csv_clave_reserva(f) not in usados
+        ]
+        elegido = _elegir_csv_preferido(exactos, correo)
+        if elegido:
+            resultado[correo] = elegido
+            usados.add(_csv_clave_reserva(elegido))
+            reservar_csv_para_cuenta(elegido, correo)
+
+    # Pasada 2: alias Gmail solo si queda exactamente un candidato libre
+    for correo in correos:
+        if resultado[correo] is not None:
+            continue
+        email_l = correo.strip().lower()
+        aliases = []
+        for f in archivos:
+            clave = _csv_clave_reserva(f)
+            if clave in usados:
+                continue
+            stem = f.stem.strip().lower()
+            if "@" not in stem:
+                continue
+            if son_correos_equivalentes(stem, email_l):
+                aliases.append(f)
+        if len(aliases) == 1:
+            elegido = aliases[0]
+            resultado[correo] = elegido
+            usados.add(_csv_clave_reserva(elegido))
+            reservar_csv_para_cuenta(elegido, correo)
+        elif len(aliases) > 1:
+            nombres = ", ".join(a.name for a in aliases[:5])
+            print(f"  {Color.WARNING}[CSV] [{correo}] Alias Gmail ambiguo "
+                  f"({len(aliases)} archivos: {nombres}). "
+                  f"Renombra a '{correo}.csv' para emparejarlo.{Color.ENDC}")
+
+    return resultado
+
+
+def obtener_csv_para_subida(manager_o_email, *, reintentar_s: float = 0.0) -> Path | None:
+    """CSV definitivo para subir a TuneMyMusic: asignación previa del lote, validada.
+
+    Si hay `csv_asignado` válido y perteneciente a la cuenta, se usa ese (no se re-resuelve
+    a otro archivo). Si falta, se resuelve respetando reservas exclusivas.
+    """
+    if hasattr(manager_o_email, "client_email"):
+        email = manager_o_email.client_email
+        asignado = getattr(manager_o_email, "csv_asignado", None)
+    else:
+        email = manager_o_email
+        asignado = None
+
+    def _ok(path: Path | None) -> Path | None:
+        if not path:
+            return None
+        if not csv_parece_valido(path):
+            return None
+        if not csv_pertenece_a_cuenta(path, email):
+            print(f"  {Color.FAIL}[CSV] [{email}] Rechazado '{getattr(path, 'name', path)}': "
+                  f"no coincide con la cuenta Tidal.{Color.ENDC}")
+            return None
+        if not reservar_csv_para_cuenta(path, email):
+            print(f"  {Color.FAIL}[CSV] [{email}] '{path.name}' ya está reservado para otra cuenta.{Color.ENDC}")
+            return None
+        return path
+
+    path = _ok(asignado if isinstance(asignado, Path) else None)
+    if path:
+        return path
+
+    limite = time.time() + max(0.0, float(reintentar_s or 0.0))
+    while True:
+        path = _ok(resolver_csv_cuenta(email, permitir_alias=True, respetar_reservas=True))
+        if path:
+            if hasattr(manager_o_email, "client_email"):
+                manager_o_email.csv_asignado = path
+            return path
+        if time.time() >= limite:
+            return None
+        time.sleep(3.0)
 
 
 def guardar_csv_descarga_playwright(download, client_email: str) -> Path | None:
@@ -2062,50 +2253,108 @@ def _destinatario_es_para_alias(gmail_user: str, recipients_text: str, cuerpo_te
 
 
 def _extraer_codigos_otp(texto: str) -> list[str]:
-    """Extrae códigos OTP de 5–6 dígitos (juntos o separados por espacios/guiones en HTML)."""
+    """Extrae códigos OTP de 5–6 dígitos priorizando los junto a 'code'/'código'.
+
+    Antes devolvía el primer número de 6 dígitos del HTML (fechas, tracking, etc.) y
+    descartaba OTP reales tipo 202431 por parecer un año → Tidal rechazaba el código.
+    """
     if not texto:
         return []
-    hallados: list[str] = []
+    prioritarios: list[str] = []
+    normales: list[str] = []
     vistos: set[str] = set()
 
-    def _add(codigo: str) -> None:
+    def _es_basura(codigo: str, estricto_anio: bool) -> bool:
+        if codigo in {"00000", "000000", "11111", "111111"}:
+            return True
+        # Fechas YYYYMM sueltas en HTML (202401…) no son OTP; si viene junto a 'code', sí se acepta.
+        if estricto_anio and len(codigo) == 6 and codigo.startswith("20"):
+            try:
+                y, m = int(codigo[:4]), int(codigo[4:6])
+                if 2020 <= y <= 2039 and 1 <= m <= 12:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _add(codigo: str, prioritario: bool = False) -> None:
         codigo = (codigo or "").strip()
         if len(codigo) not in (5, 6) or not codigo.isdigit():
             return
-        # Evitar basura habitual (no filtrar secuencias tipo 123456: a veces son OTP reales)
-        if codigo in {"00000", "000000", "11111", "111111"}:
+        if _es_basura(codigo, estricto_anio=not prioritario):
             return
-        if codigo.startswith("20") and len(codigo) == 6 and 2020 <= int(codigo) <= 2035:
+        if codigo in vistos:
             return
-        if codigo not in vistos:
-            vistos.add(codigo)
-            hallados.append(codigo)
+        vistos.add(codigo)
+        (prioritarios if prioritario else normales).append(codigo)
 
-    for m in re.findall(r"\b(\d{5,6})\b", texto):
-        _add(m)
-
-    # HTML a menudo parte el código: <span>1</span><span>2</span>... → "1 2 3 4 5 6"
-    for m in re.finditer(r"(?<!\d)(?:\d[\s\-]){4,5}\d(?!\d)", texto):
-        _add(re.sub(r"\D", "", m.group(0)))
-
-    # "código: 123456" / "code is 123456" / "introduce 123456"
+    # 1) Junto a palabras de código (máxima prioridad)
     for m in re.finditer(
-        r"(?:c[oó]digo|code|introduce|ingresa|enter|confirma)[^\d]{0,24}(\d{5,6})",
+        r"(?:c[oó]digo|code|sign[-\s]?up\s*code|verification\s*code|one[-\s]?time|"
+        r"introduce|ingresa|enter|confirma|is)[^\d]{0,40}(\d{5,6})",
         texto,
         flags=re.I,
     ):
-        _add(m.group(1))
+        _add(m.group(1), prioritario=True)
 
-    return hallados
+    # 2) Dígitos partidos por HTML/espacios: "1 2 3 4 5 6"
+    for m in re.finditer(r"(?<!\d)(?:\d[\s\-]){4,5}\d(?!\d)", texto):
+        _add(re.sub(r"\D", "", m.group(0)), prioritario=True)
+
+    # 3) Cualquier 5–6 dígitos suelto (menor prioridad)
+    for m in re.findall(r"\b(\d{5,6})\b", texto):
+        _add(m, prioritario=False)
+
+    # Preferir 6 dígitos (Tidal sign-up) dentro de cada grupo
+    def _ordenar(grupo: list[str]) -> list[str]:
+        return sorted(grupo, key=lambda c: (0 if len(c) == 6 else 1, grupo.index(c)))
+
+    return _ordenar(prioritarios) + _ordenar(normales)
+
+
+def _texto_indica_codigo_invalido(texto: str) -> bool:
+    """True solo ante rechazo claro del OTP (no 'Resend' / textos genéricos)."""
+    t = (texto or "").lower()
+    if not t:
+        return False
+    frases = (
+        "código no válido", "codigo no valido", "invalid code", "incorrect code",
+        "código incorrecto", "codigo incorrecto", "wrong code", "code is incorrect",
+        "código erróneo", "codigo erroneo", "el código no es válido",
+        "the code is invalid", "code you entered is incorrect",
+        "that code isn't valid", "that code isnt valid",
+    )
+    return any(f in t for f in frases)
 
 
 KEYWORDS_ELIMINACION_CUENTA = [
+    # Frases específicas del OTP de borrado (evitar "elimin" suelto → correos de Family).
     "verificación de la eliminación", "verificacion de la eliminacion",
     "eliminación de tu cuenta", "eliminacion de tu cuenta",
     "eliminar tu cuenta", "delete your account", "account deletion",
     "confirm that you want to delete", "confirma que deseas eliminar",
-    "desactiv", "elimin", "delete account", "delete", "code", "codigo", "código",
+    "código para eliminar", "codigo para eliminar", "code to delete",
+    "para eliminar tu cuenta", "to delete your account",
+    "verificación para eliminar", "verificacion para eliminar",
+    "confirmation code", "código de confirmación", "codigo de confirmacion",
 ]
+
+# Asuntos/cuerpos que NO son el OTP de borrado de cuenta (opción 15).
+EXCLUDE_ELIMINACION_CUENTA = [
+    "plan tidal family", "tidal family", "family plan", "plan familiar",
+    "eliminado de un plan", "removed from a", "removed from your",
+    "se ha eliminado de un plan", "has been removed from",
+    "invites you to join", "te ha invitado",
+]
+
+
+def _texto_excluido_por_frases(texto: str, frases) -> bool:
+    t = (texto or "").lower()
+    if not t or not frases:
+        return False
+    if isinstance(frases, str):
+        frases = [frases]
+    return any((f or "").lower() in t for f in frases if f)
 
 KEYWORDS_INVITACION_FAMILIAR = [
     "invites you to join", "welcome to the family", "family plan", "family subscription",
@@ -2554,8 +2803,8 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 # Ignorar correos antiguos
                 continue
             
-            # Destinatario: con varios alias con puntos del mismo Gmail hay que atribuir el
-            # código al alias EXACTO. Normalizar puntos aquí mezclaba los códigos entre hilos.
+            # Destinatario: exigir alias EXACTO cuando el mensaje menciona algún alias con puntos.
+            # Si solo viene la forma canónica (sin puntos), aceptar solo si no hay hermanos en el texto.
             to_header = (msg.get("To") or "").lower()
             delivered_to = (msg.get("Delivered-To") or "").lower()
             envelope_to = (msg.get("Envelope-To") or "").lower()
@@ -2646,8 +2895,8 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 if not cumple:
                     continue
             
-            # Verificar exclusion
-            if query_exclude and query_exclude.lower() in text_to_check.lower():
+            # Verificar exclusion (una frase o lista)
+            if query_exclude and _texto_excluido_por_frases(text_to_check, query_exclude):
                 continue
             
             # Buscar codigo OTP (juntos o partidos por HTML) en asunto + cuerpo
@@ -2657,7 +2906,7 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                     if not _reclamar_uid_correo(buzon_clave, msg_id_int):
                         continue
                     print(f"    {Color.GREEN}[IMAP]{Color.ENDC} Código para {gmail_user} "
-                          f"(UID {msg_id_int}, asunto: {(subject_text or '')[:60]!r}).")
+                          f"(UID {msg_id_int}, OTP={codigos[0]}, asunto: {(subject_text or '')[:60]!r}).")
                     return codigos[0]
                 # Keywords OK pero sin OTP: útil para diagnosticar HTML partido / baseline
                 print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Correo Tidal UID {msg_id_int} coincide "
@@ -3814,13 +4063,18 @@ def hacer_click_por_textos(page, textos: list) -> bool:
     return False
 
 def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
-    """Ingresa un código de verificación de forma inteligente (una o múltiples cajas)."""
+    """Ingresa un código de verificación (una caja o 6 cajas OTP). Exige lectura == código."""
+    codigo = re.sub(r"\D", "", str(codigo or ""))
+    if not codigo:
+        return False
+
     for frame in page.frames:
         try:
             code_inputs = []
-            for poll in range(8):
+            for poll in range(10):
                 inputs = frame.locator('input').all()
                 code_inputs = []
+                otp_estrictos = []
                 for ip in inputs:
                     try:
                         if not ip.is_visible():
@@ -3828,83 +4082,191 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                         type_attr = (ip.get_attribute("type") or "").lower()
                         if type_attr in ["email", "checkbox", "radio", "submit", "button", "file", "hidden", "range", "color"]:
                             continue
+                        if type_attr == "password" and (ip.get_attribute("maxlength") or "").strip() != "1":
+                            continue
                         mode = (ip.get_attribute("inputmode") or "").lower()
                         name = (ip.get_attribute("name") or "").lower()
                         placeholder = (ip.get_attribute("placeholder") or "").lower()
                         autocomplete = (ip.get_attribute("autocomplete") or "").lower()
                         maxlength = (ip.get_attribute("maxlength") or "").strip()
+                        aria = (ip.get_attribute("aria-label") or "").lower()
 
-                        # Un input sin atributo 'type' es de texto por defecto; las cajas de código
-                        # suelen llegar así, con maxlength="1" o autocomplete de un solo uso.
-                        if (type_attr in ["", "text", "number", "tel", "password"] or
-                            mode == "numeric" or
-                            autocomplete == "one-time-code" or
-                            maxlength == "1" or
-                            "code" in name or
-                            "code" in placeholder or
-                            "código" in placeholder or
-                            "codigo" in placeholder):
+                        es_otp_estricto = (
+                            maxlength == "1"
+                            or autocomplete == "one-time-code"
+                            or "code" in name
+                            or "otp" in name
+                        )
+                        es_candidato = (
+                            es_otp_estricto
+                            or mode == "numeric"
+                            or "code" in placeholder
+                            or "código" in placeholder
+                            or "codigo" in placeholder
+                            or "digit" in aria
+                            or "código" in aria
+                            or "codigo" in aria
+                            or type_attr in ["", "text", "number", "tel", "password"]
+                        )
+                        if es_candidato:
                             code_inputs.append(ip)
+                            if es_otp_estricto:
+                                otp_estrictos.append(ip)
                     except Exception:
                         pass
-                if len(code_inputs) >= len(codigo):
+                # Preferir solo cajas OTP reales (evita rellenar otros inputs del asistente).
+                if len(otp_estrictos) >= min(4, len(codigo)):
+                    code_inputs = otp_estrictos
+                elif len(otp_estrictos) == 1 and len(codigo) >= 4:
+                    code_inputs = otp_estrictos
+                if len(code_inputs) >= min(4, len(codigo)) or (code_inputs and len(codigo) <= 8 and len(code_inputs) == 1):
                     break
-                time.sleep(0.5)
-            
+                time.sleep(0.35)
+
             if not code_inputs:
                 continue
-                
-            if len(code_inputs) >= 4:
-                objetivos = code_inputs[:len(codigo)]
 
-                def limpiar_cajas():
-                    for caja in objetivos:
+            def leer_cajas(objetivos):
+                leido = ""
+                for caja in objetivos:
+                    try:
+                        leido += (caja.input_value() or "").strip()
+                    except Exception:
+                        pass
+                return leido
+
+            def limpiar_cajas(objetivos):
+                for caja in objetivos:
+                    try:
+                        caja.click(timeout=800)
+                        caja.fill("")
+                    except Exception:
                         try:
-                            caja.click()
                             caja.press("Control+a")
                             caja.press("Backspace")
                         except Exception:
                             pass
 
-                def leer_cajas():
-                    leido = ""
-                    for caja in objetivos:
-                        try:
-                            leido += (caja.input_value() or "").strip()
-                        except Exception:
-                            pass
-                    return leido
+            # Varias cajas (Tidal: 6 inputs maxlength=1)
+            if len(code_inputs) >= 4:
+                objetivos = code_inputs[:len(codigo)]
+                if len(objetivos) < len(codigo):
+                    continue
 
-                # 1) Caja por caja, para componentes que no mueven el foco al teclear
-                limpiar_cajas()
-                for idx, digit in enumerate(codigo[:len(objetivos)]):
-                    try:
-                        objetivos[idx].click()
-                        objetivos[idx].type(digit, delay=120)
-                    except Exception:
-                        pass
-                    time.sleep(0.1)
-                if leer_cajas() == codigo:
-                    return True
-
-                # 2) Secuencia de teclado, para componentes que avanzan el foco solos
-                limpiar_cajas()
+                # 1) JS solo sobre maxlength=1 / one-time-code (React controlado)
                 try:
-                    objetivos[0].click()
+                    ok_js = frame.evaluate(
+                        """([digitos]) => {
+                            const esOtp = (el) => {
+                                const t = (el.type || '').toLowerCase();
+                                if (['email','checkbox','radio','submit','button','file','hidden'].includes(t)) return false;
+                                const max = el.getAttribute('maxlength') || '';
+                                const mode = (el.inputMode || '').toLowerCase();
+                                const ac = (el.autocomplete || '').toLowerCase();
+                                const name = (el.name || '').toLowerCase();
+                                return max === '1' || ac === 'one-time-code' || mode === 'numeric'
+                                    || name.includes('code') || name.includes('otp');
+                            };
+                            const inputs = Array.from(document.querySelectorAll('input')).filter(el => {
+                                if (!esOtp(el)) return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0;
+                            });
+                            if (inputs.length < digitos.length) return false;
+                            const targets = inputs.slice(0, digitos.length);
+                            targets.forEach((el, i) => {
+                                el.focus();
+                                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                                if (setter) setter.call(el, digitos[i]);
+                                else el.value = digitos[i];
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: digitos[i] }));
+                            });
+                            return targets.every((el, i) => (el.value || '') === digitos[i]);
+                        }""",
+                        list(codigo),
+                    )
+                    if ok_js and leer_cajas(objetivos) == codigo:
+                        return True
+                    if ok_js:
+                        # JS dice OK aunque Playwright lea distinto (shadow/React): aceptar
+                        return True
                 except Exception:
                     pass
-                time.sleep(0.3)
+
+                # 2) Caja por caja con type()
+                limpiar_cajas(objetivos)
+                for idx, digit in enumerate(codigo):
+                    try:
+                        objetivos[idx].click(timeout=800)
+                        objetivos[idx].fill("")
+                        objetivos[idx].type(digit, delay=80)
+                    except Exception:
+                        try:
+                            objetivos[idx].fill(digit)
+                        except Exception:
+                            pass
+                    time.sleep(0.05)
+                if leer_cajas(objetivos) == codigo:
+                    return True
+
+                # 3) Secuencia de teclado desde la primera caja
+                limpiar_cajas(objetivos)
+                try:
+                    objetivos[0].click(timeout=800)
+                except Exception:
+                    pass
+                time.sleep(0.2)
                 for digit in codigo:
-                    page.keyboard.type(digit, delay=150)
-                    time.sleep(0.15)
-                leido_final = leer_cajas()
-                return leido_final == codigo or leido_final == ""
-            else:
-                target = code_inputs[0]
-                target.focus()
+                    try:
+                        page.keyboard.type(digit, delay=100)
+                    except Exception:
+                        break
+                    time.sleep(0.08)
+                if leer_cajas(objetivos) == codigo:
+                    return True
+                # Nunca tratar cajas vacías como éxito
+                continue
+
+            # Una sola caja
+            target = code_inputs[0]
+            try:
+                target.click(timeout=800)
                 target.fill("")
-                target.type(codigo, delay=150)
-                return True
+                target.type(codigo, delay=80)
+            except Exception:
+                try:
+                    target.fill(codigo)
+                except Exception:
+                    continue
+            try:
+                if (target.input_value() or "").strip() == codigo:
+                    return True
+            except Exception:
+                pass
+            # Fallback JS
+            try:
+                ok = frame.evaluate(
+                    """(code) => {
+                        const el = document.querySelector('input[autocomplete="one-time-code"]')
+                            || document.querySelector('input[name="code"]')
+                            || document.querySelector('input[inputmode="numeric"]')
+                            || document.querySelector('input[maxlength="1"]');
+                        if (!el) return false;
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) setter.call(el, code);
+                        else el.value = code;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return (el.value || '') === code;
+                    }""",
+                    codigo,
+                )
+                if ok:
+                    return True
+            except Exception:
+                pass
         except Exception:
             continue
     return False
@@ -4731,6 +5093,8 @@ class TidalRegisterManager:
         self.pagos_bloqueados = set()
         self._rotaciones_antibot = 0
         self._recuperaciones_error_tidal = 0
+        # CSV fijado 1:1 en la opción 8 (asignar_csvs_a_cuentas); no re-resolver a otro archivo.
+        self.csv_asignado = None
         
         email_safe = re.sub(r'[^a-zA-Z0-9]', '_', client_email)
         self.main_profile = Path(tempfile.gettempdir()) / f"tidal_reg_{email_safe}_{random.randint(1000, 9999)}"
@@ -5414,8 +5778,8 @@ class TidalRegisterManager:
             """)
             time.sleep(1.0)
             
-            # Con varios alias con puntos del mismo Gmail, serializar Suscríbete + lectura del
-            # código evita que un hilo robe el correo del otro y se quede colgado en /authorize.
+            # Con varios alias con puntos del mismo Gmail, serializar Suscríbete + lectura +
+            # envío del código evita que un hilo robe el correo del otro o pulse Continuar vacío.
             with _lock_registro_mismo_buzon(self.client_email):
                 max_id_previo = obtener_max_email_id(self.client_email)
 
@@ -5439,45 +5803,68 @@ class TidalRegisterManager:
                         }""")
                     except Exception:
                         pass
-                time.sleep(4.0)
+                time.sleep(2.5)
 
-                print("  [Registro] Buscando código de registro enviado por correo...")
-                codigo = None
-                for intento in range(1, 8):
-                    print(f"  [Registro] Intento {intento}/7: Buscando correo...")
-                    codigo = obtener_codigo_via_imap(
-                        gmail_user=self.client_email,
-                        required_keywords=["registr", "bienven", "código", "code", "verific"],
-                        query_exclude="cancel",
-                        after_email_id=max_id_previo
-                    )
-                    if codigo:
+                codigo_aceptado = False
+                ultimo_error_codigo = ""
+                for ronda in range(1, 4):
+                    print(f"  [Registro] Buscando código de registro vía IMAP (ronda {ronda}/3)...")
+                    codigo = None
+                    for intento in range(1, 8):
+                        print(f"  [Registro] Intento {intento}/7: Buscando correo...")
+                        codigo = obtener_codigo_via_imap(
+                            gmail_user=self.client_email,
+                            required_keywords=["registr", "bienven", "código", "code", "verific", "sign-up", "signup"],
+                            query_exclude="cancel",
+                            after_email_id=max_id_previo
+                        )
+                        if codigo:
+                            break
+                        if intento < 7:
+                            print("  [Registro] Correo no encontrado aún. Esperando 5 segundos...")
+                            time.sleep(5.0)
+
+                    if not codigo:
+                        ultimo_error_codigo = "No se pudo extraer el código de verificación del correo."
                         break
-                    if intento < 7:
-                        print("  [Registro] Correo no encontrado aún. Esperando 8 segundos...")
-                        time.sleep(8.0)
 
-            if not codigo:
-                raise RuntimeError("No se pudo extraer el código de verificación del correo de manera automática.")
-                
-            if codigo:
-                code_input = esperar_locator_en_frames(
-                    self.page,
-                    ['input[name="code"]', 'input[placeholder*="código" i]', 'input[placeholder*="code" i]',
-                     'input[type="text"]', 'input[inputmode="numeric"]'],
-                    timeout_s=5.0
-                )
-                if code_input:
-                    escribir_codigo_verificacion_inteligente(self.page, codigo)
-                    time.sleep(1.0)
-                    
-                    # Gatillar el envío de forma limpia (Enter + clic único)
+                    if codigo.startswith("http"):
+                        reg_page = self.context.new_page()
+                        reg_page.goto(codigo)
+                        time.sleep(2.0)
+                        reg_page.close()
+                        codigo_aceptado = True
+                        break
+
+                    # Esperar las 6 cajas OTP de "Verify your email"
+                    esperar_locator_en_frames(
+                        self.page,
+                        [
+                            'input[autocomplete="one-time-code"]',
+                            'input[maxlength="1"]',
+                            'input[name="code"]',
+                            'input[inputmode="numeric"]',
+                            'input[type="text"]',
+                        ],
+                        timeout_s=12.0,
+                    )
+                    time.sleep(0.4)
+
+                    print(f"  [Registro] [{self.client_email}] Escribiendo código OTP ({codigo})...")
+                    if not escribir_codigo_verificacion_inteligente(self.page, codigo):
+                        print(f"  [Registro] {Color.WARNING}[WARN] No se pudo rellenar las cajas OTP; "
+                              f"reintentando...{Color.ENDC}")
+                        ultimo_error_codigo = "No se pudieron rellenar las cajas del código OTP."
+                        time.sleep(1.0)
+                        continue
+
+                    time.sleep(0.5)
                     try:
                         self.page.keyboard.press("Enter")
-                        time.sleep(1.0)
+                        time.sleep(0.8)
                     except Exception:
                         pass
-                        
+
                     btn_confirm = esperar_locator_en_frames(
                         self.page,
                         [
@@ -5499,40 +5886,73 @@ class TidalRegisterManager:
                                 const btn = document.querySelector('button[type="submit"]') ||
                                             Array.from(document.querySelectorAll('button')).find(b => {
                                                 const t = (b.textContent || '').trim().toLowerCase();
-                                                return t === '' || t.includes('continuar') || t.includes('continue') || t.includes('confirm');
+                                                return t.includes('continuar') || t.includes('continue')
+                                                    || t.includes('confirm') || t.includes('verificar')
+                                                    || t.includes('verify');
                                             });
                                 if (btn) btn.click();
                             }""")
                         except Exception:
                             pass
 
-                    time.sleep(2.0)
-                    # Si el código era de otro alias, Tidal suele mostrar error y dejar el form
+                    # Dar tiempo a Tidal a validar antes de decidir rechazo
+                    time.sleep(2.5)
                     try:
                         texto_err = self.page.evaluate(
                             "() => document.body ? document.body.innerText.toLowerCase() : ''"
                         )
                     except Exception:
                         texto_err = ""
-                    if any(x in texto_err for x in (
-                        "código no válido", "codigo no valido", "invalid code", "incorrect code",
-                        "código incorrecto", "codigo incorrecto", "try again", "inténtalo de nuevo"
-                    )) and encontrar_locator_en_frames(
-                        self.page,
-                        ['input[name="code"]', 'input[inputmode="numeric"]', 'input[type="text"]']
-                    ):
-                        raise RuntimeError(
-                            f"Tidal rechazó el código de verificación para {self.client_email} "
-                            f"(posible mezcla con otro alias del mismo Gmail)."
+
+                    sigue_en_otp = False
+                    try:
+                        sigue_en_otp = bool(encontrar_locator_en_frames(
+                            self.page,
+                            [
+                                'input[maxlength="1"]',
+                                'input[autocomplete="one-time-code"]',
+                                'input[name="code"]',
+                                'input[inputmode="numeric"]',
+                            ]
+                        ))
+                    except Exception:
+                        pass
+
+                    if _texto_indica_codigo_invalido(texto_err) and sigue_en_otp:
+                        print(f"  [Registro] {Color.WARNING}[WARN] [{self.client_email}] Tidal rechazó "
+                              f"el código {codigo}. Solicitando uno nuevo...{Color.ENDC}")
+                        ultimo_error_codigo = (
+                            f"Tidal rechazó el código de verificación para {self.client_email}."
                         )
-                            
+                        # Resend + nuevo baseline para no reutilizar el mismo UID
+                        try:
+                            btn_resend = esperar_locator_en_frames(
+                                self.page,
+                                [
+                                    "button:has-text('Resend code')", "button:has-text('Resend')",
+                                    "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
+                                    "a:has-text('Resend')", "a:has-text('Reenviar')",
+                                ],
+                                timeout_s=3.0,
+                            )
+                            if btn_resend:
+                                btn_resend.click(force=True)
+                                time.sleep(2.0)
+                        except Exception:
+                            pass
+                        max_id_previo = obtener_max_email_id(self.client_email)
+                        continue
+
+                    # Si ya salimos de la pantalla OTP, o no hay error claro → seguir
+                    codigo_aceptado = True
                     print("  [Registro] Código enviado. Esperando procesamiento de la cuenta...")
-                else:
-                    if codigo.startswith("http"):
-                        reg_page = self.context.new_page()
-                        reg_page.goto(codigo)
-                        time.sleep(2.0)
-                        reg_page.close()
+                    break
+
+                if not codigo_aceptado:
+                    raise RuntimeError(
+                        ultimo_error_codigo
+                        or f"No se pudo verificar el correo de registro para {self.client_email}."
+                    )
             
             print("  [Registro] Esperando redirección automática al perfil o cuenta...")
             # Opción 8: confirmación más corta; no hace falta quemar 60s si la sesión ya está.
@@ -6448,24 +6868,24 @@ class TidalRegisterManager:
             transfer_ok = False
             mantener_abierta = False
 
-            # Localizar el archivo CSV (exacto o alias Gmail); reintentar unos segundos por si OneDrive aún sincroniza
-            csv_path = resolver_csv_cuenta(self.client_email)
+            # CSV fijado 1:1 a esta cuenta (lote opción 8). No re-resolver a otro archivo.
+            csv_path = obtener_csv_para_subida(self, reintentar_s=0.0)
             if not csv_path:
                 print(f"  {Color.WARNING}[TuneMyMusic] [{self.client_email}] CSV aún no visible en 'descargas/'. "
-                      f"Esperando hasta 90s...{Color.ENDC}")
-                limite_csv = time.time() + 90
-                while time.time() < limite_csv and not csv_path:
-                    time.sleep(3.0)
-                    csv_path = resolver_csv_cuenta(self.client_email)
+                      f"Esperando hasta 90s (solo archivos que coincidan con esta cuenta)...{Color.ENDC}")
+                csv_path = obtener_csv_para_subida(self, reintentar_s=90.0)
 
             if not csv_path:
                 print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] ERROR: No se encontró CSV válido en "
-                      f"'descargas/' para esta cuenta. La ventana se mantiene abierta para subida manual "
+                      f"'descargas/' para esta cuenta ({self.client_email}.csv). "
+                      f"La ventana se mantiene abierta para subida manual "
                       f"(hasta 15 min o hasta que la cierres).{Color.ENDC}")
                 mantener_abierta = True
             else:
                 # Tras ENTER, cada ventana puede seguir sin el input listo (usuario preparando 10 pantallas).
                 # Antes: 30s → error → cierre inmediato (error.txt: Timeout input[type=file]).
+                print(f"  [TuneMyMusic] [{self.client_email}] CSV emparejado: {csv_path.name} "
+                      f"→ cuenta {self.client_email}")
                 print(f"  [TuneMyMusic] [{self.client_email}] Esperando el selector de archivo (hasta 5 min) "
                       f"para subir {csv_path.name}...")
                 file_input = None
@@ -6498,14 +6918,21 @@ class TidalRegisterManager:
                           f"Ventana abierta para subida manual (15 min).{Color.ENDC}")
                     mantener_abierta = True
                 else:
-                    print(f"  [TuneMyMusic] [{self.client_email}] Subiendo archivo CSV: {csv_path.name}...")
-                    try:
-                        file_input.set_input_files(str(csv_path.resolve()))
-                        print(f"  [TuneMyMusic] [{self.client_email}] Archivo CSV subido con éxito.")
-                    except Exception as e:
-                        print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] ERROR al subir el archivo CSV: {e}. "
-                              f"Ventana abierta para reintento manual (15 min).{Color.ENDC}")
+                    # Doble chequeo justo antes de set_input_files (evita carrera entre ventanas)
+                    if not csv_pertenece_a_cuenta(csv_path, self.client_email) or not csv_parece_valido(csv_path):
+                        print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] Abortada subida: "
+                              f"'{csv_path.name}' ya no coincide con la cuenta.{Color.ENDC}")
                         mantener_abierta = True
+                    else:
+                        print(f"  [TuneMyMusic] [{self.client_email}] Subiendo archivo CSV: {csv_path.name}...")
+                        try:
+                            file_input.set_input_files(str(csv_path.resolve()))
+                            print(f"  [TuneMyMusic] [{self.client_email}] Archivo CSV subido con éxito "
+                                  f"({csv_path.name} → {self.client_email}).")
+                        except Exception as e:
+                            print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] ERROR al subir el archivo CSV: {e}. "
+                                  f"Ventana abierta para reintento manual (15 min).{Color.ENDC}")
+                            mantener_abierta = True
 
             # Monitorear transferencia (también si la subida fue manual: el usuario puede completar solo)
             if not self.page or self.page.is_closed():
@@ -8599,70 +9026,43 @@ class TidalFamilyInviter:
             time.sleep(2.0)
         return False
 
-    def _login_titular_una_vez(self, titular) -> bool:
-        """Login titular con bypass de reputación, antibot y reintento ante túnel muerto.
+    def _cambiar_a_modo_codigo_si_hay_password(self, titular) -> bool:
+        """Si Tidal muestra contraseña, intenta pasar a 'iniciar sesión sin/con código'.
 
-        En frío a account.tidal.com/ (sin pricing) DataDome suele tapar el formulario.
-        Ante ERR_TUNNEL se rota proxy; tras el código se espera sesión real antes de /family.
+        Devuelve True si tras el intento ya no hay campo password (o nunca lo hubo).
         """
-        max_intentos_nav = 4
-        ultimo_error = None
-        for intento_nav in range(1, max_intentos_nav + 1):
-            try:
-                if self._login_titular_flujo(titular):
-                    return True
-                # Flujo llegó al final sin sesión: reintentar con IP limpia si queda cupo
-                if intento_nav < max_intentos_nav:
-                    print(f"  [Inviter] [{titular['correo']}] Login incompleto "
-                          f"(intento {intento_nav}/{max_intentos_nav}). Rotando proxy PE...")
-                    self.logout_titular()
-                    self.rotar_proxy_contexto()
-                    continue
-            except RuntimeError as e:
-                # Antibot persistente / sin proxies: no insistir
-                print(f"  [Inviter] [{titular['correo']}] Login abortado: {e}")
-                return False
-            except Exception as e:
-                ultimo_error = e
-                if es_error_proxy_o_red(e) and intento_nav < max_intentos_nav:
-                    print(f"  [Inviter] [{titular['correo']}] Fallo de túnel/proxy "
-                          f"({e}). Rotando IP ({intento_nav}/{max_intentos_nav})...")
-                    try:
-                        self.rotar_proxy_contexto()
-                    except RuntimeError as e_rot:
-                        print(f"  [Inviter] [{titular['correo']}] Sin proxies limpios: {e_rot}")
-                        return False
-                    continue
-                if es_error_navegacion_abortada(e) and intento_nav < max_intentos_nav:
-                    print(f"  [Inviter] [{titular['correo']}] Navegación abortada; "
-                          f"reintentando mismo proxy ({intento_nav}/{max_intentos_nav})...")
-                    time.sleep(1.5)
-                    continue
-                print(f"  [Inviter] [{titular['correo']}] Excepción en login: {e}")
-                if intento_nav < max_intentos_nav:
-                    time.sleep(2.0)
-                    continue
-                return False
-        if ultimo_error:
-            print(f"  [Inviter] [{titular['correo']}] Login agotó reintentos: {ultimo_error}")
-        return False
-
-    def _cambiar_a_modo_codigo_si_hay_password(self, titular) -> None:
-        """Si Tidal muestra contraseña, intentar pasar a 'iniciar sesión sin contraseña'."""
         pwd_input = encontrar_locator_en_frames(
             self.page, ['input[type="password"]', 'input[name="password"]']
         )
         if not pwd_input:
-            return
+            return True
         print(f"  [Inviter] [{titular['correo']}] Pantalla de contraseña detectada. "
               f"Cambiando a inicio por código...")
+        # 1) Helpers usados en invitaciones (más fiables con el texto suelto de Tidal)
+        try:
+            if _invite_eval_modo_contrasena(self.page, "existe"):
+                _invite_clic_modo_contrasena(self.page)
+                time.sleep(2.0)
+                self.page = pagina_vigente(self.page)
+                if not encontrar_locator_en_frames(
+                    self.page, ['input[type="password"]', 'input[name="password"]']
+                ):
+                    return True
+        except Exception:
+            pass
+
         btn_code_mode = esperar_locator_en_frames(
             self.page,
-            ["a:has-text('contraseña')", "button:has-text('contraseña')",
-             "a:has-text('código')", "button:has-text('código')",
-             "a:has-text('code')", "button:has-text('code')",
-             "text='Inicia sesión sin contraseña'", "text='Sign in without password'",
-             "text='Inicia sesión con un código'", "text='Sign in with a code'"],
+            [
+                "a:has-text('sin contraseña')", "button:has-text('sin contraseña')",
+                "a:has-text('without password')", "button:has-text('without password')",
+                "a:has-text('con un código')", "button:has-text('con un código')",
+                "a:has-text('with a code')", "button:has-text('with a code')",
+                "a:has-text('código')", "button:has-text('código')",
+                "a:has-text('code')", "button:has-text('code')",
+                "text='Inicia sesión sin contraseña'", "text='Sign in without password'",
+                "text='Inicia sesión con un código'", "text='Sign in with a code'",
+            ],
             timeout_s=6.0
         )
         if btn_code_mode:
@@ -8676,10 +9076,124 @@ class TidalFamilyInviter:
             time.sleep(2.5)
             self.page = pagina_vigente(self.page)
 
+        return not bool(encontrar_locator_en_frames(
+            self.page, ['input[type="password"]', 'input[name="password"]']
+        ))
+
+    def _login_titular_con_password(self, titular, password: str) -> bool:
+        """Completa el login del titular con contraseña conocida (sesiones_imap_cuentas.txt)."""
+        pwd_input = esperar_locator_en_frames(
+            self.page,
+            ['input[type="password"]', 'input[name="password"]'],
+            timeout_s=8.0
+        )
+        if not pwd_input:
+            return False
+        print(f"  [Inviter] [{titular['correo']}] Iniciando sesión con contraseña guardada...")
+        try:
+            pwd_input.fill("")
+            pwd_input.fill(password)
+        except Exception:
+            try:
+                rellenar_campo_humanizado(pwd_input, password)
+            except Exception:
+                return False
+        time.sleep(0.4)
+        try:
+            self.page.keyboard.press("Enter")
+            time.sleep(0.8)
+        except Exception:
+            pass
+        btn_login = esperar_locator_en_frames(
+            self.page,
+            [
+                "button[type='submit']",
+                "button:has-text('Iniciar sesión')", "button:has-text('Log in')",
+                "button:has-text('Sign in')", "button:has-text('Continuar')",
+                "button:has-text('Continue')",
+            ],
+            timeout_s=6.0
+        )
+        if btn_login:
+            try:
+                btn_login.click()
+            except Exception:
+                try:
+                    btn_login.evaluate("el => el.click()")
+                except Exception:
+                    pass
+        time.sleep(2.0)
+        manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular post-password ({titular['correo']})")
+        self.page = pagina_vigente(self.page)
+        if not self._esperar_fin_de_login(titular):
+            return False
+        return self._abrir_panel_familia(titular)
+
+    def _login_titular_una_vez(self, titular) -> bool:
+        """Login titular con bypass de reputación, antibot y reintento ante fallos de red.
+
+        Preferencia: contraseña de sesiones_imap_cuentas.txt. Fallback: código IMAP.
+        En MODO_SIN_PROXY reinicia Chrome/IP real; no exige pool PE.
+        """
+        max_intentos_nav = 4
+        ultimo_error = None
+        self.client_email = titular.get("correo") or self.client_email
+        for intento_nav in range(1, max_intentos_nav + 1):
+            try:
+                if self._login_titular_flujo(titular):
+                    return True
+                if intento_nav < max_intentos_nav:
+                    if MODO_SIN_PROXY:
+                        print(f"  [Inviter] [{titular['correo']}] Login incompleto "
+                              f"(intento {intento_nav}/{max_intentos_nav}). "
+                              f"Reiniciando navegador (sin proxy)...")
+                    else:
+                        print(f"  [Inviter] [{titular['correo']}] Login incompleto "
+                              f"(intento {intento_nav}/{max_intentos_nav}). Rotando proxy PE...")
+                    self.logout_titular()
+                    self.rotar_proxy_contexto()
+                    continue
+            except RuntimeError as e:
+                print(f"  [Inviter] [{titular['correo']}] Login abortado: {e}")
+                return False
+            except Exception as e:
+                ultimo_error = e
+                if es_error_proxy_o_red(e) and intento_nav < max_intentos_nav:
+                    if MODO_SIN_PROXY:
+                        print(f"  [Inviter] [{titular['correo']}] Fallo de red ({e}). "
+                              f"Reiniciando con IP real ({intento_nav}/{max_intentos_nav})...")
+                    else:
+                        print(f"  [Inviter] [{titular['correo']}] Fallo de túnel/proxy "
+                              f"({e}). Rotando IP ({intento_nav}/{max_intentos_nav})...")
+                    try:
+                        self.rotar_proxy_contexto()
+                    except RuntimeError as e_rot:
+                        print(f"  [Inviter] [{titular['correo']}] No se pudo reiniciar: {e_rot}")
+                        return False
+                    continue
+                if es_error_navegacion_abortada(e) and intento_nav < max_intentos_nav:
+                    print(f"  [Inviter] [{titular['correo']}] Navegación abortada; "
+                          f"reintentando ({intento_nav}/{max_intentos_nav})...")
+                    time.sleep(1.5)
+                    continue
+                print(f"  [Inviter] [{titular['correo']}] Excepción en login: {e}")
+                if intento_nav < max_intentos_nav:
+                    time.sleep(2.0)
+                    continue
+                return False
+        if ultimo_error:
+            print(f"  [Inviter] [{titular['correo']}] Login agotó reintentos: {ultimo_error}")
+        return False
+
     def _login_titular_flujo(self, titular) -> bool:
         # Calentar la reputación de la IP antes de tocar el login
         print(f"  [Bypass] [{titular['correo']}] Calentando reputación en tidal.com/pricing...")
-        navegar_tidal_tolerante(self.page, "https://tidal.com/pricing", timeout_ms=30000)
+        try:
+            navegar_tidal_tolerante(self.page, "https://tidal.com/pricing", timeout_ms=30000)
+        except Exception as e_pr:
+            if es_error_proxy_o_red(e_pr):
+                raise
+            print(f"  [Inviter] [{titular['correo']}] [WARN] Pricing: {e_pr}")
         manejar_bloqueos_e_intervencion(self.page, "Invitador Titular (Calentamiento)")
         self.page = pagina_vigente(self.page)
         time.sleep(random.uniform(2.0, 3.5))
@@ -8687,11 +9201,22 @@ class TidalFamilyInviter:
         time.sleep(random.uniform(0.5, 1.0))
 
         print(f"  [Bypass] [{titular['correo']}] Entrando a account.tidal.com/login con referer...")
-        navegar_tidal_tolerante(
-            self.page, "https://account.tidal.com/login",
-            referer="https://tidal.com/pricing",
-            timeout_ms=30000
-        )
+        try:
+            navegar_tidal_tolerante(
+                self.page, "https://account.tidal.com/login",
+                referer="https://tidal.com/pricing",
+                timeout_ms=30000
+            )
+        except Exception as e_lg:
+            # Soft abort: a veces la pestaña ya quedó en login
+            try:
+                u = (self.page.url or "").lower()
+            except Exception:
+                u = ""
+            if not (url_es_login_o_cuenta(u) or "account.tidal.com" in u):
+                raise
+            print(f"  [Inviter] [{titular['correo']}] goto login abortó pero la pestaña "
+                  f"quedó en {u[:70]}. Se continúa.")
         manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular ({titular['correo']})")
         self.page = pagina_vigente(self.page)
         aceptar_cookies_con_espera(self.page)
@@ -8702,6 +9227,13 @@ class TidalFamilyInviter:
                 return False
             manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular ({titular['correo']})")
             self.page = pagina_vigente(self.page)
+
+        # Sesión residual del perfil persistente
+        try:
+            if self._sesion_titular_activa(titular):
+                return self._abrir_panel_familia(titular)
+        except Exception:
+            pass
 
         email_selectors = ['input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]', '#email']
         email_input = esperar_locator_en_frames(self.page, email_selectors, timeout_s=20.0)
@@ -8738,7 +9270,33 @@ class TidalFamilyInviter:
         time.sleep(2.0)
         manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular post-email ({titular['correo']})")
         self.page = pagina_vigente(self.page)
-        self._cambiar_a_modo_codigo_si_hay_password(titular)
+
+        # Preferir contraseña si la tenemos: el modo código a menudo no dispara correo
+        # cuando Tidal ya ofreció el campo password (fallo típico de la opción 9).
+        pwd_cuenta = buscar_contrasena_cuenta(titular["correo"])
+        hay_pwd_ui = bool(encontrar_locator_en_frames(
+            self.page, ['input[type="password"]', 'input[name="password"]']
+        ))
+        if hay_pwd_ui and pwd_cuenta:
+            if self._login_titular_con_password(titular, pwd_cuenta):
+                return True
+            print(f"  [Inviter] [{titular['correo']}] Login por contraseña falló. "
+                  f"Probando inicio por código IMAP...")
+            if not self._cambiar_a_modo_codigo_si_hay_password(titular):
+                print(f"  [Inviter] [{titular['correo']}] No se pudo cambiar a modo código "
+                      f"tras fallar la contraseña.")
+                return False
+        elif hay_pwd_ui and not pwd_cuenta:
+            print(f"  [Inviter] [{titular['correo']}] Hay campo password pero no hay "
+                  f"contraseña en sesiones_imap_cuentas.txt. Cambiando a modo código...")
+            if not self._cambiar_a_modo_codigo_si_hay_password(titular):
+                print(f"  [Inviter] {Color.FAIL}[{titular['correo']}] Sigue en password y "
+                      f"no hay clave guardada ni modo código. Anota la contraseña del "
+                      f"titular en sesiones_imap_cuentas.txt.{Color.ENDC}")
+                return False
+        else:
+            # Por si aparece password más tarde, intentamos forzar código de todas formas
+            self._cambiar_a_modo_codigo_si_hay_password(titular)
 
         print(f"  [Inviter] [{titular['correo']}] Esperando enlace/código de inicio de sesión vía IMAP...")
         code_or_link = None
@@ -8746,16 +9304,51 @@ class TidalFamilyInviter:
             print(f"  [Inviter] [{titular['correo']}] Intento {intento}/14: Buscando correo de inicio de sesión...")
             code_or_link = obtener_codigo_via_imap(
                 gmail_user=titular["correo"],
-                required_keywords=["code", "código", "verific", "login", "link", "acceso", "entrar", "inici"],
-                query_exclude="invited to a tidal family",
+                required_keywords=[
+                    "sign-in code", "signin code", "login code", "código de acceso",
+                    "codigo de acceso", "verification code", "código de verificación",
+                    "codigo de verificacion", "one-time", "código", "codigo", "code",
+                    "verific", "acceso", "entrar", "inici", "login", "link",
+                ],
+                query_exclude=[
+                    "invited to a tidal family", "plan tidal family", "tidal family",
+                    "plan familiar", "eliminación de tu cuenta", "eliminacion de tu cuenta",
+                    "delete your account", "account deletion", "reset your password",
+                    "restablecer", "resetpass",
+                ],
                 after_email_id=base_id,
-                solo_link=False
+                solo_link=False,
+                max_age_minutes=20,
             )
             if code_or_link:
                 break
-            time.sleep(8.0)
+            # A mitad: reintentar forzar modo código / reenviar
+            if intento in (4, 8):
+                try:
+                    self._cambiar_a_modo_codigo_si_hay_password(titular)
+                    btn_resend = esperar_locator_en_frames(
+                        self.page,
+                        [
+                            "button:has-text('Resend')", "button:has-text('Reenviar')",
+                            "a:has-text('Resend')", "a:has-text('Reenviar')",
+                        ],
+                        timeout_s=2.0,
+                    )
+                    if btn_resend:
+                        btn_resend.click(force=True)
+                        time.sleep(1.5)
+                        base_id = obtener_max_email_id(titular["correo"], "tidal")
+                except Exception:
+                    pass
+            time.sleep(6.0)
 
         if not code_or_link:
+            # Último recurso: password si apareció y tenemos clave
+            if pwd_cuenta and encontrar_locator_en_frames(
+                self.page, ['input[type="password"]', 'input[name="password"]']
+            ):
+                print(f"  [Inviter] [{titular['correo']}] Sin código IMAP; reintentando con contraseña...")
+                return self._login_titular_con_password(titular, pwd_cuenta)
             print(f"  [Inviter] ERROR: No se recibió ningún código/enlace por IMAP para {titular['correo']}.")
             return False
 
@@ -8769,6 +9362,10 @@ class TidalFamilyInviter:
             escrito = False
             for reintento in range(1, 4):
                 self.page = pagina_vigente(self.page)
+                try:
+                    self.page.bring_to_front()
+                except Exception:
+                    pass
                 if escribir_codigo_verificacion_inteligente(self.page, code_or_link):
                     escrito = True
                     break
@@ -8797,10 +9394,17 @@ class TidalFamilyInviter:
         return self._abrir_panel_familia(titular)
 
     def asegurar_login_titular(self, titular) -> bool:
+        self.client_email = titular.get("correo") or self.client_email
         if self._sesion_titular_activa(titular):
             return True
 
         print(f"  [Inviter] No se detectó sesión activa o es incorrecta. Iniciando sesión en titular: {titular['correo']}...")
+        pwd = buscar_contrasena_cuenta(titular["correo"])
+        if pwd:
+            print(f"  [Inviter] Contraseña del titular encontrada en sesiones_imap_cuentas.txt.")
+        else:
+            print(f"  [Inviter] {Color.WARNING}Sin contraseña en sesiones_imap_cuentas.txt para "
+                  f"{titular['correo']}; se usará login por código IMAP.{Color.ENDC}")
         for intento_login in range(1, 4):
             if intento_login > 1:
                 print(f"  [Inviter] {Color.WARNING}Reintentando inicio de sesión del titular ({intento_login}/3)...{Color.ENDC}")
@@ -10497,7 +11101,10 @@ class TidalAutoLoginManager:
             self.asegurar_navegador_abierto()
             
             # 1. Abrir navegador y cargar página de login en Tidal con bypass de reputación
-            print(f"  [Navegador] [{self.client_email}] Abriendo ventana de Chrome mediante proxy de Perú...")
+            if MODO_SIN_PROXY:
+                print(f"  [Navegador] [{self.client_email}] Abriendo Chrome con IP real (sin proxy)...")
+            else:
+                print(f"  [Navegador] [{self.client_email}] Abriendo ventana de Chrome mediante proxy de Perú...")
             
             nav_exitoso = False
             # Misma cuota: cada intento duro puede rotar. Los ERR_ABORTED no consumen rotación
@@ -10544,9 +11151,10 @@ class TidalAutoLoginManager:
                     nav_exitoso = True
                     break
                 except Exception as e_nav:
-                    print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Intento {intento_nav}/{_max_intentos_nav} de navegación con proxy falló ({e_nav})...{Color.ENDC}")
+                    print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Intento "
+                          f"{intento_nav}/{_max_intentos_nav} de navegación falló ({e_nav})...{Color.ENDC}")
 
-                    # ERR_ABORTED / redirect: reintentar con el MISMO proxy. Solo rotar ante
+                    # ERR_ABORTED / redirect: reintentar con el MISMO proxy/IP. Solo rotar ante
                     # fallo real de túnel/conectividad.
                     if es_error_navegacion_abortada(e_nav) and not es_error_proxy_o_red(e_nav):
                         try:
@@ -10555,7 +11163,7 @@ class TidalAutoLoginManager:
                             actual = ""
                         if url_es_login_o_cuenta(actual):
                             print(f"  [Login] [{self.client_email}] Navegación abortada pero la pestaña "
-                                  f"quedó en login/cuenta ({actual[:70]}). Se continúa sin rotar proxy.")
+                                  f"quedó en login/cuenta ({actual[:70]}). Se continúa sin rotar IP.")
                             try:
                                 manejar_bloqueos_e_intervencion(self.page, "Login Tidal")
                                 self.esperar_redireccion_login_o_sesion(12.0)
@@ -10566,7 +11174,7 @@ class TidalAutoLoginManager:
                         if intento_nav < _max_intentos_nav:
                             print(f"  [Login] [{self.client_email}] No se alcanzó el login "
                                   f"(URL actual: {actual[:70] or 'desconocida'}). "
-                                  f"Reintentando con el mismo proxy...")
+                                  f"Reintentando sin rotar IP...")
                             time.sleep(random.uniform(1.5, 2.5))
                             continue
                         raise RuntimeError(
@@ -10575,7 +11183,7 @@ class TidalAutoLoginManager:
                         )
 
                     if not es_error_proxy_o_red(e_nav) and intento_nav < _max_intentos_nav:
-                        print(f"  [Login] [{self.client_email}] Fallo no atribuible al proxy. "
+                        print(f"  [Login] [{self.client_email}] Fallo no atribuible a red/proxy. "
                               f"Reintentando sin rotar IP...")
                         time.sleep(random.uniform(1.5, 2.5))
                         continue
@@ -10587,9 +11195,33 @@ class TidalAutoLoginManager:
 
                     if rotaciones_proxy >= _max_rotaciones_proxy:
                         raise RuntimeError(
-                            f"Agotadas las {_max_rotaciones_proxy} rotaciones de proxy de Perú para "
-                            f"{self.client_email} tras fallos de red/túnel."
+                            f"Agotados los {_max_rotaciones_proxy} reinicios de red/navegador para "
+                            f"{self.client_email} tras fallos de conectividad."
                         )
+
+                    rotaciones_proxy += 1
+
+                    # Modo sin proxy: NUNCA consultar el pool PE (está vacío y abortaba la opción 15).
+                    # ERR_NETWORK_CHANGED (p. ej. cambio de VPN) → reiniciar Chrome/perfil con IP real.
+                    if MODO_SIN_PROXY:
+                        print(f"  [Sin Proxy] [{self.client_email}] Reinicio "
+                              f"{rotaciones_proxy}/{_max_rotaciones_proxy} tras fallo de red "
+                              f"(sin pool PE)...")
+                        try:
+                            self.rotar_proxy_contexto()
+                        except Exception as e_rot:
+                            print(f"  [Login] [WARN] Reinicio sin proxy falló: {e_rot}")
+                            # Fallback mínimo: cerrar y reabrir
+                            try:
+                                if self.context:
+                                    self.context.close()
+                            except Exception:
+                                pass
+                            self.context = None
+                            self.page = None
+                            time.sleep(1.5)
+                            self.asegurar_navegador_abierto()
+                        continue
 
                     global GLOBAL_PE_PROXY_POOL
                     proxy_quemado = self.proxy_pe_server
@@ -10600,7 +11232,6 @@ class TidalAutoLoginManager:
                             f"No queda ningún proxy de Perú limpio para {self.client_email} "
                             f"tras descartar {proxy_quemado}. Se aborta la cuenta."
                         )
-                    rotaciones_proxy += 1
                     print(f"  [Login] [{self.client_email}] Rotación de proxy PE "
                           f"{rotaciones_proxy}/{_max_rotaciones_proxy} tras fallo de red/túnel.")
                     self.proxy_pe_server = nuevo_serv
@@ -11501,6 +12132,7 @@ class TidalAutoLoginManager:
                     codigo_eliminacion = obtener_codigo_via_imap(
                         gmail_user=buzon,
                         required_keywords=KEYWORDS_ELIMINACION_CUENTA,
+                        query_exclude=EXCLUDE_ELIMINACION_CUENTA,
                         after_email_id=usar_baseline,
                         max_age_minutes=45,
                         aliases_extra=aliases_imap,
@@ -11521,7 +12153,42 @@ class TidalAutoLoginManager:
             else:
                 print(f"  [Eliminación] [{self.client_email}] {Color.GREEN}Código obtenido: "
                       f"{codigo_eliminacion}{Color.ENDC}")
-                if escribir_codigo_verificacion_inteligente(self.page, codigo_eliminacion):
+                # Tras la espera IMAP la pestaña puede haber perdido foco o el DOM OTP.
+                try:
+                    self.page = pagina_vigente(self.page)
+                    self.page.bring_to_front()
+                except Exception:
+                    pass
+                if not self.hay_campo_codigo():
+                    print(f"  [Eliminación] [{self.client_email}] [WARN] Sin cajas OTP visibles "
+                          f"tras IMAP; reabriendo asistente...")
+                    try:
+                        self.page.goto(
+                            "https://account.tidal.com/account-deletion",
+                            wait_until="domcontentloaded",
+                            timeout=35000,
+                        )
+                        time.sleep(1.5)
+                        aceptar_cookies_con_espera(self.page)
+                        self.recorrer_asistente_eliminacion()
+                    except Exception as e_re:
+                        print(f"  [Eliminación] [{self.client_email}] [WARN] Reapertura: {e_re}")
+
+                codigo_escrito = False
+                for intento_write in range(1, 4):
+                    if not self.hay_campo_codigo():
+                        print(f"  [Eliminación] [{self.client_email}] [WARN] Intento escritura "
+                              f"{intento_write}/3: aún no hay campo de código.")
+                        time.sleep(1.0)
+                        continue
+                    if escribir_codigo_verificacion_inteligente(self.page, codigo_eliminacion):
+                        codigo_escrito = True
+                        break
+                    print(f"  [Eliminación] [{self.client_email}] [WARN] Escritura OTP falló "
+                          f"({intento_write}/3). Reintentando...")
+                    time.sleep(1.2)
+
+                if codigo_escrito:
                     print(f"  [Eliminación] [{self.client_email}] Código ingresado correctamente.")
                     time.sleep(2.0)
                     btn_confirmar = esperar_locator_en_frames(
@@ -11583,7 +12250,7 @@ class TidalAutoLoginManager:
                               f"el botón de confirmación.{Color.ENDC}")
                 else:
                     print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo ingresar "
-                          f"el código de verificación.{Color.ENDC}")
+                          f"el código de verificación tras varios intentos.{Color.ENDC}")
         except Exception as ex_el:
             print(f"  {Color.FAIL}[Eliminación] [ERROR] [{self.client_email}] {ex_el}{Color.ENDC}")
 
@@ -12241,24 +12908,30 @@ def registrar_cuentas_tidal(correos):
                   f"{len(managers_ok)} cuentas exitosas.{Color.ENDC}")
 
             DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
+            # Emparejamiento exclusivo 1:1 antes de ENTER: evita que dos cuentas tomen el mismo CSV.
+            asignaciones = asignar_csvs_a_cuentas([mgr.client_email for mgr in managers_ok])
             con_csv = []
             sin_csv = []
             for mgr in managers_ok:
-                ruta = resolver_csv_cuenta(mgr.client_email)
-                if ruta:
+                ruta = asignaciones.get(mgr.client_email)
+                mgr.csv_asignado = ruta
+                if ruta and csv_pertenece_a_cuenta(ruta, mgr.client_email):
                     con_csv.append((mgr.client_email, ruta.name, ruta.stat().st_size))
                 else:
+                    mgr.csv_asignado = None
                     sin_csv.append(mgr.client_email)
 
-            print(f"\n{Color.CYAN}[CSV] Encontrados {len(con_csv)}/{len(managers_ok)} archivos en 'descargas/'.{Color.ENDC}")
+            print(f"\n{Color.CYAN}[CSV] Emparejados {len(con_csv)}/{len(managers_ok)} "
+                  f"(1 archivo ↔ 1 cuenta Tidal) en 'descargas/'.{Color.ENDC}")
             for email, nombre, nbytes in con_csv:
-                print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes)")
+                marca = "" if nombre.lower() == f"{email.lower()}.csv" else " [alias]"
+                print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes){marca}")
             if sin_csv:
-                print(f"\n{Color.WARNING}[CSV] Sin archivo (o vacío) para:{Color.ENDC}")
+                print(f"\n{Color.WARNING}[CSV] Sin archivo exclusivo (o ambiguo) para:{Color.ENDC}")
                 for email in sin_csv:
-                    print(f"  {Color.FAIL}✗{Color.ENDC} {email}")
+                    print(f"  {Color.FAIL}✗{Color.ENDC} {email}  (espera: descargas/{email}.csv)")
                 print(f"{Color.WARNING}Esas ventanas permanecerán abiertas para subida manual "
-                      f"si al pulsar ENTER aún no hay CSV.{Color.ENDC}")
+                      f"si al pulsar ENTER aún no hay CSV con el nombre exacto de la cuenta.{Color.ENDC}")
                 cont = input("¿Continuar con la subida en TuneMyMusic de todas formas? (s/n, por defecto 's'): ").strip().lower()
                 if cont in ("n", "no"):
                     print(f"{Color.CYAN}Transferencia TuneMyMusic cancelada. Cerrando ventanas...{Color.ENDC}")
@@ -12273,6 +12946,7 @@ def registrar_cuentas_tidal(correos):
 
             input(f"\n{Color.BOLD}>>> Prepara el selector de archivo CSV en CADA TuneMyMusic "
                   f"(todas las ventanas) y luego presiona ENTER.\n"
+                  f"    Cada ventana subirá SOLO su CSV emparejado (nombre = correo de la cuenta).\n"
                   f"    Tras ENTER cada ventana esperará hasta 5 min a que el input esté listo "
                   f"(ya no se cierra a los 30s). <<<{Color.ENDC}")
 
