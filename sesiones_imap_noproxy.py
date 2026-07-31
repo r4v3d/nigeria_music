@@ -8268,94 +8268,56 @@ def cargar_titulares_familiares() -> tuple[list[dict], Path]:
     else:
         print(f"  [Inviter] Cargando cuentas titulares desde: {path}")
 
-    titulares = []
     if not path.exists():
         # Crear plantilla si no existe ninguna
         lines = [
             "# Cuentas Familiares Titulares de Tidal (Nigeria)",
-            "# Formato: correo_titular, miembros_actuales, estado, miembros_detalles",
+            "# Formato por bloques (opción 11):",
+            "# TITULAR",
+            "# correo_titular, miembros_actuales, estado, [miembros_detalles]",
+            "# MIEMBROS:",
+            "# miembro1@gmail.com",
             "#",
-            "# Ejemplo:",
-            "# titular1@gmail.com, 0, disponible, []"
         ]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines), encoding="utf-8")
-        return titulares, path
+        return [], path
 
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "MIEMBROS:" in line.upper():
-            break
-            
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 1 and parts[0]:
-            correo = parts[0]
-            correo = re.sub(r'^[\s\.]+|[\s\.]+$', '', correo)
-            if "@" not in correo or "." not in correo or ":" in correo:
-                continue
-            
-            usados = 0
-            if len(parts) >= 2:
-                try:
-                    match = re.search(r'\d+', parts[1])
-                    usados = int(match.group()) if match else 0
-                except Exception:
-                    usados = 0
-                    
-            estado = "disponible"
-            if len(parts) >= 3:
-                if "lleno" in parts[2].lower():
-                    estado = "lleno"
-                    
-            miembros = []
-            lista_match = re.search(r'\[.*\]', line)
-            if lista_match:
-                try:
-                    import ast
-                    miembros = ast.literal_eval(lista_match.group())
-                    if not isinstance(miembros, list):
-                        miembros = []
-                except Exception:
-                    miembros = []
-                    
-            if len(miembros) >= 5 or usados >= 5:
-                estado = "lleno"
-                
-            titulares.append({
-                "correo": correo,
-                "usados": max(usados, len(miembros)),
-                "estado": estado,
-                "miembros": miembros
-            })
-            
+    titulares, _ = parsear_titular_familiar_txt_opcion11(path)
     return titulares, path
 
 def guardar_titulares_familiares(titulares: list[dict], path: Path):
-    miembros_section = ""
+    """Guarda en formato por bloques TITULAR / MIEMBROS, preservando el plan de invitaciones."""
+    # Conservar miembros_invitar del archivo si el dict en memoria no lo trae
     if path.exists():
         try:
-            content = path.read_text(encoding="utf-8")
-            if "MIEMBROS:" in content.upper():
-                idx = content.upper().find("MIEMBROS:")
-                miembros_section = content[idx:].strip()
+            existentes, _ = parsear_titular_familiar_txt_opcion11(path)
+            by_key = {clean_email(t.get("correo", "")): t for t in existentes}
+            for t in titulares:
+                key = clean_email(t.get("correo", ""))
+                if not t.get("miembros_invitar") and key in by_key:
+                    t["miembros_invitar"] = list(by_key[key].get("miembros_invitar") or [])
         except Exception:
             pass
 
     lines = [
         "# Cuentas Familiares Titulares de Tidal (Nigeria)",
-        "# Formato: correo_titular, miembros_actuales, estado, miembros_detalles",
-        "#"
+        "# Formato por bloques:",
+        "# TITULAR",
+        "# correo_titular, miembros_actuales, estado, [miembros_detalles]",
+        "# MIEMBROS:",
+        "# miembro1@gmail.com",
+        "#",
     ]
     for t in titulares:
-        lines.append(f"{t['correo']}, {t['usados']}, {t['estado']}, {t['miembros']}")
-
-    if miembros_section:
+        lines.append("TITULAR")
+        lines.append(f"{t['correo']}, {t['usados']}, {t['estado']}, {t.get('miembros', [])}")
+        lines.append("MIEMBROS:")
+        for m in (t.get("miembros_invitar") or []):
+            lines.append(str(m))
         lines.append("")
-        lines.append(miembros_section)
 
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 def _pw_error_types():
     from playwright.sync_api import Error as PlaywrightError
     return (PlaywrightError,)
@@ -13360,64 +13322,143 @@ def registrar_cuentas_tidal(correos):
 
 
 def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[str]]:
-    titulares = []
-    miembros = []
+    """Lee titular_familiar.txt.
+
+    Formato preferido (bloques, define titular ↔ miembros a invitar):
+        TITULAR
+        correo@..., 0, disponible, []
+        MIEMBROS:
+        miembro1@...
+        miembro2@...
+
+    Formato antiguo (compatibilidad): líneas titular,... y una sola sección MIEMBROS:
+    global al final (se reparte por cupos en orden).
+
+    Cada dict titular incluye:
+      correo, usados, estado, miembros (ya invitados / detalles),
+      miembros_invitar (lista ordenada del bloque MIEMBROS de ese titular).
+    El segundo valor de retorno es la lista plana de todos los miembros_invitar.
+    """
+    titulares: list[dict] = []
+    miembros_planos: list[str] = []
     if not path.exists():
-        return titulares, miembros
-        
+        return titulares, miembros_planos
+
     lines = path.read_text(encoding="utf-8").splitlines()
+
+    def _parse_linea_titular(line_clean: str) -> dict | None:
+        if "," not in line_clean or "@" not in line_clean:
+            return None
+        parts = [p.strip() for p in line_clean.split(",")]
+        if not parts or "@" not in parts[0]:
+            return None
+        correo_t = re.sub(r'^[\s\.]+|[\s\.]+$', '', parts[0])
+        if "@" not in correo_t:
+            return None
+        usados = 0
+        if len(parts) >= 2:
+            try:
+                match = re.search(r'\d+', parts[1])
+                usados = int(match.group()) if match else 0
+            except Exception:
+                usados = 0
+        estado = parts[2].strip().lower() if len(parts) >= 3 else "disponible"
+        miembros_detalles: list[str] = []
+        lista_match = re.search(r'\[(.*?)\]', line_clean)
+        if lista_match:
+            inside = lista_match.group(1)
+            emails_in_list = re.findall(
+                r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', inside
+            )
+            if emails_in_list:
+                miembros_detalles = emails_in_list
+            else:
+                try:
+                    import ast
+                    miembros_detalles = ast.literal_eval(lista_match.group())
+                    if not isinstance(miembros_detalles, list):
+                        miembros_detalles = []
+                except Exception:
+                    miembros_detalles = []
+        usados = max(usados, len(miembros_detalles))
+        if usados >= 5 or "lleno" in estado:
+            estado = "lleno"
+        return {
+            "correo": correo_t,
+            "usados": usados,
+            "estado": estado,
+            "miembros": list(miembros_detalles),
+            "miembros_invitar": [],
+        }
+
+    # Detectar formato por bloques (línea TITULAR)
+    tiene_bloques = any(
+        ln.strip().upper() == "TITULAR" or ln.strip().upper().startswith("TITULAR")
+        for ln in lines if ln.strip() and not ln.strip().startswith("#")
+    )
+
+    if tiene_bloques:
+        actual: dict | None = None
+        en_miembros = False
+        for line in lines:
+            line_clean = line.strip()
+            if not line_clean or line_clean.startswith("#"):
+                continue
+            upper = line_clean.upper()
+            if upper == "TITULAR" or upper.startswith("TITULAR"):
+                if actual:
+                    titulares.append(actual)
+                actual = None
+                en_miembros = False
+                continue
+            if upper.startswith("MIEMBROS"):
+                en_miembros = True
+                continue
+            if en_miembros:
+                if "@" in line_clean and "," not in line_clean:
+                    # línea solo-email del bloque MIEMBROS
+                    correo_m = re.sub(r'^[\s\.]+|[\s\.]+$', '', line_clean)
+                    if correo_m and "@" in correo_m and actual is not None:
+                        if correo_m not in actual["miembros_invitar"]:
+                            actual["miembros_invitar"].append(correo_m)
+                        miembros_planos.append(correo_m)
+                elif "," in line_clean and "@" in line_clean:
+                    # nuevo titular sin palabra TITULAR intermedia
+                    if actual:
+                        titulares.append(actual)
+                    actual = _parse_linea_titular(line_clean)
+                    en_miembros = False
+                continue
+            # Línea de metadatos del titular
+            parsed = _parse_linea_titular(line_clean)
+            if parsed:
+                if actual:
+                    titulares.append(actual)
+                actual = parsed
+                en_miembros = False
+        if actual:
+            titulares.append(actual)
+        return titulares, miembros_planos
+
+    # --- Formato antiguo ---
     in_miembros_section = False
-    
     for line in lines:
         line_clean = line.strip()
         if not line_clean or line_clean.startswith("#"):
             continue
-            
         if "MIEMBROS:" in line_clean.upper():
             in_miembros_section = True
             continue
-            
         if in_miembros_section:
             if "@" in line_clean:
                 correo_m = re.sub(r'^[\s\.]+|[\s\.]+$', '', line_clean)
                 if correo_m:
-                    miembros.append(correo_m)
+                    miembros_planos.append(correo_m)
         else:
-            if "," in line_clean:
-                parts = [p.strip() for p in line_clean.split(",")]
-                if len(parts) >= 1 and "@" in parts[0]:
-                    correo_t = re.sub(r'^[\s\.]+|[\s\.]+$', '', parts[0])
-                    usados = 0
-                    if len(parts) >= 2:
-                        try:
-                            match = re.search(r'\d+', parts[1])
-                            usados = int(match.group()) if match else 0
-                        except Exception:
-                            usados = 0
-                    estado = parts[2].strip().lower() if len(parts) >= 3 else "disponible"
-                    miembros_detalles = []
-                    lista_match = re.search(r'\[(.*?)\]', line_clean)
-                    if lista_match:
-                        inside = lista_match.group(1)
-                        emails_in_list = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', inside)
-                        if emails_in_list:
-                            miembros_detalles = emails_in_list
-                        else:
-                            try:
-                                import ast
-                                miembros_detalles = ast.literal_eval(lista_match.group())
-                                if not isinstance(miembros_detalles, list):
-                                    miembros_detalles = []
-                            except Exception:
-                                miembros_detalles = []
-                    
-                    titulares.append({
-                        "correo": correo_t,
-                        "usados": max(usados, len(miembros_detalles)),
-                        "estado": estado,
-                        "miembros": miembros_detalles
-                    })
-    return titulares, miembros
+            parsed = _parse_linea_titular(line_clean)
+            if parsed:
+                titulares.append(parsed)
+    return titulares, miembros_planos
 
 
 def invitar_al_plan_familiar_opcion11():
@@ -13431,19 +13472,30 @@ def invitar_al_plan_familiar_opcion11():
         if path1.exists():
             path = path1
             
-    titulares, miembros = parsear_titular_familiar_txt_opcion11(path)
+    titulares, miembros_planos = parsear_titular_familiar_txt_opcion11(path)
     if not titulares:
         print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas titulares válidas en {path.name}.")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
-        
-    if not miembros:
-        print(f"\n{Color.WARNING}[Info]{Color.ENDC} No se encontraron miembros en la sección 'MIEMBROS:' de {path.name}.")
-        correos_input = ingresar_correos()
-        miembros = correos_input
 
-    print(f"\n  [Opción 11] Titulares cargados ({len(titulares)}): {[t['correo'] for t in titulares]}")
-    print(f"  [Opción 11] Total de miembros a invitar ({len(miembros)}): {miembros}")
+    # ¿Hay bloques con MIEMBROS por titular?
+    hay_asignacion_por_bloque = any(t.get("miembros_invitar") for t in titulares)
+
+    if hay_asignacion_por_bloque:
+        print(f"\n  [Opción 11] Formato por bloques TITULAR/MIEMBROS en {path.name}.")
+        print(f"  [Opción 11] Titulares cargados ({len(titulares)}):")
+        for t in titulares:
+            print(f"    • {t['correo']} → {len(t.get('miembros_invitar') or [])} miembro(s) "
+                  f"(usados={t['usados']}, estado={t['estado']})")
+            for m in (t.get("miembros_invitar") or []):
+                print(f"        - {m}")
+    else:
+        miembros = list(miembros_planos)
+        if not miembros:
+            print(f"\n{Color.WARNING}[Info]{Color.ENDC} No se encontraron miembros en {path.name}.")
+            miembros = ingresar_correos()
+        print(f"\n  [Opción 11] Titulares cargados ({len(titulares)}): {[t['correo'] for t in titulares]}")
+        print(f"  [Opción 11] Total de miembros a invitar ({len(miembros)}): {miembros}")
 
     if MODO_SIN_PROXY:
         print(f"\n{Color.CYAN}[Sin Proxy] Opcion 11 con IP real.{Color.ENDC}")
@@ -13466,30 +13518,53 @@ def invitar_al_plan_familiar_opcion11():
             return f"{local}@{parts[1]}"
         return email
 
+    def _ya_invitado(titular: dict, miembro: str) -> bool:
+        for m in titular.get("miembros") or []:
+            if son_correos_equivalentes(m, miembro) or clean_email(m) == clean_email(miembro):
+                return True
+        return False
+
     titulares_trabajos = []
-    idx_miembro = 0
-    total_miembros = len(miembros)
 
-    for idx_t, titular in enumerate(titulares, 1):
-        if idx_miembro >= total_miembros:
-            break
-
-        cupos_disponibles = 5 - titular["usados"]
-        if cupos_disponibles <= 0:
-            print(f"  [Opción 11] Titular {titular['correo']} ya se encuentra lleno (5/5). Omitiendo...")
-            continue
-
-        miembros_titular = miembros[idx_miembro: idx_miembro + cupos_disponibles]
-        idx_miembro += len(miembros_titular)
-
-        titulares_trabajos.append({
-            "idx_t": idx_t,
-            "titular": titular,
-            "miembros_titular": miembros_titular
-        })
+    if hay_asignacion_por_bloque:
+        for idx_t, titular in enumerate(titulares, 1):
+            cupos_disponibles = 5 - int(titular.get("usados") or 0)
+            if cupos_disponibles <= 0 or titular.get("estado") == "lleno":
+                print(f"  [Opción 11] Titular {titular['correo']} ya se encuentra lleno (5/5). Omitiendo...")
+                continue
+            plan = list(titular.get("miembros_invitar") or [])
+            pendientes = [m for m in plan if not _ya_invitado(titular, m)]
+            miembros_titular = pendientes[:cupos_disponibles]
+            if not miembros_titular:
+                print(f"  [Opción 11] Titular {titular['correo']}: sin miembros pendientes en su bloque MIEMBROS.")
+                continue
+            titulares_trabajos.append({
+                "idx_t": idx_t,
+                "titular": titular,
+                "miembros_titular": miembros_titular,
+            })
+    else:
+        idx_miembro = 0
+        total_miembros = len(miembros)
+        for idx_t, titular in enumerate(titulares, 1):
+            if idx_miembro >= total_miembros:
+                break
+            cupos_disponibles = 5 - int(titular.get("usados") or 0)
+            if cupos_disponibles <= 0:
+                print(f"  [Opción 11] Titular {titular['correo']} ya se encuentra lleno (5/5). Omitiendo...")
+                continue
+            miembros_titular = miembros[idx_miembro: idx_miembro + cupos_disponibles]
+            idx_miembro += len(miembros_titular)
+            # Guardar plan en el dict para que al guardar se preserve el bloque
+            titular["miembros_invitar"] = list(miembros_titular)
+            titulares_trabajos.append({
+                "idx_t": idx_t,
+                "titular": titular,
+                "miembros_titular": miembros_titular,
+            })
 
     if not titulares_trabajos:
-        print(f"\n{Color.WARNING}[Opción 11] No hay titulares con cupos disponibles para procesar.{Color.ENDC}")
+        print(f"\n{Color.WARNING}[Opción 11] No hay titulares con cupos/miembros pendientes para procesar.{Color.ENDC}")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
 
@@ -13685,6 +13760,55 @@ def verificar_contrasenas_imap_opcion12(correos: list[str]):
         print(f"\n{Color.FAIL}{Color.BOLD}>>> FALTAN REGISTRAR CONTRASEÑAS IMAP EN PASSWORDS.TXT PARA LOS SIGUIENTES CORREOS ({len(faltantes)}): <<<{Color.ENDC}")
         for c in faltantes:
             print(f"  {Color.FAIL}✖ {c}{Color.ENDC}")
+
+
+def verificar_csvs_descargas_opcion16(correos: list[str]):
+    """Opción 16: comprueba que exista un CSV en descargas/ para cada correo activo del menú."""
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   OPCIÓN 16: VERIFICAR CSV EN DESCARGAS/{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+
+    if not correos:
+        print(f"\n{Color.WARNING}[Info]{Color.ENDC} No hay correos activos. Cárgalos al inicio o con la opción 6.")
+        return
+
+    DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\n  Carpeta: {DESCARGAS_DIR}")
+    print(f"  Correos activos a comprobar: {len(correos)}\n")
+
+    encontrados: list[tuple[str, Path]] = []
+    faltantes: list[str] = []
+
+    for correo in correos:
+        correo = (correo or "").strip()
+        if not correo or "@" not in correo:
+            continue
+        # Sin reservas: es solo una lectura de comprobación
+        ruta = resolver_csv_cuenta(correo, permitir_alias=True, respetar_reservas=False)
+        if ruta and csv_parece_valido(ruta):
+            encontrados.append((correo, ruta))
+            try:
+                nbytes = ruta.stat().st_size
+            except Exception:
+                nbytes = 0
+            marca = "" if ruta.stem.lower() == correo.strip().lower() else " [alias]"
+            print(f"  {Color.GREEN}✓{Color.ENDC} {correo} → {ruta.name} ({nbytes} bytes){marca}")
+        else:
+            faltantes.append(correo)
+            print(f"  {Color.FAIL}✗{Color.ENDC} {correo} → falta descargas/{correo}.csv")
+
+    print()
+    if faltantes:
+        print(f"{Color.FAIL}{Color.BOLD}>>> FALTAN CSV PARA {len(faltantes)}/{len(correos)} CORREO(S): <<<{Color.ENDC}")
+        for c in faltantes:
+            print(f"  {Color.FAIL}✖ {c}{Color.ENDC}")
+        print(f"{Color.WARNING}Coloca los archivos como 'descargas/correo@dominio.csv' "
+              f"y vuelve a comprobar.{Color.ENDC}\n")
+    else:
+        print(f"{Color.GREEN}{Color.BOLD}>>> TODO CORRECTO: Hay CSV válido en 'descargas/' "
+              f"para los {len(encontrados)} correo(s) activo(s). <<<{Color.ENDC}\n")
+
+
 def crear_cuentas_familiares_automatico_opcion14():
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   OPCIÓN 14: CREAR CUENTAS FAMILIARES AUTOMÁTICO (NIGERIA){Color.ENDC}")
@@ -13926,7 +14050,7 @@ def menu_principal():
         print(" 3. Obtener CÓDIGO DE INICIO DE SESIÓN (Login Verification)")
         print(" 4. Buscar y aceptar ENLACE DE INVITACIÓN (auto-login + cerrar Chrome)")
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
-        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en 8–15)")
+        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en 8–16)")
         print(" 7. Salir")
         print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
@@ -13936,9 +14060,10 @@ def menu_principal():
         print(" 13. Validar y verificar lista de proxies (Nigeria / Perú) [N/A sin proxy]")
         print(" 14. Crear cuentas FAMILIARES AUTOMÁTICO (Registro NG + Checkout + Upgrade Family)")
         print(" 15. ELIMINAR CUENTA TIDAL AUTOMÁTICO")
+        print(" 16. Verificar CSV en descargas/ (correos activos del menú)")
         print(f"{Color.CYAN}{Color.BOLD}" + "-"*50 + f"{Color.ENDC}")
         
-        opcion = input(f"{Color.BOLD}Selecciona una opción (1-15):{Color.ENDC} ").strip()
+        opcion = input(f"{Color.BOLD}Selecciona una opción (1-16):{Color.ENDC} ").strip()
         
         if opcion in ("1", "2", "3"):
             for correo in correos:
@@ -14153,9 +14278,12 @@ def menu_principal():
 
         elif opcion == "15":
             eliminar_cuentas_tidal_automatico_opcion15(correos)
+
+        elif opcion == "16":
+            verificar_csvs_descargas_opcion16(correos)
             
         else:
-            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 15.")
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 16.")
 
 
 if __name__ == "__main__":
