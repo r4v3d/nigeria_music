@@ -9394,63 +9394,151 @@ class TidalFamilyInviter:
         """
         return (email or "").strip().lower().rstrip(".")
 
-    def _sesion_titular_activa(self, titular) -> bool:
-        """Comprueba contra Tidal que la sesión abierta pertenece al titular esperado."""
+    def _hay_login_titular_visible(self) -> bool:
+        """True si la pestaña está en el flujo OAuth / formulario de acceso (no sesión de cuenta)."""
         try:
-            curr_url = self.page.url.lower()
-            if "account.tidal.com" in curr_url and "/login" not in curr_url and "family" in curr_url:
-                # En /family hace falta verificar el correo del perfil: no asumir por URL
-                pass
+            self.page = pagina_vigente(self.page)
+            if not self.page or self.page.is_closed():
+                return True
+            url = (self.page.url or "").lower()
+            if "/login/tidal/return" in url or "/login/tidal/callback" in url:
+                return False
+            if "login.tidal.com" in url or "/authorize" in url:
+                return True
+            return bool(_formulario_login_visible(self.page))
+        except Exception:
+            return False
 
-            self.page.goto("https://account.tidal.com/profile", wait_until="domcontentloaded", timeout=30000)
+    def _leer_email_perfil_titular(self) -> str:
+        """Lee el correo del titular en /profile (input o texto 'Correo electrónico')."""
+        try:
+            self.page = pagina_vigente(self.page)
+            email = self.page.evaluate(r"""() => {
+                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const esEmail = (s) => /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test((s || '').trim());
+                const el = document.querySelector('input[type="email"], input[name="email"], #email');
+                if (el && el.value && esEmail(el.value)) return el.value.trim().toLowerCase();
+
+                const labelsOk = new Set([
+                    'correo electrónico', 'correo electronico', 'email address', 'e-mail', 'email'
+                ]);
+                const nodos = Array.from(document.querySelectorAll(
+                    'p, span, div, label, dt, dd, li, h2, h3, h4, strong, b'
+                ));
+                for (const n of nodos) {
+                    const t = norm(n.textContent);
+                    if (!labelsOk.has(t)) continue;
+                    const cont = n.parentElement || n;
+                    const bloque = cont.closest('div, section, li, article') || cont;
+                    const texto = (bloque && (bloque.innerText || bloque.textContent)) || '';
+                    const m = texto.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+                    if (m && esEmail(m[0]) && !m[0].toLowerCase().endsWith('@tidal.com')) {
+                        return m[0].trim().toLowerCase();
+                    }
+                }
+
+                const body = document.body ? document.body.innerText : '';
+                const idx = body.search(/informaci[oó]n\s+general|general\s+information/i);
+                if (idx >= 0) {
+                    const trozo = body.slice(idx, idx + 900);
+                    const mCorreo = trozo.match(
+                        /correo\s+electr[oó]nico|email\s+address|e-?mail[\s\S]{0,100}?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i
+                    );
+                    if (mCorreo && mCorreo[1] && !mCorreo[1].toLowerCase().endsWith('@tidal.com')) {
+                        return mCorreo[1].trim().toLowerCase();
+                    }
+                }
+
+                // Señales de cuenta autenticada (sin exigir el email aún)
+                const low = body.toLowerCase();
+                const senales = [
+                    'cerrar sesión', 'sign out', 'log out', 'detalles de inicio de sesión',
+                    'login details', 'editar perfil', 'edit profile', 'plan familiar',
+                    'family plan', 'mi cuenta', 'suscripción', 'subscription'
+                ];
+                if (senales.some(s => low.includes(s))) return '__SESION_SIN_EMAIL__';
+                return '';
+            }""") or ""
+            return str(email).strip().lower()
+        except Exception:
+            return ""
+
+    def _sesion_titular_activa(self, titular) -> bool:
+        """Comprueba contra Tidal que la sesión abierta pertenece al titular esperado.
+
+        Antes fallaba si /profile no tenía input[type=email] (UI nueva de Tidal): devolvía
+        False con la sesión ya iniciada → bucle de reintentos y cierre sin invitar.
+        """
+        try:
+            self.page = pagina_vigente(self.page)
+            try:
+                self.page.goto(
+                    "https://account.tidal.com/profile",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+            except Exception as e_nav:
+                # Timeout con pestaña ya en perfil/cuenta: seguir comprobando
+                try:
+                    u = (self.page.url or "").lower()
+                except Exception:
+                    u = ""
+                if "account.tidal.com" not in u or self._hay_login_titular_visible():
+                    raise e_nav
+
             manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular ({titular['correo']})")
             self.page = pagina_vigente(self.page)
             aceptar_cookies_con_espera(self.page)
 
-            # Con proxy el perfil puede tardar varios segundos en pintar el correo; el chequeo
-            # instantáneo anterior daba "sesión incorrecta" antes de que la página cargara.
-            limite = time.time() + 15.0
+            limite = time.time() + 18.0
             email_detectado = ""
+            senal_sesion = False
             while time.time() < limite:
-                curr_url = self.page.url.lower()
-                if "login" in curr_url or "authorize" in curr_url:
+                self.page = pagina_vigente(self.page)
+                curr_url = (self.page.url or "").lower()
+                if self._hay_login_titular_visible():
                     return False
-                email_detectado = self.page.evaluate("""() => {
-                    // Preferir el campo de correo del perfil (no el primer email del body,
-                    // que puede ser un miembro del plan familiar).
-                    const el = document.querySelector('input[type="email"], input[name="email"], #email');
-                    if (el && el.value) return el.value.trim().toLowerCase();
-                    const labels = Array.from(document.querySelectorAll('label, span, p, div, dt, dd'));
-                    for (const n of labels) {
-                        const t = (n.textContent || '').trim().toLowerCase();
-                        if (t === 'correo electrónico' || t === 'email' || t === 'e-mail') {
-                            const sib = n.parentElement;
-                            if (sib) {
-                                const m = (sib.innerText || '').match(
-                                    /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/
-                                );
-                                if (m) return m[0].trim().toLowerCase();
-                            }
-                        }
-                    }
-                    return '';
-                }""")
+                if "/login/tidal/return" in curr_url or "/login/tidal/callback" in curr_url:
+                    time.sleep(1.0)
+                    continue
+                if "account.tidal.com" not in curr_url:
+                    time.sleep(0.8)
+                    continue
+
+                email_detectado = self._leer_email_perfil_titular()
+                if email_detectado == "__sesion_sin_email__":
+                    senal_sesion = True
+                    email_detectado = ""
                 if email_detectado:
                     break
+                # Sin email aún: si la URL de cuenta es estable y no hay login, seguir un poco
+                if "account.tidal.com" in curr_url and "/login" not in curr_url:
+                    senal_sesion = True
                 time.sleep(1.0)
 
-            if not email_detectado:
+            if email_detectado:
+                print(f"  [Inviter] Sesión activa detectada en Chrome para: {email_detectado}")
+                if correos_iguales_exacto(email_detectado, titular["correo"]):
+                    print(f"  [Inviter] {Color.GREEN}Sesión confirmada para el titular correcto: "
+                          f"{titular['correo']}{Color.ENDC}")
+                    return True
+                # Mismo buzón Gmail con distintos puntos = otra cuenta Tidal
+                if son_correos_equivalentes(email_detectado, titular["correo"]):
+                    print(f"  [Inviter] {Color.WARNING}Perfil muestra '{email_detectado}' "
+                          f"(mismo buzón Gmail que {titular['correo']}, puntos distintos). "
+                          f"En Tidal son cuentas distintas; se cierra sesión.{Color.ENDC}")
+                else:
+                    print(f"  [Inviter] Sesión de cuenta incorrecta "
+                          f"({email_detectado} ≠ {titular['correo']}). Cerrando sesión...")
+                self.logout_titular()
                 return False
 
-            print(f"  [Inviter] Sesión activa detectada en Chrome para: {email_detectado}")
-            # EXACTO con puntos: no usar son_correos_equivalentes / quitar puntos
-            if correos_iguales_exacto(email_detectado, titular["correo"]):
-                print(f"  [Inviter] {Color.GREEN}Sesión confirmada para el titular correcto: {titular['correo']}{Color.ENDC}")
+            # UI sin email legible pero claramente autenticada en account.tidal.com
+            if senal_sesion and not self._hay_login_titular_visible():
+                print(f"  [Inviter] {Color.GREEN}Sesión de cuenta activa en profile "
+                      f"(sin email visible en DOM). Se asume titular {titular['correo']} "
+                      f"y se continúa a /family.{Color.ENDC}")
                 return True
-
-            print(f"  [Inviter] Sesión de cuenta incorrecta ({email_detectado} ≠ {titular['correo']}). "
-                  f"Cerrando sesión...")
-            self.logout_titular()
         except Exception as e:
             print(f"  [Inviter] [WARN] Error al verificar sesión activa: {e}")
         return False
@@ -9534,6 +9622,15 @@ class TidalFamilyInviter:
                 self.page.goto("https://account.tidal.com/family", wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
                 print(f"  [Inviter] [WARN] Intento {intento}/3 de abrir el panel familiar falló: {e}")
+                # Si el goto falló pero ya estamos autenticados en /family u otra ruta de cuenta
+                try:
+                    u = (self.page.url or "").lower()
+                except Exception:
+                    u = ""
+                if "family" in u and not self._hay_login_titular_visible():
+                    print(f"  [Inviter] {Color.GREEN}Sesión iniciada con éxito para titular: "
+                          f"{titular['correo']}{Color.ENDC}")
+                    return True
                 time.sleep(3.0)
                 continue
 
@@ -9541,19 +9638,56 @@ class TidalFamilyInviter:
             self.page = pagina_vigente(self.page)
             aceptar_cookies_con_espera(self.page)
 
-            limite = time.time() + 15.0
+            limite = time.time() + 18.0
             while time.time() < limite:
                 try:
-                    url = self.page.url.lower()
+                    self.page = pagina_vigente(self.page)
+                    url = (self.page.url or "").lower()
                 except Exception:
                     break
-                if "login" in url or "authorize" in url:
+                if self._hay_login_titular_visible():
                     break
-                if "/family" in url:
-                    print(f"  [Inviter] {Color.GREEN}Sesión iniciada con éxito para titular: {titular['correo']}{Color.ENDC}")
+                if "/login/tidal/return" in url or "/login/tidal/callback" in url:
+                    time.sleep(1.0)
+                    continue
+                # Éxito: /family o contenido de plan familiar aunque la URL varíe
+                if "family" in url and "account.tidal.com" in url:
+                    print(f"  [Inviter] {Color.GREEN}Sesión iniciada con éxito para titular: "
+                          f"{titular['correo']}{Color.ENDC}")
                     return True
+                try:
+                    tiene_familia = self.page.evaluate("""() => {
+                        const t = document.body ? document.body.innerText.toLowerCase() : '';
+                        return t.includes('plan familiar') || t.includes('family plan')
+                            || t.includes('invitar') || t.includes('invite')
+                            || t.includes('miembro') || t.includes('member');
+                    }""")
+                    if tiene_familia and "account.tidal.com" in url and "/login" not in url:
+                        print(f"  [Inviter] {Color.GREEN}Panel familiar visible para titular: "
+                              f"{titular['correo']}{Color.ENDC}")
+                        return True
+                except Exception:
+                    pass
                 time.sleep(1.0)
             time.sleep(2.0)
+
+        # Último recurso: si el perfil confirma sesión, no tratar el fallo de /family como
+        # "no logueado" (evita el bucle de reintentos que cierra Chrome).
+        try:
+            if self._sesion_titular_activa(titular):
+                print(f"  [Inviter] {Color.WARNING}[{titular['correo']}] /family no cargó limpio, "
+                      f"pero la sesión del titular está activa. Se continúa.{Color.ENDC}")
+                try:
+                    self.page.goto(
+                        "https://account.tidal.com/family",
+                        wait_until="domcontentloaded",
+                        timeout=20000,
+                    )
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
         return False
 
     def _cambiar_a_modo_codigo_si_hay_password(self, titular) -> bool:
@@ -9758,6 +9892,28 @@ class TidalFamilyInviter:
             manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular ({titular['correo']})")
             self.page = pagina_vigente(self.page)
 
+        # Si al abrir /login Tidal ya redirigió a la cuenta (sesión residual / password OK),
+        # no esperar el campo email ni entrar en el bucle IMAP.
+        try:
+            url_ahora = (self.page.url or "").lower()
+        except Exception:
+            url_ahora = ""
+        if (
+            "account.tidal.com" in url_ahora
+            and "/login" not in url_ahora
+            and not self._hay_login_titular_visible()
+        ) or (
+            not self._hay_login_titular_visible()
+            and not encontrar_locator_en_frames(
+                self.page, ['input[type="email"]', 'input[name="email"]', '#email']
+            )
+            and "login.tidal.com" not in url_ahora
+        ):
+            print(f"  [Inviter] [{titular['correo']}] Ya hay sesión de cuenta (sin formulario de login). "
+                  f"Confirmando titular...")
+            if self._sesion_titular_activa(titular):
+                return self._abrir_panel_familia(titular)
+
         # Sesión residual del perfil persistente
         try:
             if self._sesion_titular_activa(titular):
@@ -9766,9 +9922,14 @@ class TidalFamilyInviter:
             pass
 
         email_selectors = ['input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]', '#email']
-        email_input = esperar_locator_en_frames(self.page, email_selectors, timeout_s=20.0)
+        email_input = esperar_locator_en_frames(self.page, email_selectors, timeout_s=12.0)
         if not email_input:
-            print(f"  [Inviter] [WARN] No apareció el campo de correo para {titular['correo']}.")
+            # Puede que el login haya terminado mientras esperábamos el input
+            print(f"  [Inviter] [WARN] No apareció el campo de correo para {titular['correo']}. "
+                  f"Comprobando si ya quedó logueado...")
+            if self._sesion_titular_activa(titular):
+                return self._abrir_panel_familia(titular)
+            print(f"  [Inviter] [WARN] Sin campo de correo ni sesión activa para {titular['correo']}.")
             return False
 
         # Baseline ANTES de pedir el código (evitar usar un código viejo del buzón)
@@ -9926,7 +10087,11 @@ class TidalFamilyInviter:
     def asegurar_login_titular(self, titular) -> bool:
         self.client_email = titular.get("correo") or self.client_email
         if self._sesion_titular_activa(titular):
-            return True
+            # Asegurar /family antes de invitar (antes devolvía True y a veces seguía en /profile)
+            if self._abrir_panel_familia(titular):
+                return True
+            print(f"  [Inviter] {Color.WARNING}Sesión OK pero no se abrió /family; "
+                  f"se reintentará el login completo...{Color.ENDC}")
 
         print(f"  [Inviter] No se detectó sesión activa o es incorrecta. Iniciando sesión en titular: {titular['correo']}...")
         pwd = buscar_contrasena_cuenta(titular["correo"])
@@ -9943,12 +10108,24 @@ class TidalFamilyInviter:
             try:
                 if self._login_titular_una_vez(titular):
                     return True
+                # Si el login "falló" pero la sesión quedó activa (falso negativo típico), continuar
+                if self._sesion_titular_activa(titular) and self._abrir_panel_familia(titular):
+                    print(f"  [Inviter] {Color.GREEN}[{titular['correo']}] Login detectado tras "
+                          f"falso negativo. Se continúa con las invitaciones.{Color.ENDC}")
+                    return True
             except RuntimeError as e:
                 # Bloqueo antirobot insuperable o sin proxies limpios: no tiene sentido insistir.
                 print(f"  [Inviter] {Color.FAIL}Login del titular abortado: {e}{Color.ENDC}")
                 return False
             except Exception as e:
                 print(f"  [Inviter] Excepción al iniciar sesión (intento {intento_login}/3): {e}")
+                try:
+                    if self._sesion_titular_activa(titular) and self._abrir_panel_familia(titular):
+                        print(f"  [Inviter] {Color.GREEN}[{titular['correo']}] Pese a la excepción, "
+                              f"hay sesión activa. Se continúa.{Color.ENDC}")
+                        return True
+                except Exception:
+                    pass
         return False
 
     def enviar_invitacion_familiar(self, titular, miembro_correo) -> bool:

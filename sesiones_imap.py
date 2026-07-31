@@ -3969,18 +3969,103 @@ def hacer_click_por_textos(page, textos: list) -> bool:
             pass
     return False
 
+def contar_cajas_otp_visibles(page) -> int:
+    """Cuenta inputs OTP visibles (maxlength=1 / one-time-code) en la página actual."""
+    try:
+        page = pagina_vigente(page)
+        n = page.evaluate("""() => {
+            const esOtp = (el) => {
+                const max = (el.getAttribute('maxlength') || '').trim();
+                const ac = (el.autocomplete || '').toLowerCase();
+                const mode = (el.inputMode || '').toLowerCase();
+                const name = (el.name || '').toLowerCase();
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
+                    return false;
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) return false;
+                // Solo cajas de un dígito (asistente de eliminación Tidal) o one-time-code único
+                return max === '1' || ac === 'one-time-code'
+                    || (mode === 'numeric' && max === '1')
+                    || ((name.includes('code') || name.includes('otp')) && max === '1');
+            };
+            return Array.from(document.querySelectorAll('input')).filter(esOtp).length;
+        }""")
+        return int(n or 0)
+    except Exception:
+        return 0
+
+
+def leer_otp_cajas_visibles(page) -> str:
+    """Lee el valor concatenado de las cajas OTP visibles."""
+    try:
+        page = pagina_vigente(page)
+        return page.evaluate("""() => {
+            const esOtp = (el) => {
+                const max = (el.getAttribute('maxlength') || '').trim();
+                const ac = (el.autocomplete || '').toLowerCase();
+                const mode = (el.inputMode || '').toLowerCase();
+                const name = (el.name || '').toLowerCase();
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
+                    return false;
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) return false;
+                return max === '1' || ac === 'one-time-code'
+                    || (mode === 'numeric' && max === '1')
+                    || ((name.includes('code') || name.includes('otp')) && max === '1');
+            };
+            return Array.from(document.querySelectorAll('input'))
+                .filter(esOtp)
+                .map(el => (el.value || '').trim())
+                .join('');
+        }""") or ""
+    except Exception:
+        return ""
+
+
 def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
-    """Ingresa un código de verificación (una caja o 6 cajas OTP). Exige lectura == código."""
+    """Ingresa un código de verificación (una caja o N cajas OTP). Exige lectura == código.
+
+    Crítico en eliminación (opción 15): hay que rellenar TODAS las cajas visibles.
+    Nunca acepta éxito solo porque JS escribió en el DOM (React dejaría el botón disabled).
+    """
     codigo = re.sub(r"\D", "", str(codigo or ""))
     if not codigo:
         return False
 
+    page = pagina_vigente(page)
+    n_cajas = contar_cajas_otp_visibles(page)
+    codigos_a_probar = [codigo]
+    if n_cajas >= 4:
+        if len(codigo) > n_cajas:
+            codigos_a_probar = [codigo[:n_cajas]]
+        elif len(codigo) < n_cajas:
+            pad = ("0" * (n_cajas - len(codigo))) + codigo
+            codigos_a_probar = [pad, codigo]
+            print(f"  [OTP] Código de {len(codigo)} dígitos con {n_cajas} cajas; "
+                  f"se probará también '{pad}'.")
+
+    for codigo_try in codigos_a_probar:
+        if _escribir_codigo_otp_intento(page, codigo_try):
+            return True
+    return False
+
+
+def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
+    """Un intento de escritura OTP (longitud fija)."""
+    codigo = re.sub(r"\D", "", str(codigo or ""))
+    if not codigo:
+        return False
+    page = pagina_vigente(page)
+
     for frame in page.frames:
         try:
             code_inputs = []
-            for poll in range(10):
+            for _poll in range(10):
                 inputs = frame.locator('input').all()
                 code_inputs = []
+                otp_estrictos = []
                 for ip in inputs:
                     try:
                         if not ip.is_visible():
@@ -3996,27 +4081,61 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                         autocomplete = (ip.get_attribute("autocomplete") or "").lower()
                         maxlength = (ip.get_attribute("maxlength") or "").strip()
                         aria = (ip.get_attribute("aria-label") or "").lower()
-
-                        if (type_attr in ["", "text", "number", "tel", "password"] or
-                            mode == "numeric" or
-                            autocomplete == "one-time-code" or
-                            maxlength == "1" or
-                            "code" in name or
-                            "code" in placeholder or
-                            "código" in placeholder or
-                            "codigo" in placeholder or
-                            "digit" in aria or
-                            "código" in aria or
-                            "codigo" in aria):
+                        es_otp_estricto = (
+                            maxlength == "1"
+                            or autocomplete == "one-time-code"
+                            or "code" in name
+                            or "otp" in name
+                        )
+                        es_candidato = (
+                            es_otp_estricto
+                            or mode == "numeric"
+                            or "code" in placeholder
+                            or "código" in placeholder
+                            or "codigo" in placeholder
+                            or "digit" in aria
+                            or "código" in aria
+                            or "codigo" in aria
+                            or type_attr in ["", "text", "number", "tel", "password"]
+                        )
+                        if es_candidato:
                             code_inputs.append(ip)
+                            if es_otp_estricto:
+                                otp_estrictos.append(ip)
                     except Exception:
                         pass
-                if len(code_inputs) >= min(4, len(codigo)) or (code_inputs and len(codigo) <= 8 and len(code_inputs) == 1):
+                if len(otp_estrictos) >= min(4, len(codigo)):
+                    code_inputs = otp_estrictos
+                elif len(otp_estrictos) == 1 and len(codigo) >= 4:
+                    code_inputs = otp_estrictos
+                # Códigos de registro (≥4): exigir cajas OTP reales antes de salir del poll
+                if len(codigo) >= 4:
+                    if len(otp_estrictos) >= min(4, len(codigo)) or (
+                        len(otp_estrictos) == 1 and len(codigo) >= 4
+                    ):
+                        code_inputs = otp_estrictos
+                        break
+                elif len(code_inputs) >= min(4, len(codigo)) or (
+                    code_inputs and len(codigo) <= 8 and len(code_inputs) == 1
+                ):
                     break
                 time.sleep(0.35)
 
             if not code_inputs:
                 continue
+
+            # Códigos largos (registro/login Tidal): NO usar inputs genéricos type=text.
+            # Si aún no hay cajas OTP estrictas, fallar rápido para que el caller espere la UI.
+            if len(codigo) >= 4:
+                if len(otp_estrictos) >= min(4, len(codigo)):
+                    code_inputs = otp_estrictos
+                elif len(otp_estrictos) == 1:
+                    code_inputs = otp_estrictos
+                else:
+                    # Sin cajas OTP reales todavía → no inventar con campos sueltos
+                    continue
+            elif len(otp_estrictos) >= 1:
+                code_inputs = otp_estrictos
 
             def leer_cajas(objetivos):
                 leido = ""
@@ -4039,51 +4158,33 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                         except Exception:
                             pass
 
-            # Varias cajas (Tidal: 6 inputs maxlength=1)
-            if len(code_inputs) >= 4:
-                objetivos = code_inputs[:len(codigo)]
-                if len(objetivos) < len(codigo):
-                    continue
+            def _exito_completo(objetivos, esperado: str) -> bool:
+                if leer_cajas(objetivos) == esperado:
+                    return True
+                return leer_otp_cajas_visibles(page) == esperado
 
-                # 1) JS + eventos input/change (React controlado)
+            # Varias cajas OTP
+            if len(code_inputs) >= 4:
+                if len(code_inputs) < len(codigo):
+                    continue
+                objetivos = code_inputs[:len(codigo)]
+
+                # 1) Teclado humano (mejor con React)
+                limpiar_cajas(code_inputs[:len(codigo)])
                 try:
-                    ok_js = frame.evaluate(
-                        """([digitos]) => {
-                            const inputs = Array.from(document.querySelectorAll('input')).filter(el => {
-                                if (!el.offsetParent && el.type !== 'hidden') {
-                                    // visible check soft
-                                }
-                                const t = (el.type || '').toLowerCase();
-                                if (['email','checkbox','radio','submit','button','file','hidden'].includes(t)) return false;
-                                const max = el.getAttribute('maxlength') || '';
-                                const mode = (el.inputMode || '').toLowerCase();
-                                const ac = (el.autocomplete || '').toLowerCase();
-                                return max === '1' || mode === 'numeric' || ac === 'one-time-code' || t === '' || t === 'text' || t === 'tel' || t === 'number';
-                            }).filter(el => {
-                                const r = el.getBoundingClientRect();
-                                return r.width > 0 && r.height > 0;
-                            });
-                            if (inputs.length < digitos.length) return false;
-                            const targets = inputs.slice(0, digitos.length);
-                            targets.forEach((el, i) => {
-                                el.focus();
-                                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                                if (setter) setter.call(el, digitos[i]);
-                                else el.value = digitos[i];
-                                el.dispatchEvent(new Event('input', { bubbles: true }));
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
-                                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: digitos[i] }));
-                            });
-                            return targets.every((el, i) => (el.value || '') === digitos[i]);
-                        }""",
-                        list(codigo),
-                    )
-                    if ok_js and leer_cajas(objetivos) == codigo:
-                        return True
+                    objetivos[0].click(timeout=800)
                 except Exception:
                     pass
+                time.sleep(0.15)
+                try:
+                    page.keyboard.type(codigo, delay=90)
+                except Exception:
+                    pass
+                time.sleep(0.3)
+                if _exito_completo(objetivos, codigo):
+                    return True
 
-                # 2) Caja por caja con type()
+                # 2) Caja por caja
                 limpiar_cajas(objetivos)
                 for idx, digit in enumerate(codigo):
                     try:
@@ -4096,25 +4197,55 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                         except Exception:
                             pass
                     time.sleep(0.05)
-                if leer_cajas(objetivos) == codigo:
+                if _exito_completo(objetivos, codigo):
                     return True
 
-                # 3) Secuencia de teclado desde la primera caja
-                limpiar_cajas(objetivos)
+                # 3) JS + InputEvent — éxito solo si la lectura coincide
                 try:
-                    objetivos[0].click(timeout=800)
+                    ok_js = frame.evaluate(
+                        """([digitos]) => {
+                            const esOtp = (el) => {
+                                const t = (el.type || '').toLowerCase();
+                                if (['email','checkbox','radio','submit','button','file','hidden'].includes(t)) return false;
+                                const max = el.getAttribute('maxlength') || '';
+                                const mode = (el.inputMode || '').toLowerCase();
+                                const ac = (el.autocomplete || '').toLowerCase();
+                                const name = (el.name || '').toLowerCase();
+                                return max === '1' || ac === 'one-time-code' || mode === 'numeric'
+                                    || name.includes('code') || name.includes('otp');
+                            };
+                            const inputs = Array.from(document.querySelectorAll('input')).filter(el => {
+                                if (!esOtp(el)) return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0;
+                            });
+                            if (inputs.length < digitos.length) return false;
+                            const targets = inputs.slice(0, digitos.length);
+                            targets.forEach((el, i) => {
+                                el.focus();
+                                const setter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'value')?.set;
+                                if (setter) setter.call(el, digitos[i]);
+                                else el.value = digitos[i];
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                try {
+                                    el.dispatchEvent(new InputEvent('input', {
+                                        bubbles: true, data: digitos[i], inputType: 'insertText'
+                                    }));
+                                } catch (e) {}
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', {
+                                    bubbles: true, key: digitos[i]
+                                }));
+                            });
+                            return targets.every((el, i) => (el.value || '') === digitos[i]);
+                        }""",
+                        list(codigo),
+                    )
+                    if ok_js and _exito_completo(objetivos, codigo):
+                        return True
                 except Exception:
                     pass
-                time.sleep(0.2)
-                for digit in codigo:
-                    try:
-                        page.keyboard.type(digit, delay=100)
-                    except Exception:
-                        break
-                    time.sleep(0.08)
-                if leer_cajas(objetivos) == codigo:
-                    return True
-                # Nunca tratar cajas vacías como éxito
                 continue
 
             # Una sola caja
@@ -4133,13 +4264,13 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                     return True
             except Exception:
                 pass
-            # Fallback JS
             try:
                 ok = frame.evaluate(
                     """(code) => {
                         const el = document.querySelector('input[autocomplete="one-time-code"]')
                             || document.querySelector('input[name="code"]')
-                            || document.querySelector('input[inputmode="numeric"]');
+                            || document.querySelector('input[inputmode="numeric"]')
+                            || document.querySelector('input[maxlength="1"]');
                         if (!el) return false;
                         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
                         if (setter) setter.call(el, code);
@@ -4150,13 +4281,14 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                     }""",
                     codigo,
                 )
-                if ok:
+                if ok and (target.input_value() or "").strip() == codigo:
                     return True
             except Exception:
                 pass
         except Exception:
             continue
     return False
+
 
 def encontrar_locator_en_frames(page, selectors: list, label_regex=None, text_regex=None):
     """Busca en todos los frames el primer localizador visible.
@@ -5384,28 +5516,78 @@ class TidalRegisterManager:
             # Bypass de reputación: entrar en frío a account.tidal.com/ a menudo acaba en
             # login.tidal.com/authorize?email=... con "Algo salió mal" (caso g.etspooky2.189).
             print(f"  [Registro] [{self.client_email}] Calentando reputación en tidal.com/pricing...")
-            try:
-                navegar_tidal_tolerante(self.page, "https://tidal.com/pricing", timeout_ms=30000)
-                time.sleep(random.uniform(1.2, 2.2))
-                aceptar_cookies_con_espera(self.page)
-            except Exception as e:
-                print(f"  [Registro] [{self.client_email}] [WARN] Pricing falló: {e}")
+            pricing_ok = False
+            for _intento_pr in range(1, 4):
+                try:
+                    navegar_tidal_tolerante(self.page, "https://tidal.com/pricing", timeout_ms=30000)
+                    time.sleep(random.uniform(1.2, 2.2))
+                    aceptar_cookies_con_espera(self.page)
+                    pricing_ok = True
+                    break
+                except Exception as e:
+                    print(f"  [Registro] [{self.client_email}] [WARN] Pricing falló "
+                          f"(intento {_intento_pr}/3): {e}")
+                    if self.use_proxy and es_error_proxy_o_red(e):
+                        print(f"  [Registro] [{self.client_email}] Túnel/proxy caído en pricing. "
+                              f"Rotando NG y reintentando...")
+                        try:
+                            self.ejecutar_rotacion_proxy_y_recargar()
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                    elif _intento_pr < 3:
+                        time.sleep(1.5)
+            if not pricing_ok:
+                print(f"  [Registro] [{self.client_email}] [WARN] Se continúa sin pricing estable.")
 
             print(f"  [Registro] [{self.client_email}] Cargando account.tidal.com/ con referer...")
-            try:
-                navegar_tidal_tolerante(
-                    self.page, "https://account.tidal.com/",
-                    referer="https://tidal.com/pricing",
-                    timeout_ms=30000,
-                )
-            except Exception as e:
-                print(f"  [Registro] [{self.client_email}] [WARN] Timeout en navegación inicial: {e}")
-                # Si caímos en authorize?email= con Error, recuperar ya (no esperar a quemar 4 proxies)
-                if es_pantalla_error_login_tidal(self.page) or url_es_oauth_login_roto(
-                    getattr(self.page, "url", "") or ""
-                ):
-                    self.recuperar_login_tras_error_tidal()
-                
+            account_ok = False
+            for _intento_acc in range(1, 4):
+                try:
+                    navegar_tidal_tolerante(
+                        self.page, "https://account.tidal.com/",
+                        referer="https://tidal.com/pricing",
+                        timeout_ms=30000,
+                    )
+                    account_ok = True
+                    break
+                except Exception as e:
+                    print(f"  [Registro] [{self.client_email}] [WARN] Timeout en navegación inicial "
+                          f"(intento {_intento_acc}/3): {e}")
+                    url_now = ""
+                    try:
+                        url_now = (getattr(self.page, "url", "") or "").lower()
+                    except Exception:
+                        pass
+                    # chrome-error / ERR_TUNNEL: rotar NG antes de insistir con el mismo proxy muerto
+                    if self.use_proxy and (
+                        es_error_proxy_o_red(e)
+                        or "chrome-error://" in url_now
+                        or "chromewebdata" in url_now
+                    ):
+                        print(f"  [Registro] [{self.client_email}] Túnel/proxy caído al abrir cuenta. "
+                              f"Rotando NG...")
+                        try:
+                            self.ejecutar_rotacion_proxy_y_recargar()
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        continue
+                    # authorize?email= con Error: recuperar vía pricing (sin quemar proxy aún)
+                    if es_pantalla_error_login_tidal(self.page) or url_es_oauth_login_roto(
+                        getattr(self.page, "url", "") or ""
+                    ):
+                        try:
+                            self.recuperar_login_tras_error_tidal()
+                            account_ok = True
+                            break
+                        except Exception:
+                            pass
+                    if _intento_acc < 3:
+                        time.sleep(1.5)
+            if not account_ok:
+                print(f"  [Registro] [{self.client_email}] [WARN] Se continúa tras fallos al abrir account.tidal.com.")
+
             email_input = esperar_locator_en_frames(self.page, ['input[type="email"]', 'input[name="email"]'], timeout_s=25.0)
             if not email_input:
                 # Si falló, rotamos el proxy una única vez y reintentamos por pricing (nunca authorize)
@@ -5902,11 +6084,19 @@ class TidalRegisterManager:
 
                 codigo_aceptado = False
                 ultimo_error_codigo = ""
-                for ronda in range(1, 4):
-                    print(f"  [Registro] Buscando código de registro vía IMAP (ronda {ronda}/3)...")
-                    codigo = getattr(self, "_otp_registro_prefetch", None)
-                    self._otp_registro_prefetch = None
+                codigo_guardado = getattr(self, "_otp_registro_prefetch", None)
+                self._otp_registro_prefetch = None
+
+                for ronda in range(1, 5):
+                    if self._sesion_post_registro_detectada():
+                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Sesión/cuenta ya activa. "
+                              f"Continuando...{Color.ENDC}")
+                        codigo_aceptado = True
+                        break
+
+                    codigo = codigo_guardado
                     if not codigo:
+                        print(f"  [Registro] Buscando código de registro vía IMAP (ronda {ronda}/4)...")
                         for intento in range(1, 11):
                             print(f"  [Registro] Intento {intento}/10: Buscando correo...")
                             codigo = obtener_codigo_via_imap(
@@ -5920,8 +6110,8 @@ class TidalRegisterManager:
                                 max_age_minutes=20,
                             )
                             if codigo:
+                                codigo_guardado = codigo
                                 break
-                            # A mitad de intentos: Resend por si Tidal no envió el primer correo
                             if intento in (4, 7) and _pantalla_otp_registro():
                                 try:
                                     btn_resend = esperar_locator_en_frames(
@@ -5941,10 +6131,23 @@ class TidalRegisterManager:
                                 except Exception:
                                     pass
                             if intento < 10:
+                                if self._sesion_post_registro_detectada():
+                                    codigo_aceptado = True
+                                    break
                                 print("  [Registro] Correo no encontrado aún. Esperando 5 segundos...")
                                 time.sleep(5.0)
+                        if codigo_aceptado:
+                            break
+                    else:
+                        print(f"  [Registro] [{self.client_email}] Reutilizando OTP ya leído "
+                              f"({codigo}) — reintento {ronda}/4...")
 
                     if not codigo:
+                        if self._confirmar_registro_completado(timeout_s=10.0):
+                            print(f"  [Registro] {Color.GREEN}[{self.client_email}] Cuenta ya registrada "
+                                  f"pese a no re-leer OTP. Continuando...{Color.ENDC}")
+                            codigo_aceptado = True
+                            break
                         ultimo_error_codigo = (
                             "No se pudo extraer el código de verificación del correo de manera automática."
                         )
@@ -5965,16 +6168,42 @@ class TidalRegisterManager:
                             'input[maxlength="1"]',
                             'input[name="code"]',
                             'input[inputmode="numeric"]',
-                            'input[type="text"]',
                         ],
-                        timeout_s=12.0,
+                        timeout_s=15.0,
                     )
-                    time.sleep(0.4)
+                    time.sleep(0.5)
 
                     print(f"  [Registro] [{self.client_email}] Escribiendo código OTP ({codigo})...")
-                    if not escribir_codigo_verificacion_inteligente(self.page, codigo):
+                    fill_ok = False
+                    for intento_fill in range(1, 4):
+                        if self._sesion_post_registro_detectada():
+                            fill_ok = True
+                            break
+                        wrote = escribir_codigo_verificacion_inteligente(self.page, codigo)
+                        time.sleep(1.0)
+                        if self._sesion_post_registro_detectada():
+                            print(f"  [Registro] [{self.client_email}] OTP aceptado por Tidal "
+                                  f"(sesión detectada tras el relleno).")
+                            fill_ok = True
+                            break
+                        if wrote:
+                            fill_ok = True
+                            break
+                        print(f"  [Registro] {Color.WARNING}[WARN] Relleno OTP falló "
+                              f"(intento {intento_fill}/3)...{Color.ENDC}")
+                        time.sleep(1.2)
+
+                    if not fill_ok:
+                        try:
+                            self.page.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        if self._sesion_post_registro_detectada():
+                            codigo_aceptado = True
+                            break
                         print(f"  [Registro] {Color.WARNING}[WARN] No se pudo rellenar las cajas OTP; "
-                              f"reintentando...{Color.ENDC}")
+                              f"se reintenta con el mismo código (sin buscar otro correo).{Color.ENDC}")
                         ultimo_error_codigo = "No se pudieron rellenar las cajas del código OTP."
                         time.sleep(1.0)
                         continue
@@ -6017,6 +6246,11 @@ class TidalRegisterManager:
                             pass
 
                     time.sleep(2.5)
+                    if self._sesion_post_registro_detectada():
+                        codigo_aceptado = True
+                        print("  [Registro] Código aceptado. Esperando procesamiento de la cuenta...")
+                        break
+
                     try:
                         texto_err = self.page.evaluate(
                             "() => document.body ? document.body.innerText.toLowerCase() : ''"
@@ -6031,6 +6265,7 @@ class TidalRegisterManager:
                         ultimo_error_codigo = (
                             f"Tidal rechazó el código de verificación para {self.client_email}."
                         )
+                        codigo_guardado = None
                         try:
                             btn_resend = esperar_locator_en_frames(
                                 self.page,
@@ -6054,16 +6289,28 @@ class TidalRegisterManager:
                     break
 
                 if not codigo_aceptado:
-                    raise RuntimeError(
-                        ultimo_error_codigo
-                        or f"No se pudo verificar el correo de registro para {self.client_email}."
-                    )
-            
+                    print(f"  [Registro] [{self.client_email}] Última comprobación: ¿la cuenta "
+                          f"quedó creada aunque falló la verificación OTP?")
+                    if self._confirmar_registro_completado(timeout_s=15.0):
+                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Sí: sesión activa. "
+                              f"Se continúa.{Color.ENDC}")
+                        codigo_aceptado = True
+                    else:
+                        raise RuntimeError(
+                            ultimo_error_codigo
+                            or f"No se pudo verificar el correo de registro para {self.client_email}."
+                        )
+
             print("  [Registro] Esperando redirección automática al perfil o cuenta...")
             registro_exitoso = self._confirmar_registro_completado(timeout_s=60.0)
 
             if registro_exitoso:
-                print(f"  {Color.GREEN}[OK] ¡Registro completado y verificado con éxito para {self.client_email}! Cerrando ventana automáticamente...{Color.ENDC}")
+                if cerrar_navegador_al_final:
+                    print(f"  {Color.GREEN}[OK] ¡Registro completado y verificado con éxito para {self.client_email}! "
+                          f"Cerrando ventana automáticamente...{Color.ENDC}")
+                else:
+                    print(f"  {Color.GREEN}[OK] ¡Registro completado y verificado con éxito para {self.client_email}! "
+                          f"Chrome se mantiene para TuneMyMusic...{Color.ENDC}")
                 try:
                     cookies_proxy = self.context.cookies()
                     self.cookies_tidal = [c for c in cookies_proxy if "tidal.com" in c.get("domain", "")]
@@ -6077,12 +6324,36 @@ class TidalRegisterManager:
                 
         except Exception as e:
             print(f"  {Color.FAIL}[ERROR] Falló el registro para {self.client_email}: {e}{Color.ENDC}")
+            try:
+                if self.page and not self.page.is_closed() and self._confirmar_registro_completado(timeout_s=12.0):
+                    print(f"  [Registro] {Color.GREEN}[{self.client_email}] La cuenta SÍ quedó registrada. "
+                          f"Se ignora el error OTP y se continúa.{Color.ENDC}")
+                    registro_exitoso = True
+                    try:
+                        cookies_proxy = self.context.cookies()
+                        self.cookies_tidal = [
+                            c for c in cookies_proxy if "tidal.com" in c.get("domain", "")
+                        ]
+                    except Exception:
+                        self.cookies_tidal = []
+                    return True
+            except Exception:
+                pass
             return False
         finally:
             if cerrar_navegador_al_final:
                 # Tras un registro OK la opción 8 reutiliza el PE en TuneMyMusic: no liberarlo aquí.
                 # El NG sí se libera siempre; la fase Nigeria ya terminó.
                 self.cerrar_navegador(liberar_ng=True, liberar_pe=not registro_exitoso)
+            elif registro_exitoso:
+                if getattr(self, "proxy_ng_server", None):
+                    try:
+                        GLOBAL_NG_PROXY_POOL.liberar_proxy(self.proxy_ng_server)
+                    except Exception:
+                        pass
+                    self.proxy_ng_server = None
+                    self.proxy_ng_user = None
+                    self.proxy_ng_pass = None
             try:
                 # Solo limpiar perfil temporal si NO fue exitoso y el navegador ya está cerrado:
                 # borrarlo con Chrome abierto dejaba el perfil a medias y bloqueado en Windows.
@@ -6092,6 +6363,34 @@ class TidalRegisterManager:
                         print(f"  [Registro] Limpiado perfil temporal por fallo: {self.main_profile}")
             except Exception as ex:
                 pass
+
+    def _sesion_post_registro_detectada(self) -> bool:
+        """True si tras el OTP ya hay sesión (aunque el relleno diga fallo)."""
+        try:
+            self.page = pagina_vigente(self.page)
+            if not self.page or self.page.is_closed():
+                return False
+            url = (self.page.url or "").lower()
+            if self._url_indica_cuenta_activa(url):
+                hay_login = False
+                try:
+                    hay_login = bool(encontrar_locator_en_frames(
+                        self.page,
+                        ['input[type="email"]', 'input[name="email"]', '#email'],
+                    ))
+                except Exception:
+                    pass
+                if not hay_login:
+                    return True
+            if (
+                ("account.tidal.com" in url or "listen.tidal.com" in url or "tidal.com/browse" in url)
+                and "login.tidal.com" not in url
+                and "/authorize" not in url
+            ):
+                return True
+        except Exception:
+            pass
+        return False
 
     def limpiar_perfil_temporal(self) -> None:
         # Windows tarda un instante en liberar los ficheros del perfil tras cerrar Chrome
@@ -6745,7 +7044,11 @@ class TidalRegisterManager:
         except Exception as e:
             print(f"  {Color.WARNING}[Titulares] [{self.client_email}] [WARN] No se pudo registrar como titular: {e}{Color.ENDC}")
 
-    def run_tmm_transfer(self, event_subir_csv: threading.Event) -> None:
+    def run_tmm_transfer(
+        self,
+        event_subir_csv: threading.Event,
+        cancelar_event: threading.Event | None = None,
+    ) -> None:
         """Abre una nueva ventana para TuneMyMusic con proxy de Perú y sube el archivo CSV."""
         try:
             from playwright.sync_api import sync_playwright
@@ -6880,8 +7183,13 @@ class TidalRegisterManager:
             print(f"  [TuneMyMusic] [{self.client_email}] Ventana abierta con la sesión de Tidal inyectada.")
             print(f"  [TuneMyMusic] [{self.client_email}] Esperando que prepares la pantalla de selección de archivo...")
             
-            # Esperar a que el usuario presione Enter en el hilo principal
-            event_subir_csv.wait()
+            # Esperar ENTER del hilo principal (o cancelación)
+            while True:
+                if cancelar_event is not None and cancelar_event.is_set():
+                    print(f"  [TuneMyMusic] [{self.client_email}] Transferencia cancelada.")
+                    return
+                if event_subir_csv.wait(timeout=0.5):
+                    break
 
             transfer_ok = False
             mantener_abierta = False
@@ -12097,17 +12405,39 @@ def registrar_cuentas_tidal(correos):
     success_count = 0
     fail_count = 0
     successful_managers = []
+    estado_lock = threading.Lock()
+    pendientes_fase_registro = len(correos)
+    fase_registro_lista = threading.Event()
+    event_subir_csv = threading.Event()
+    cancelar_tmm = threading.Event()
+
+    def _marcar_fin_fase_registro(marcado_ref: dict):
+        """Marca fin de fase una sola vez por hilo (evita deadlock si falla tras el registro)."""
+        nonlocal pendientes_fase_registro
+        if marcado_ref.get("ok"):
+            return
+        with estado_lock:
+            if marcado_ref.get("ok"):
+                return
+            marcado_ref["ok"] = True
+            pendientes_fase_registro -= 1
+            if pendientes_fase_registro <= 0:
+                fase_registro_lista.set()
     
     def registrar_un_correo(idx, correo):
+        nonlocal success_count, fail_count
         p_ng_server = p_ng_user = p_ng_pass = None
         p_pe_server = p_pe_user = p_pe_pass = None
         manager = None
         exito = False
+        fase_marcada = {"ok": False}
         try:
             if use_proxy and valid_ng_list:
                 p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico()
                 if not p_ng:
                     print(f"  {Color.FAIL}[Proxy NG] [{correo}] Sin proxy de Nigeria libre; se omite la cuenta.{Color.ENDC}")
+                    with estado_lock:
+                        fail_count += 1
                     return correo, False, None
                 p_ng_server = p_ng.get("server")
                 p_ng_user = p_ng.get("username")
@@ -12135,20 +12465,60 @@ def registrar_cuentas_tidal(correos):
             )
 
             print(f"\n{Color.CYAN}{Color.BOLD}[Registro Concurrente] Iniciando proceso para: {correo}{Color.ENDC}")
-            exito = manager.run_registration()
-            return correo, exito, manager
-        except Exception:
-            # Asegurar cierre de Chrome si el fallo ocurrió a mitad del proceso
+            # Cierra Chrome NG al terminar: TuneMyMusic se relanza con proxy PE en este mismo hilo.
+            exito = manager.run_registration(cerrar_navegador_al_final=True)
+            if not exito:
+                try:
+                    manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+                except Exception:
+                    pass
+                try:
+                    manager.limpiar_perfil_temporal()
+                except Exception:
+                    pass
+                with estado_lock:
+                    fail_count += 1
+                return correo, False, manager
+
+            with estado_lock:
+                success_count += 1
+                successful_managers.append(manager)
+
+            # Liberar el resumen principal YA (no esperar a completar TMM ni a cuentas lentas).
+            _marcar_fin_fase_registro(fase_marcada)
+
+            if cancelar_tmm.is_set():
+                try:
+                    manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+                except Exception:
+                    pass
+                try:
+                    manager.limpiar_perfil_temporal()
+                except Exception:
+                    pass
+                return correo, True, manager
+
+            print(f"  [TuneMyMusic] [{correo}] Abriendo TuneMyMusic (proxy PE) tras el registro...")
+            try:
+                manager.run_tmm_transfer(event_subir_csv, cancelar_event=cancelar_tmm)
+            except Exception as e_tmm:
+                print(f"  {Color.FAIL}[TuneMyMusic] [{correo}] Falló la transferencia: {e_tmm}{Color.ENDC}")
+            return correo, True, manager
+        except Exception as e_reg:
             if manager is not None:
                 try:
                     manager.cerrar_navegador(liberar_ng=False, liberar_pe=False)
                 except Exception:
                     pass
+            with estado_lock:
+                if not exito:
+                    fail_count += 1
+            print(f"  {Color.FAIL}[ERROR] Excepción en registro/TMM de {correo}: {e_reg}{Color.ENDC}")
             raise
         finally:
             cerrar_sesion_imap_hilo()
             # Si el registro no tuvo éxito, devolver ambos proxies. Si tuvo éxito, NG ya lo
-            # liberó run_registration y el PE se conserva en el manager para TuneMyMusic.
+            # liberó run_registration y el PE se libera al cerrar TuneMyMusic.
             if not exito:
                 try:
                     GLOBAL_NG_PROXY_POOL.liberar_proxy(p_ng_server)
@@ -12161,96 +12531,108 @@ def registrar_cuentas_tidal(correos):
                 if manager is not None:
                     manager.proxy_ng_server = None
                     manager.proxy_pe_server = None
+            _marcar_fin_fase_registro(fase_marcada)
 
-    # Ejecutar de manera simultánea
+    if not correos:
+        print(f"\n{Color.WARNING}[Opción 8] No hay correos para registrar.{Color.ENDC}")
+        return
     workers = min(10, len(correos))
     print(f"\n{Color.CYAN}{Color.BOLD}Iniciando registro de {len(correos)} cuentas de forma simultánea (usando {workers} hilos)...{Color.ENDC}\n")
+    print(f"{Color.CYAN}Cada cuenta abrirá TuneMyMusic en cuanto termine su registro "
+          f"(sin esperar a que el lote entero acabe).{Color.ENDC}\n")
     
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(registrar_un_correo, idx, correo): correo for idx, correo in enumerate(correos, 1)}
+
+        # Esperar a que TODOS terminen el registro (éxito o fallo) antes del ENTER.
+        # Las cuentas OK ya están abriendo/esperando en TMM en paralelo.
+        while not fase_registro_lista.wait(timeout=0.5):
+            pass
+
+        with estado_lock:
+            ok_n = success_count
+            fail_n = fail_count
+            managers_ok = list(successful_managers)
+
+        print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+        print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO{Color.ENDC}")
+        print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+        print(f" Cuentas procesadas con éxito: {Color.GREEN}{ok_n}{Color.ENDC}")
+        print(f" Cuentas fallidas: {Color.FAIL}{fail_n}{Color.ENDC}")
+        print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
+
+        if managers_ok:
+            print(f"\n{Color.CYAN}{Color.BOLD}TuneMyMusic se abre (o ya está abierto) para las "
+                  f"{len(managers_ok)} cuentas exitosas.{Color.ENDC}")
+
+            try:
+                DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
+                asignaciones = asignar_csvs_a_cuentas([mgr.client_email for mgr in managers_ok])
+                con_csv = []
+                sin_csv = []
+                for mgr in managers_ok:
+                    ruta = asignaciones.get(mgr.client_email)
+                    mgr.csv_asignado = ruta
+                    if ruta and csv_pertenece_a_cuenta(ruta, mgr.client_email):
+                        try:
+                            nbytes = ruta.stat().st_size
+                        except Exception:
+                            nbytes = 0
+                        con_csv.append((mgr.client_email, ruta.name, nbytes))
+                    else:
+                        mgr.csv_asignado = None
+                        sin_csv.append(mgr.client_email)
+
+                print(f"\n{Color.CYAN}[CSV] Emparejados {len(con_csv)}/{len(managers_ok)} "
+                      f"(1 archivo ↔ 1 cuenta Tidal) en 'descargas/'.{Color.ENDC}")
+                for email, nombre, nbytes in con_csv:
+                    marca = "" if nombre.lower() == f"{email.lower()}.csv" else " [alias]"
+                    print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes){marca}")
+                if sin_csv:
+                    print(f"\n{Color.WARNING}[CSV] Sin archivo exclusivo (o ambiguo) para:{Color.ENDC}")
+                    for email in sin_csv:
+                        print(f"  {Color.FAIL}✗{Color.ENDC} {email}  (espera: descargas/{email}.csv)")
+                    print(f"{Color.WARNING}Esas ventanas permanecerán abiertas para subida manual "
+                          f"si al pulsar ENTER aún no hay CSV con el nombre exacto de la cuenta.{Color.ENDC}")
+                    cont = input("¿Continuar con la subida en TuneMyMusic de todas formas? (s/n, por defecto 's'): ").strip().lower()
+                    if cont in ("n", "no"):
+                        print(f"{Color.CYAN}Transferencia TuneMyMusic cancelada. Cerrando ventanas...{Color.ENDC}")
+                        cancelar_tmm.set()
+                        event_subir_csv.set()
+                        for future in as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception:
+                                pass
+                        print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+                        return
+            except Exception as e_csv:
+                print(f"  {Color.FAIL}[CSV] Error al emparejar archivos tras el registro: {e_csv}{Color.ENDC}")
+                print(f"  {Color.WARNING}Se continúa igual: pulsa ENTER cuando el selector CSV esté listo "
+                      f"en cada TuneMyMusic.{Color.ENDC}")
+
+            input(f"\n{Color.BOLD}>>> Prepara el selector de archivo CSV en CADA TuneMyMusic "
+                  f"(todas las ventanas) y luego presiona ENTER.\n"
+                  f"    Cada ventana subirá SOLO su CSV emparejado (nombre = correo de la cuenta).\n"
+                  f"    Tras ENTER cada ventana esperará hasta 5 min a que el input esté listo "
+                  f"(ya no se cierra a los 30s). <<<{Color.ENDC}")
+
+            event_subir_csv.set()
+            print(f"\n{Color.CYAN}Subida disparada. Cada ventana espera su propio input; "
+                  f"si falla, permanece abierta para corrección manual.{Color.ENDC}")
+        else:
+            cancelar_tmm.set()
+            event_subir_csv.set()
+
         for future in as_completed(futures):
             correo = futures[future]
             try:
-                c, exito, manager = future.result()
-                if exito and manager is not None:
-                    success_count += 1
-                    successful_managers.append(manager)
-                else:
-                    fail_count += 1
+                future.result()
             except Exception as e:
                 print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
-                fail_count += 1
-            
-    print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f" Cuentas procesadas con éxito: {Color.GREEN}{success_count}{Color.ENDC}")
-    print(f" Cuentas fallidas: {Color.FAIL}{fail_count}{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
-    
-    if successful_managers:
-        print(f"\n{Color.CYAN}{Color.BOLD}Iniciando transferencia en TuneMyMusic para las {len(successful_managers)} cuentas exitosas...{Color.ENDC}")
 
-        # Pre-chequeo exclusivo 1:1: avisar qué CSV faltan ANTES de abrir TuneMyMusic
-        DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
-        asignaciones = asignar_csvs_a_cuentas([mgr.client_email for mgr in successful_managers])
-        con_csv = []
-        sin_csv = []
-        for mgr in successful_managers:
-            ruta = asignaciones.get(mgr.client_email)
-            mgr.csv_asignado = ruta
-            if ruta and csv_pertenece_a_cuenta(ruta, mgr.client_email):
-                con_csv.append((mgr.client_email, ruta.name, ruta.stat().st_size))
-            else:
-                mgr.csv_asignado = None
-                sin_csv.append(mgr.client_email)
-
-        print(f"\n{Color.CYAN}[CSV] Emparejados {len(con_csv)}/{len(successful_managers)} "
-              f"(1 archivo ↔ 1 cuenta Tidal) en 'descargas/'.{Color.ENDC}")
-        for email, nombre, nbytes in con_csv:
-            marca = "" if nombre.lower() == f"{email.lower()}.csv" else " [alias]"
-            print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes){marca}")
-        if sin_csv:
-            print(f"\n{Color.WARNING}[CSV] Sin archivo exclusivo (o ambiguo) para:{Color.ENDC}")
-            for email in sin_csv:
-                print(f"  {Color.FAIL}✗{Color.ENDC} {email}  (espera: descargas/{email}.csv)")
-            print(f"{Color.WARNING}Esas ventanas se abrirán igual y permanecerán abiertas para subida manual "
-                  f"si al pulsar ENTER aún no hay CSV con el nombre exacto de la cuenta.{Color.ENDC}")
-            cont = input("¿Continuar con TuneMyMusic de todas formas? (s/n, por defecto 's'): ").strip().lower()
-            if cont in ("n", "no"):
-                print(f"{Color.CYAN}Transferencia TuneMyMusic cancelada. Regresa cuando los CSV estén en 'descargas/'.{Color.ENDC}")
-                print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
-                return
-        
-        event_subir_csv = threading.Event()
-        
-        def transferir_un_correo(mgr):
-            mgr.run_tmm_transfer(event_subir_csv)
-            
-        tmm_threads = []
-        for mgr in successful_managers:
-            t = threading.Thread(target=transferir_un_correo, args=(mgr,), daemon=True)
-            t.start()
-            tmm_threads.append(t)
-            
-        print(f"\n{Color.CYAN}Esperando a que las ventanas de TuneMyMusic se abran...{Color.ENDC}")
-        time.sleep(0.5)
-        
-        input(f"\n{Color.BOLD}>>> Prepara el selector de archivo CSV en CADA TuneMyMusic "
-              f"(todas las ventanas) y luego presiona ENTER.\n"
-              f"    Cada ventana subirá SOLO su CSV emparejado (nombre = correo de la cuenta).\n"
-              f"    Tras ENTER cada ventana esperará hasta 5 min a que el input esté listo "
-              f"(ya no se cierra a los 30s). <<<{Color.ENDC}")
-        
-        # Desencadenar subida en todos los hilos
-        event_subir_csv.set()
-        
-        print(f"\n{Color.CYAN}Subida disparada. Cada ventana espera su propio input; "
-              f"si falla, permanece abierta para corrección manual.{Color.ENDC}")
-        for t in tmm_threads:
-            t.join()
-            
-        print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso de transferencia TuneMyMusic finalizado para todas las cuentas exitosas.{Color.ENDC}")
+        if managers_ok:
+            print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso de transferencia TuneMyMusic finalizado para todas las cuentas exitosas.{Color.ENDC}")
         
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
 
