@@ -3573,6 +3573,17 @@ def detectar_pantalla_antirobot(page) -> bool:
         pass
     return False
 
+def correos_iguales_exacto(c1: str, c2: str) -> bool:
+    """Compara dos correos Tidal respetando los puntos de Gmail.
+
+    En Tidal, s.oftcake78.8 y s.of.tcake7.88 son cuentas distintas aunque Gmail
+    entregue el mismo buzón. Nunca usar son_correos_equivalentes para titulares.
+    """
+    if not c1 or not c2:
+        return False
+    return (c1 or "").strip().lower().rstrip(".") == (c2 or "").strip().lower().rstrip(".")
+
+
 def son_correos_equivalentes(c1: str, c2: str) -> bool:
     """Compara dos correos ignorando los puntos del usuario en las direcciones de Gmail."""
     if not c1 or not c2:
@@ -6721,7 +6732,7 @@ class TidalRegisterManager:
         try:
             with TITULARES_FILE_LOCK:
                 titulares_existentes, path_tit = cargar_titulares_familiares()
-                if any(t["correo"].lower() == self.client_email.lower() for t in titulares_existentes):
+                if any(correos_iguales_exacto(t["correo"], self.client_email) for t in titulares_existentes):
                     return
                 titulares_existentes.append({
                     "correo": self.client_email,
@@ -7856,13 +7867,16 @@ def cargar_titulares_familiares() -> tuple[list[dict], Path]:
 
 def guardar_titulares_familiares(titulares: list[dict], path: Path):
     """Guarda en formato por bloques TITULAR / MIEMBROS, preservando el plan de invitaciones."""
-    # Conservar miembros_invitar del archivo si el dict en memoria no lo trae
+    # Conservar miembros_invitar del archivo si el dict en memoria no lo trae.
+    # Clave EXACTA (con puntos): no usar clean_email/son_correos_equivalentes.
     if path.exists():
         try:
             existentes, _ = parsear_titular_familiar_txt_opcion11(path)
-            by_key = {clean_email(t.get("correo", "")): t for t in existentes}
+            by_key = {
+                (t.get("correo") or "").strip().lower(): t for t in existentes
+            }
             for t in titulares:
-                key = clean_email(t.get("correo", ""))
+                key = (t.get("correo") or "").strip().lower()
                 if not t.get("miembros_invitar") and key in by_key:
                     t["miembros_invitar"] = list(by_key[key].get("miembros_invitar") or [])
         except Exception:
@@ -8678,10 +8692,13 @@ class TidalFamilyInviter:
             
             raw_miembros = resultado.get("miembros", [])
             miembros_reales = []
+            titular_l = (titular.get("correo") or "").strip().lower()
             for m in raw_miembros:
                 m_clean = m.strip().rstrip('.').lower()
-                if m_clean and m_clean not in miembros_reales and m_clean != titular["correo"].strip().lower():
-                    miembros_reales.append(m_clean)
+                # Exacto con puntos: no colapsar aliases Gmail del titular
+                if m_clean and m_clean != titular_l and m_clean not in miembros_reales:
+                    if not correos_iguales_exacto(m_clean, titular_l):
+                        miembros_reales.append(m_clean)
 
             is_full_text = resultado.get("isFullText", False)
             has_add_button = resultado.get("hasAddButton", False)
@@ -8716,20 +8733,19 @@ class TidalFamilyInviter:
 
     @staticmethod
     def _normalizar_correo(email: str) -> str:
-        if not email:
-            return ""
-        email = email.strip().lower()
-        partes = email.split("@")
-        if len(partes) == 2:
-            return f"{partes[0].replace('.', '')}@{partes[1]}"
-        return email
+        """Normaliza para comparar titulares: minúsculas, SIN quitar puntos de Gmail.
+
+        s.oftcake78.8 y s.of.tcake7.88 son titulares distintos en Tidal.
+        """
+        return (email or "").strip().lower().rstrip(".")
 
     def _sesion_titular_activa(self, titular) -> bool:
         """Comprueba contra Tidal que la sesión abierta pertenece al titular esperado."""
         try:
             curr_url = self.page.url.lower()
             if "account.tidal.com" in curr_url and "/login" not in curr_url and "family" in curr_url:
-                return True
+                # En /family hace falta verificar el correo del perfil: no asumir por URL
+                pass
 
             self.page.goto("https://account.tidal.com/profile", wait_until="domcontentloaded", timeout=30000)
             manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular ({titular['correo']})")
@@ -8745,12 +8761,24 @@ class TidalFamilyInviter:
                 if "login" in curr_url or "authorize" in curr_url:
                     return False
                 email_detectado = self.page.evaluate("""() => {
+                    // Preferir el campo de correo del perfil (no el primer email del body,
+                    // que puede ser un miembro del plan familiar).
                     const el = document.querySelector('input[type="email"], input[name="email"], #email');
                     if (el && el.value) return el.value.trim().toLowerCase();
-                    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;
-                    const bodyText = document.body ? document.body.innerText : '';
-                    const matches = bodyText.match(emailRegex);
-                    return matches ? matches[0].trim().toLowerCase() : '';
+                    const labels = Array.from(document.querySelectorAll('label, span, p, div, dt, dd'));
+                    for (const n of labels) {
+                        const t = (n.textContent || '').trim().toLowerCase();
+                        if (t === 'correo electrónico' || t === 'email' || t === 'e-mail') {
+                            const sib = n.parentElement;
+                            if (sib) {
+                                const m = (sib.innerText || '').match(
+                                    /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/
+                                );
+                                if (m) return m[0].trim().toLowerCase();
+                            }
+                        }
+                    }
+                    return '';
                 }""")
                 if email_detectado:
                     break
@@ -8760,11 +8788,13 @@ class TidalFamilyInviter:
                 return False
 
             print(f"  [Inviter] Sesión activa detectada en Chrome para: {email_detectado}")
-            if self._normalizar_correo(email_detectado) == self._normalizar_correo(titular["correo"]):
+            # EXACTO con puntos: no usar son_correos_equivalentes / quitar puntos
+            if correos_iguales_exacto(email_detectado, titular["correo"]):
                 print(f"  [Inviter] {Color.GREEN}Sesión confirmada para el titular correcto: {titular['correo']}{Color.ENDC}")
                 return True
 
-            print(f"  [Inviter] Sesión de cuenta incorrecta ({email_detectado}). Cerrando sesión...")
+            print(f"  [Inviter] Sesión de cuenta incorrecta ({email_detectado} ≠ {titular['correo']}). "
+                  f"Cerrando sesión...")
             self.logout_titular()
         except Exception as e:
             print(f"  [Inviter] [WARN] Error al verificar sesión activa: {e}")
@@ -12417,7 +12447,8 @@ def invitar_al_plan_familiar_opcion11():
 
     def _ya_invitado(titular: dict, miembro: str) -> bool:
         for m in titular.get("miembros") or []:
-            if son_correos_equivalentes(m, miembro) or clean_email(m) == clean_email(miembro):
+            # Exacto con puntos: en Tidal cada variante con puntos es otra cuenta
+            if correos_iguales_exacto(m, miembro):
                 return True
         return False
 

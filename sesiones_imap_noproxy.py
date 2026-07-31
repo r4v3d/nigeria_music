@@ -3789,6 +3789,17 @@ def detectar_pantalla_antirobot(page) -> bool:
         pass
     return False
 
+def correos_iguales_exacto(c1: str, c2: str) -> bool:
+    """Compara dos correos Tidal respetando los puntos de Gmail.
+
+    En Tidal, s.oftcake78.8 y s.of.tcake7.88 son cuentas distintas aunque Gmail
+    entregue el mismo buzón. Nunca usar son_correos_equivalentes para titulares.
+    """
+    if not c1 or not c2:
+        return False
+    return (c1 or "").strip().lower().rstrip(".") == (c2 or "").strip().lower().rstrip(".")
+
+
 def son_correos_equivalentes(c1: str, c2: str) -> bool:
     """Compara dos correos ignorando los puntos del usuario en las direcciones de Gmail."""
     if not c1 or not c2:
@@ -4465,12 +4476,34 @@ def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
                     code_inputs = otp_estrictos
                 elif len(otp_estrictos) == 1 and len(codigo) >= 4:
                     code_inputs = otp_estrictos
-                if len(code_inputs) >= min(4, len(codigo)) or (code_inputs and len(codigo) <= 8 and len(code_inputs) == 1):
+                # Códigos de registro (≥4): exigir cajas OTP reales antes de salir del poll
+                if len(codigo) >= 4:
+                    if len(otp_estrictos) >= min(4, len(codigo)) or (
+                        len(otp_estrictos) == 1 and len(codigo) >= 4
+                    ):
+                        code_inputs = otp_estrictos
+                        break
+                elif len(code_inputs) >= min(4, len(codigo)) or (
+                    code_inputs and len(codigo) <= 8 and len(code_inputs) == 1
+                ):
                     break
                 time.sleep(0.35)
 
             if not code_inputs:
                 continue
+
+            # Códigos largos (registro/login Tidal): NO usar inputs genéricos type=text.
+            # Si aún no hay cajas OTP estrictas, fallar rápido para que el caller espere la UI.
+            if len(codigo) >= 4:
+                if len(otp_estrictos) >= min(4, len(codigo)):
+                    code_inputs = otp_estrictos
+                elif len(otp_estrictos) == 1:
+                    code_inputs = otp_estrictos
+                else:
+                    # Sin cajas OTP reales todavía → no inventar con campos sueltos
+                    continue
+            elif len(otp_estrictos) >= 1:
+                code_inputs = otp_estrictos
 
             def leer_cajas(objetivos):
                 leido = ""
@@ -6161,24 +6194,81 @@ class TidalRegisterManager:
 
                 codigo_aceptado = False
                 ultimo_error_codigo = ""
-                for ronda in range(1, 4):
-                    print(f"  [Registro] Buscando código de registro vía IMAP (ronda {ronda}/3)...")
-                    codigo = None
-                    for intento in range(1, 8):
-                        print(f"  [Registro] Intento {intento}/7: Buscando correo...")
-                        codigo = obtener_codigo_via_imap(
-                            gmail_user=self.client_email,
-                            required_keywords=["registr", "bienven", "código", "code", "verific", "sign-up", "signup"],
-                            query_exclude="cancel",
-                            after_email_id=max_id_previo
-                        )
-                        if codigo:
+                codigo_guardado = None  # No perder el OTP si falló el relleno de cajas
+
+                def _esperar_ui_otp_registro(timeout_s: float = 20.0) -> bool:
+                    """Espera cajas OTP reales (maxlength=1 / one-time-code), no cualquier input text."""
+                    fin = time.time() + timeout_s
+                    while time.time() < fin:
+                        try:
+                            self.page = pagina_vigente(self.page)
+                            # Si ya salimos del OTP (cuenta creada), no seguir esperando cajas
+                            if self._sesion_post_registro_detectada():
+                                return False  # caller tratará como éxito vía _sesion_*
+                            n = contar_cajas_otp_visibles(self.page)
+                            if n >= 4:
+                                return True
+                            loc = encontrar_locator_en_frames(
+                                self.page,
+                                [
+                                    'input[autocomplete="one-time-code"]',
+                                    'input[name="code"]',
+                                    'input[inputmode="numeric"][maxlength]',
+                                ],
+                            )
+                            if loc and n >= 1:
+                                return True
+                        except Exception:
+                            pass
+                        time.sleep(0.4)
+                    return contar_cajas_otp_visibles(self.page) >= 1
+
+                for ronda in range(1, 5):
+                    # Cuenta ya creada (OTP aceptado aunque el script diga que falló el fill)
+                    if self._sesion_post_registro_detectada():
+                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Sesión/cuenta ya activa "
+                              f"(OTP aceptado por Tidal). Continuando...{Color.ENDC}")
+                        codigo_aceptado = True
+                        break
+
+                    codigo = codigo_guardado
+                    if not codigo:
+                        print(f"  [Registro] Buscando código de registro vía IMAP (ronda {ronda}/4)...")
+                        for intento in range(1, 8):
+                            print(f"  [Registro] Intento {intento}/7: Buscando correo...")
+                            codigo = obtener_codigo_via_imap(
+                                gmail_user=self.client_email,
+                                required_keywords=[
+                                    "registr", "bienven", "código", "code",
+                                    "verific", "sign-up", "signup", "sign up",
+                                ],
+                                query_exclude="cancel",
+                                after_email_id=max_id_previo,
+                            )
+                            if codigo:
+                                codigo_guardado = codigo
+                                break
+                            if intento < 7:
+                                # Mientras esperamos el mail, la UI pudo haber avanzado sola
+                                if self._sesion_post_registro_detectada():
+                                    codigo_aceptado = True
+                                    break
+                                print("  [Registro] Correo no encontrado aún. Esperando 5 segundos...")
+                                time.sleep(5.0)
+                        if codigo_aceptado:
                             break
-                        if intento < 7:
-                            print("  [Registro] Correo no encontrado aún. Esperando 5 segundos...")
-                            time.sleep(5.0)
+                    else:
+                        print(f"  [Registro] [{self.client_email}] Reutilizando OTP ya leído "
+                              f"({codigo}) — reintento de relleno {ronda}/4...")
 
                     if not codigo:
+                        # Última oportunidad: a veces el OTP se escribió pero la lectura falló
+                        # y la cuenta ya quedó creada.
+                        if self._confirmar_registro_completado(timeout_s=10.0):
+                            print(f"  [Registro] {Color.GREEN}[{self.client_email}] Cuenta ya registrada "
+                                  f"pese a no re-leer OTP. Continuando...{Color.ENDC}")
+                            codigo_aceptado = True
+                            break
                         ultimo_error_codigo = "No se pudo extraer el código de verificación del correo."
                         break
 
@@ -6190,24 +6280,59 @@ class TidalRegisterManager:
                         codigo_aceptado = True
                         break
 
-                    # Esperar las 6 cajas OTP de "Verify your email"
-                    esperar_locator_en_frames(
-                        self.page,
-                        [
-                            'input[autocomplete="one-time-code"]',
-                            'input[maxlength="1"]',
-                            'input[name="code"]',
-                            'input[inputmode="numeric"]',
-                            'input[type="text"]',
-                        ],
-                        timeout_s=12.0,
-                    )
-                    time.sleep(0.4)
+                    ui_otp = _esperar_ui_otp_registro(22.0)
+                    if self._sesion_post_registro_detectada():
+                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Registro ya completado "
+                              f"(sin cajas OTP). Continuando a confirmación...{Color.ENDC}")
+                        codigo_aceptado = True
+                        break
+                    if not ui_otp:
+                        print(f"  [Registro] {Color.WARNING}[WARN] [{self.client_email}] "
+                              f"Aún no aparecen las cajas OTP. Reintentando...{Color.ENDC}")
+                        ultimo_error_codigo = "No aparecieron las cajas del código OTP de registro."
+                        time.sleep(1.5)
+                        continue
 
+                    time.sleep(0.5)
                     print(f"  [Registro] [{self.client_email}] Escribiendo código OTP ({codigo})...")
-                    if not escribir_codigo_verificacion_inteligente(self.page, codigo):
+                    fill_ok = False
+                    for intento_fill in range(1, 4):
+                        if self._sesion_post_registro_detectada():
+                            fill_ok = True
+                            break
+                        wrote = escribir_codigo_verificacion_inteligente(self.page, codigo)
+                        # React a veces no deja leer el value aunque el OTP ya se envió
+                        time.sleep(1.0)
+                        if self._sesion_post_registro_detectada():
+                            print(f"  [Registro] [{self.client_email}] OTP aceptado por Tidal "
+                                  f"(sesión detectada tras el intento de relleno).")
+                            fill_ok = True
+                            break
+                        if wrote:
+                            fill_ok = True
+                            break
+                        print(f"  [Registro] {Color.WARNING}[WARN] Relleno OTP falló "
+                              f"(intento {intento_fill}/3). Esperando UI...{Color.ENDC}")
+                        time.sleep(1.2)
+                        _esperar_ui_otp_registro(8.0)
+                        if self._sesion_post_registro_detectada():
+                            fill_ok = True
+                            break
+
+                    if not fill_ok:
+                        # React a veces acepta el teclado aunque input_value no se lea: confirmar igual
+                        try:
+                            self.page.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        if self._sesion_post_registro_detectada():
+                            print(f"  [Registro] {Color.GREEN}[{self.client_email}] Cuenta activa tras "
+                                  f"confirmar OTP (lectura de cajas falló, pero Tidal aceptó).{Color.ENDC}")
+                            codigo_aceptado = True
+                            break
                         print(f"  [Registro] {Color.WARNING}[WARN] No se pudo rellenar las cajas OTP; "
-                              f"reintentando...{Color.ENDC}")
+                              f"se reintenta con el mismo código (sin buscar otro correo).{Color.ENDC}")
                         ultimo_error_codigo = "No se pudieron rellenar las cajas del código OTP."
                         time.sleep(1.0)
                         continue
@@ -6251,6 +6376,11 @@ class TidalRegisterManager:
 
                     # Dar tiempo a Tidal a validar antes de decidir rechazo
                     time.sleep(2.5)
+                    if self._sesion_post_registro_detectada():
+                        codigo_aceptado = True
+                        print("  [Registro] Código aceptado. Esperando procesamiento de la cuenta...")
+                        break
+
                     try:
                         texto_err = self.page.evaluate(
                             "() => document.body ? document.body.innerText.toLowerCase() : ''"
@@ -6260,15 +6390,17 @@ class TidalRegisterManager:
 
                     sigue_en_otp = False
                     try:
-                        sigue_en_otp = bool(encontrar_locator_en_frames(
-                            self.page,
-                            [
-                                'input[maxlength="1"]',
-                                'input[autocomplete="one-time-code"]',
-                                'input[name="code"]',
-                                'input[inputmode="numeric"]',
-                            ]
-                        ))
+                        sigue_en_otp = contar_cajas_otp_visibles(self.page) >= 4 or bool(
+                            encontrar_locator_en_frames(
+                                self.page,
+                                [
+                                    'input[maxlength="1"]',
+                                    'input[autocomplete="one-time-code"]',
+                                    'input[name="code"]',
+                                    'input[inputmode="numeric"]',
+                                ]
+                            )
+                        )
                     except Exception:
                         pass
 
@@ -6278,7 +6410,7 @@ class TidalRegisterManager:
                         ultimo_error_codigo = (
                             f"Tidal rechazó el código de verificación para {self.client_email}."
                         )
-                        # Resend + nuevo baseline para no reutilizar el mismo UID
+                        codigo_guardado = None  # forzar nuevo IMAP tras Resend
                         try:
                             btn_resend = esperar_locator_en_frames(
                                 self.page,
@@ -6303,10 +6435,17 @@ class TidalRegisterManager:
                     break
 
                 if not codigo_aceptado:
-                    raise RuntimeError(
-                        ultimo_error_codigo
-                        or f"No se pudo verificar el correo de registro para {self.client_email}."
-                    )
+                    print(f"  [Registro] [{self.client_email}] Última comprobación: ¿la cuenta "
+                          f"quedó creada aunque falló la verificación OTP?")
+                    if self._confirmar_registro_completado(timeout_s=15.0):
+                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Sí: sesión activa. "
+                              f"Se continúa a TuneMyMusic.{Color.ENDC}")
+                        codigo_aceptado = True
+                    else:
+                        raise RuntimeError(
+                            ultimo_error_codigo
+                            or f"No se pudo verificar el correo de registro para {self.client_email}."
+                        )
             
             print("  [Registro] Esperando redirección automática al perfil o cuenta...")
             # Opción 8: confirmación más corta; no hace falta quemar 60s si la sesión ya está.
@@ -6334,6 +6473,28 @@ class TidalRegisterManager:
                 
         except Exception as e:
             print(f"  {Color.FAIL}[ERROR] Falló el registro para {self.client_email}: {e}{Color.ENDC}")
+            # A veces Tidal ya creó la cuenta (OTP aceptado) pero el script falló al leer las cajas.
+            # Si la sesión sigue viva, no cerrar en falso: continuar hacia TuneMyMusic.
+            try:
+                if (
+                    not cerrar_navegador_al_final
+                    and self.page
+                    and not self.page.is_closed()
+                    and self._confirmar_registro_completado(timeout_s=12.0)
+                ):
+                    print(f"  [Registro] {Color.GREEN}[{self.client_email}] La cuenta SÍ quedó registrada. "
+                          f"Se ignora el error OTP y se continúa a TuneMyMusic.{Color.ENDC}")
+                    registro_exitoso = True
+                    try:
+                        cookies_proxy = self.context.cookies()
+                        self.cookies_tidal = [
+                            c for c in cookies_proxy if "tidal.com" in c.get("domain", "")
+                        ]
+                    except Exception:
+                        self.cookies_tidal = []
+                    return True
+            except Exception:
+                pass
             return False
         finally:
             if cerrar_navegador_al_final:
@@ -6370,6 +6531,40 @@ class TidalRegisterManager:
                 return
             except Exception:
                 time.sleep(1.5)
+
+    def _sesion_post_registro_detectada(self) -> bool:
+        """True si tras el OTP ya hay sesión de cuenta (aunque el relleno OTP diga fallo).
+
+        React a veces no deja leer el value de las cajas, el script cree que falló, pero
+        Tidal ya aceptó el código y redirigió a account/listen.
+        """
+        try:
+            self.page = pagina_vigente(self.page)
+            if not self.page or self.page.is_closed():
+                return False
+            url = (self.page.url or "").lower()
+            if self._url_indica_cuenta_activa(url):
+                hay_login = False
+                try:
+                    hay_login = bool(encontrar_locator_en_frames(
+                        self.page,
+                        ['input[type="email"]', 'input[name="email"]', '#email'],
+                    ))
+                except Exception:
+                    pass
+                if not hay_login:
+                    return True
+            # Sin cajas OTP y fuera del flujo de signup/verify
+            n_otp = contar_cajas_otp_visibles(self.page)
+            if n_otp == 0 and (
+                "account.tidal.com" in url
+                or "listen.tidal.com" in url
+                or "tidal.com/browse" in url
+            ) and "login.tidal.com" not in url and "/authorize" not in url:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _url_indica_cuenta_activa(self, url: str) -> bool:
         u = (url or "").lower()
@@ -7016,7 +7211,7 @@ class TidalRegisterManager:
         try:
             with TITULARES_FILE_LOCK:
                 titulares_existentes, path_tit = cargar_titulares_familiares()
-                if any(t["correo"].lower() == self.client_email.lower() for t in titulares_existentes):
+                if any(correos_iguales_exacto(t["correo"], self.client_email) for t in titulares_existentes):
                     return
                 titulares_existentes.append({
                     "correo": self.client_email,
@@ -8288,13 +8483,16 @@ def cargar_titulares_familiares() -> tuple[list[dict], Path]:
 
 def guardar_titulares_familiares(titulares: list[dict], path: Path):
     """Guarda en formato por bloques TITULAR / MIEMBROS, preservando el plan de invitaciones."""
-    # Conservar miembros_invitar del archivo si el dict en memoria no lo trae
+    # Conservar miembros_invitar del archivo si el dict en memoria no lo trae.
+    # Clave EXACTA (con puntos): no usar clean_email/son_correos_equivalentes.
     if path.exists():
         try:
             existentes, _ = parsear_titular_familiar_txt_opcion11(path)
-            by_key = {clean_email(t.get("correo", "")): t for t in existentes}
+            by_key = {
+                (t.get("correo") or "").strip().lower(): t for t in existentes
+            }
             for t in titulares:
-                key = clean_email(t.get("correo", ""))
+                key = (t.get("correo") or "").strip().lower()
                 if not t.get("miembros_invitar") and key in by_key:
                     t["miembros_invitar"] = list(by_key[key].get("miembros_invitar") or [])
         except Exception:
@@ -9149,10 +9347,13 @@ class TidalFamilyInviter:
             
             raw_miembros = resultado.get("miembros", [])
             miembros_reales = []
+            titular_l = (titular.get("correo") or "").strip().lower()
             for m in raw_miembros:
                 m_clean = m.strip().rstrip('.').lower()
-                if m_clean and m_clean not in miembros_reales and m_clean != titular["correo"].strip().lower():
-                    miembros_reales.append(m_clean)
+                # Exacto con puntos: no colapsar aliases Gmail del titular
+                if m_clean and m_clean != titular_l and m_clean not in miembros_reales:
+                    if not correos_iguales_exacto(m_clean, titular_l):
+                        miembros_reales.append(m_clean)
 
             is_full_text = resultado.get("isFullText", False)
             has_add_button = resultado.get("hasAddButton", False)
@@ -9187,20 +9388,19 @@ class TidalFamilyInviter:
 
     @staticmethod
     def _normalizar_correo(email: str) -> str:
-        if not email:
-            return ""
-        email = email.strip().lower()
-        partes = email.split("@")
-        if len(partes) == 2:
-            return f"{partes[0].replace('.', '')}@{partes[1]}"
-        return email
+        """Normaliza para comparar titulares: minúsculas, SIN quitar puntos de Gmail.
+
+        s.oftcake78.8 y s.of.tcake7.88 son titulares distintos en Tidal.
+        """
+        return (email or "").strip().lower().rstrip(".")
 
     def _sesion_titular_activa(self, titular) -> bool:
         """Comprueba contra Tidal que la sesión abierta pertenece al titular esperado."""
         try:
             curr_url = self.page.url.lower()
             if "account.tidal.com" in curr_url and "/login" not in curr_url and "family" in curr_url:
-                return True
+                # En /family hace falta verificar el correo del perfil: no asumir por URL
+                pass
 
             self.page.goto("https://account.tidal.com/profile", wait_until="domcontentloaded", timeout=30000)
             manejar_bloqueos_e_intervencion(self.page, f"Invitador Titular ({titular['correo']})")
@@ -9216,12 +9416,24 @@ class TidalFamilyInviter:
                 if "login" in curr_url or "authorize" in curr_url:
                     return False
                 email_detectado = self.page.evaluate("""() => {
+                    // Preferir el campo de correo del perfil (no el primer email del body,
+                    // que puede ser un miembro del plan familiar).
                     const el = document.querySelector('input[type="email"], input[name="email"], #email');
                     if (el && el.value) return el.value.trim().toLowerCase();
-                    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;
-                    const bodyText = document.body ? document.body.innerText : '';
-                    const matches = bodyText.match(emailRegex);
-                    return matches ? matches[0].trim().toLowerCase() : '';
+                    const labels = Array.from(document.querySelectorAll('label, span, p, div, dt, dd'));
+                    for (const n of labels) {
+                        const t = (n.textContent || '').trim().toLowerCase();
+                        if (t === 'correo electrónico' || t === 'email' || t === 'e-mail') {
+                            const sib = n.parentElement;
+                            if (sib) {
+                                const m = (sib.innerText || '').match(
+                                    /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/
+                                );
+                                if (m) return m[0].trim().toLowerCase();
+                            }
+                        }
+                    }
+                    return '';
                 }""")
                 if email_detectado:
                     break
@@ -9231,11 +9443,13 @@ class TidalFamilyInviter:
                 return False
 
             print(f"  [Inviter] Sesión activa detectada en Chrome para: {email_detectado}")
-            if self._normalizar_correo(email_detectado) == self._normalizar_correo(titular["correo"]):
+            # EXACTO con puntos: no usar son_correos_equivalentes / quitar puntos
+            if correos_iguales_exacto(email_detectado, titular["correo"]):
                 print(f"  [Inviter] {Color.GREEN}Sesión confirmada para el titular correcto: {titular['correo']}{Color.ENDC}")
                 return True
 
-            print(f"  [Inviter] Sesión de cuenta incorrecta ({email_detectado}). Cerrando sesión...")
+            print(f"  [Inviter] Sesión de cuenta incorrecta ({email_detectado} ≠ {titular['correo']}). "
+                  f"Cerrando sesión...")
             self.logout_titular()
         except Exception as e:
             print(f"  [Inviter] [WARN] Error al verificar sesión activa: {e}")
@@ -13106,9 +13320,15 @@ def registrar_cuentas_tidal(correos):
     event_subir_csv = threading.Event()
     cancelar_tmm = threading.Event()
 
-    def _marcar_fin_fase_registro():
+    def _marcar_fin_fase_registro(marcado_ref: dict):
+        """Marca fin de fase una sola vez por hilo (evita deadlock si falla tras el registro)."""
         nonlocal pendientes_fase_registro
+        if marcado_ref.get("ok"):
+            return
         with estado_lock:
+            if marcado_ref.get("ok"):
+                return
+            marcado_ref["ok"] = True
             pendientes_fase_registro -= 1
             if pendientes_fase_registro <= 0:
                 fase_registro_lista.set()
@@ -13119,6 +13339,7 @@ def registrar_cuentas_tidal(correos):
         p_pe_server = p_pe_user = p_pe_pass = None
         manager = None
         exito = False
+        fase_marcada = {"ok": False}
         try:
             if use_proxy and valid_ng_list:
                 p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico()
@@ -13182,7 +13403,8 @@ def registrar_cuentas_tidal(correos):
                 if tmm_ok:
                     successful_managers.append(manager)
 
-            _marcar_fin_fase_registro()
+            # Liberar el resumen principal YA (no esperar a completar TMM).
+            _marcar_fin_fase_registro(fase_marcada)
 
             if not tmm_ok:
                 try:
@@ -13198,7 +13420,7 @@ def registrar_cuentas_tidal(correos):
             # Esperar ENTER del hilo principal (mismo hilo Playwright que el registro).
             manager.completar_transferencia_tmm(event_subir_csv, cancelar_event=cancelar_tmm)
             return correo, True, manager
-        except Exception:
+        except Exception as e_reg:
             # Asegurar cierre de Chrome si el fallo ocurrió a mitad del proceso
             if manager is not None:
                 try:
@@ -13208,6 +13430,7 @@ def registrar_cuentas_tidal(correos):
             with estado_lock:
                 if not exito:
                     fail_count += 1
+            print(f"  {Color.FAIL}[ERROR] Excepción en registro/TMM de {correo}: {e_reg}{Color.ENDC}")
             raise
         finally:
             cerrar_sesion_imap_hilo()
@@ -13225,11 +13448,14 @@ def registrar_cuentas_tidal(correos):
                 if manager is not None:
                     manager.proxy_ng_server = None
                     manager.proxy_pe_server = None
-            # Si hubo éxito, la fase registro ya se marcó arriba. Si falló antes, marcar aquí.
-            if not exito:
-                _marcar_fin_fase_registro()
+            # Siempre marcar fin de fase (idempotente): evita que el resumen se quede colgado
+            # si falla entre registro OK y el mark explícito de arriba.
+            _marcar_fin_fase_registro(fase_marcada)
 
     # Ejecutar de manera simultánea
+    if not correos:
+        print(f"\n{Color.WARNING}[Opción 8] No hay correos para registrar.{Color.ENDC}")
+        return
     workers = min(10, len(correos))
     print(f"\n{Color.CYAN}{Color.BOLD}Iniciando registro de {len(correos)} cuentas de forma simultánea (usando {workers} hilos)...{Color.ENDC}\n")
     print(f"{Color.CYAN}Cada cuenta abrirá TuneMyMusic en cuanto termine el registro (sin cerrar Chrome).{Color.ENDC}\n")
@@ -13257,42 +13483,51 @@ def registrar_cuentas_tidal(correos):
             print(f"\n{Color.CYAN}{Color.BOLD}TuneMyMusic ya debería estar abierto en las "
                   f"{len(managers_ok)} cuentas exitosas.{Color.ENDC}")
 
-            DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
-            # Emparejamiento exclusivo 1:1 antes de ENTER: evita que dos cuentas tomen el mismo CSV.
-            asignaciones = asignar_csvs_a_cuentas([mgr.client_email for mgr in managers_ok])
-            con_csv = []
-            sin_csv = []
-            for mgr in managers_ok:
-                ruta = asignaciones.get(mgr.client_email)
-                mgr.csv_asignado = ruta
-                if ruta and csv_pertenece_a_cuenta(ruta, mgr.client_email):
-                    con_csv.append((mgr.client_email, ruta.name, ruta.stat().st_size))
-                else:
-                    mgr.csv_asignado = None
-                    sin_csv.append(mgr.client_email)
-
-            print(f"\n{Color.CYAN}[CSV] Emparejados {len(con_csv)}/{len(managers_ok)} "
-                  f"(1 archivo ↔ 1 cuenta Tidal) en 'descargas/'.{Color.ENDC}")
-            for email, nombre, nbytes in con_csv:
-                marca = "" if nombre.lower() == f"{email.lower()}.csv" else " [alias]"
-                print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes){marca}")
-            if sin_csv:
-                print(f"\n{Color.WARNING}[CSV] Sin archivo exclusivo (o ambiguo) para:{Color.ENDC}")
-                for email in sin_csv:
-                    print(f"  {Color.FAIL}✗{Color.ENDC} {email}  (espera: descargas/{email}.csv)")
-                print(f"{Color.WARNING}Esas ventanas permanecerán abiertas para subida manual "
-                      f"si al pulsar ENTER aún no hay CSV con el nombre exacto de la cuenta.{Color.ENDC}")
-                cont = input("¿Continuar con la subida en TuneMyMusic de todas formas? (s/n, por defecto 's'): ").strip().lower()
-                if cont in ("n", "no"):
-                    print(f"{Color.CYAN}Transferencia TuneMyMusic cancelada. Cerrando ventanas...{Color.ENDC}")
-                    cancelar_tmm.set()
-                    for future in as_completed(futures):
+            try:
+                DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
+                # Emparejamiento exclusivo 1:1 antes de ENTER: evita que dos cuentas tomen el mismo CSV.
+                asignaciones = asignar_csvs_a_cuentas([mgr.client_email for mgr in managers_ok])
+                con_csv = []
+                sin_csv = []
+                for mgr in managers_ok:
+                    ruta = asignaciones.get(mgr.client_email)
+                    mgr.csv_asignado = ruta
+                    if ruta and csv_pertenece_a_cuenta(ruta, mgr.client_email):
                         try:
-                            future.result()
+                            nbytes = ruta.stat().st_size
                         except Exception:
-                            pass
-                    print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
-                    return
+                            nbytes = 0
+                        con_csv.append((mgr.client_email, ruta.name, nbytes))
+                    else:
+                        mgr.csv_asignado = None
+                        sin_csv.append(mgr.client_email)
+
+                print(f"\n{Color.CYAN}[CSV] Emparejados {len(con_csv)}/{len(managers_ok)} "
+                      f"(1 archivo ↔ 1 cuenta Tidal) en 'descargas/'.{Color.ENDC}")
+                for email, nombre, nbytes in con_csv:
+                    marca = "" if nombre.lower() == f"{email.lower()}.csv" else " [alias]"
+                    print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes){marca}")
+                if sin_csv:
+                    print(f"\n{Color.WARNING}[CSV] Sin archivo exclusivo (o ambiguo) para:{Color.ENDC}")
+                    for email in sin_csv:
+                        print(f"  {Color.FAIL}✗{Color.ENDC} {email}  (espera: descargas/{email}.csv)")
+                    print(f"{Color.WARNING}Esas ventanas permanecerán abiertas para subida manual "
+                          f"si al pulsar ENTER aún no hay CSV con el nombre exacto de la cuenta.{Color.ENDC}")
+                    cont = input("¿Continuar con la subida en TuneMyMusic de todas formas? (s/n, por defecto 's'): ").strip().lower()
+                    if cont in ("n", "no"):
+                        print(f"{Color.CYAN}Transferencia TuneMyMusic cancelada. Cerrando ventanas...{Color.ENDC}")
+                        cancelar_tmm.set()
+                        for future in as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception:
+                                pass
+                        print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+                        return
+            except Exception as e_csv:
+                print(f"  {Color.FAIL}[CSV] Error al emparejar archivos tras el registro: {e_csv}{Color.ENDC}")
+                print(f"  {Color.WARNING}Se continúa igual: pulsa ENTER cuando el selector CSV esté listo "
+                      f"en cada TuneMyMusic.{Color.ENDC}")
 
             input(f"\n{Color.BOLD}>>> Prepara el selector de archivo CSV en CADA TuneMyMusic "
                   f"(todas las ventanas) y luego presiona ENTER.\n"
@@ -13520,7 +13755,8 @@ def invitar_al_plan_familiar_opcion11():
 
     def _ya_invitado(titular: dict, miembro: str) -> bool:
         for m in titular.get("miembros") or []:
-            if son_correos_equivalentes(m, miembro) or clean_email(m) == clean_email(miembro):
+            # Exacto con puntos: en Tidal cada variante con puntos es otra cuenta
+            if correos_iguales_exacto(m, miembro):
                 return True
         return False
 
