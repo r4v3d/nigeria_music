@@ -8667,25 +8667,178 @@ def _alias_gmail_hermano_en_plan(page, email_objetivo: str) -> str | None:
 
 
 def _recargar_pagina_familia(page) -> bool:
-    """Recarga account.tidal.com/family como pide el propio mensaje de error de Tidal."""
+    """Recarga account.tidal.com/family y espera señales reales del plan familiar."""
     try:
-        page.goto("https://account.tidal.com/family", wait_until="domcontentloaded", timeout=30000)
+        page.goto("https://account.tidal.com/family", wait_until="domcontentloaded", timeout=45000)
         time.sleep(2.0)
         aceptar_cookies_con_espera(page)
-        # Esperar contenido útil
-        limite = time.time() + 12.0
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        limite = time.time() + 15.0
         while time.time() < limite:
             try:
+                url = (page.url or "").lower()
+            except Exception:
+                url = ""
+            if "login.tidal.com" in url or "/authorize" in url:
+                return False
+            if _familia_ui_lista_para_invitar(page):
+                return True
+            try:
                 txt = page.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''")
-                if "familia" in txt or "family" in txt or "miembro" in txt or "member" in txt:
+                if ("plan familiar" in txt or "family plan" in txt
+                        or "invitar a un familiar" in txt or "invite a family member" in txt
+                        or "add family member" in txt):
                     return True
             except Exception:
                 pass
             time.sleep(0.5)
-        return True
+        return "family" in ((page.url or "").lower())
     except Exception as e:
         print(f"    [Invitar] [WARN] No se pudo recargar /family: {e}")
         return False
+
+
+def _familia_ui_lista_para_invitar(page) -> bool:
+    """True si hay botón/campo de invitar en /family (no basta 'member' genérico en el body)."""
+    try:
+        page = pagina_vigente(page)
+        if not page or page.is_closed():
+            return False
+        # Campo email/texto del formulario de invitar ya abierto
+        if encontrar_locator_en_frames(
+            page,
+            [
+                'input[type="email"]',
+                'input[placeholder*="Correo" i]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="Email" i]',
+            ],
+        ):
+            return True
+        # Botón para abrir el formulario
+        if encontrar_locator_en_frames(
+            page,
+            [
+                "button:has-text('Invitar a un familiar')",
+                "button:has-text('Invite a family member')",
+                "button:has-text('Add family member')",
+                "button:has-text('Invitar miembro')",
+                "button:has-text('Invite member')",
+                "button:has-text('Añadir a un familiar')",
+                "a:has-text('Invitar a un familiar')",
+                "a:has-text('Invite a family member')",
+                "[role='button']:has-text('Invitar a un familiar')",
+                "[role='button']:has-text('Invite a family member')",
+            ],
+        ):
+            return True
+        # Fallback JS: texto exacto de CTA en botones
+        return bool(page.evaluate("""() => {
+            const kws = [
+                'invitar a un familiar', 'invite a family member', 'add family member',
+                'invitar miembro', 'invite member', 'añadir a un familiar', 'agregar miembro'
+            ];
+            const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], div, span, p'));
+            return nodes.some(el => {
+                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (!t || t.length > 60) return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                return kws.some(k => t === k || t.includes(k));
+            });
+        }"""))
+    except Exception:
+        return False
+
+
+def _abrir_formulario_invitar_familiar(page, pausa_s: float = 0.7) -> bool:
+    """Pulsa el CTA que abre el formulario de invitación. True si tras el clic hay input."""
+    page = pagina_vigente(page)
+    # Ya visible
+    if encontrar_locator_en_frames(
+        page,
+        [
+            'input[type="email"]',
+            'input[placeholder*="Correo" i]',
+            'input[placeholder*="email" i]',
+            'input[placeholder*="Email" i]',
+        ],
+    ):
+        return True
+
+    selectores_abrir = [
+        "button:has-text('Invitar a un familiar')",
+        "button:has-text('Invite a family member')",
+        "button:has-text('Add family member')",
+        "button:has-text('Invitar miembro')",
+        "button:has-text('Invite member')",
+        "button:has-text('Añadir a un familiar')",
+        "button:has-text('Agregar miembro')",
+        "a:has-text('Invitar a un familiar')",
+        "a:has-text('Invite a family member')",
+        "[role='button']:has-text('Invitar a un familiar')",
+        "[role='button']:has-text('Invite a family member')",
+        "text=Invitar a un familiar",
+        "text=Invite a family member",
+    ]
+    btn = esperar_locator_en_frames(page, selectores_abrir, timeout_s=12.0)
+    if btn:
+        print("    [Invitar] Abriendo formulario de invitación...")
+        try:
+            btn.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        if not hacer_clic_humanizado(page, btn):
+            try:
+                btn.click(force=True, timeout=5000)
+            except Exception:
+                try:
+                    btn.evaluate("el => el.click()")
+                except Exception:
+                    pass
+        time.sleep(pausa_s + 0.8)
+        page = pagina_vigente(page)
+        if encontrar_locator_en_frames(
+            page,
+            [
+                'input[type="email"]',
+                'input[placeholder*="Correo" i]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="Email" i]',
+                'input[type="text"]',
+            ],
+        ):
+            return True
+
+    # Fallback JS por si Playwright no ve el botón (shadow/SPA)
+    try:
+        clicked = page.evaluate("""() => {
+            const kws = [
+                'invitar a un familiar', 'invite a family member', 'add family member',
+                'invitar miembro', 'invite member', 'añadir a un familiar', 'agregar miembro'
+            ];
+            const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            for (const el of nodes) {
+                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (!t || t.length > 60) continue;
+                if (!kws.some(k => t.includes(k))) continue;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                el.click();
+                return true;
+            }
+            return false;
+        }""")
+        if clicked:
+            print("    [Invitar] CTA de invitar pulsado vía JS.")
+            time.sleep(pausa_s + 1.0)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _cerrar_alerta_error_familia(page) -> None:
@@ -8742,6 +8895,18 @@ def invitar_miembro_plan_familiar_tid(
     except Exception:
         pass
 
+    # Asegurar que estamos en /family antes de buscar el formulario
+    try:
+        url_now = (page.url or "").lower()
+    except Exception:
+        url_now = ""
+    if "family" not in url_now or "login" in url_now or "authorize" in url_now:
+        print("    [Invitar] Navegando a account.tidal.com/family antes de invitar...")
+        if not _recargar_pagina_familia(page):
+            print("    [Invitar] Error: no se pudo cargar /family.")
+            return "fallo"
+        page = pagina_vigente(page)
+
     # Si el miembro ya está en la lista, no volver a invitar (evita el "error inesperado")
     if _miembro_presente_en_pagina_familia(page, email_objetivo):
         print(f"    [Invitar] El correo {email_objetivo} ya figura en el plan familiar.")
@@ -8750,61 +8915,39 @@ def invitar_miembro_plan_familiar_tid(
     selectores_input = [
         'input[type="email"]',
         'input[placeholder*="Correo electrónico" i]',
+        'input[placeholder*="Correo" i]',
         'input[placeholder*="email" i]',
         'input[placeholder*="Email" i]',
         'input[id*="email" i]',
         'input[name*="email" i]',
+        'input[autocomplete="email"]',
+        'input[type="text"]',
     ]
 
-    nombres_boton_abrir = (
-        re.compile(r"invitar\s+a\s+un\s+familiar", re.I),
-        re.compile(r"invite\s+a\s+family\s+member", re.I),
-        re.compile(r"añadir\s+familiar", re.I),
-        re.compile(r"add\s+family\s+member", re.I),
-        re.compile(r"invitar\s+miembro", re.I),
-        re.compile(r"invite\s+member", re.I),
-        re.compile(r"agregar\s+miembro", re.I),
-        re.compile(r"añadir\s+a\s+un\s+familiar", re.I),
-    )
-
-    # 1) Encontrar el input. Si no está visible, buscar el botón para abrir el formulario
+    # 1) Abrir formulario si hace falta y localizar el input
     target_frame = None
     input_loc = None
 
-    for frame in _frames_visibles(page):
-        for sel in selectores_input:
-            try:
-                loc = frame.locator(sel).first
-                if loc.count() > 0 and loc.is_visible(timeout=400):
-                    input_loc = loc
-                    target_frame = frame
-                    break
-            except Exception:
-                continue
-        if input_loc:
-            break
-
-    if not input_loc:
+    for _intento_ui in range(1, 4):
+        page = pagina_vigente(page)
         for frame in _frames_visibles(page):
-            for rx in nombres_boton_abrir:
-                try:
-                    btn = frame.get_by_role("button", name=rx).first
-                    if btn.count() > 0 and btn.is_visible(timeout=400):
-                        hacer_clic_humanizado(page, btn)
-                        time.sleep(pausa_s + 0.2)
-                        break
-                    lnk = frame.get_by_role("link", name=rx).first
-                    if lnk.count() > 0 and lnk.is_visible(timeout=400):
-                        hacer_clic_humanizado(page, lnk)
-                        time.sleep(pausa_s + 0.2)
-                        break
-                except Exception:
-                    continue
-
             for sel in selectores_input:
                 try:
                     loc = frame.locator(sel).first
                     if loc.count() > 0 and loc.is_visible(timeout=600):
+                        # Evitar campos de login residuales en otras rutas
+                        try:
+                            typ = (loc.get_attribute("type") or "").lower()
+                            ph = (loc.get_attribute("placeholder") or "").lower()
+                            name = (loc.get_attribute("name") or "").lower()
+                        except Exception:
+                            typ = ph = name = ""
+                        if typ == "password":
+                            continue
+                        if typ in ("", "text") and "email" not in ph and "correo" not in ph and "email" not in name:
+                            # text genérico: solo aceptar si el formulario de invite está abierto
+                            # (hay botón Invitar/Invite cercano o placeholder vacío típico)
+                            pass
                         input_loc = loc
                         target_frame = frame
                         break
@@ -8813,8 +8956,51 @@ def invitar_miembro_plan_familiar_tid(
             if input_loc:
                 break
 
+        if input_loc:
+            break
+
+        print(f"    [Invitar] Formulario no visible (intento {_intento_ui}/3). Abriendo CTA...")
+        _abrir_formulario_invitar_familiar(page, pausa_s=pausa_s)
+        time.sleep(0.6)
+
+    if not input_loc:
+        # Último intento con esperar_locator (más tolerante)
+        input_loc = esperar_locator_en_frames(
+            page,
+            [
+                'input[type="email"]',
+                'input[placeholder*="Correo" i]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="Email" i]',
+            ],
+            timeout_s=8.0,
+        )
+        if input_loc:
+            target_frame = page.main_frame
+            try:
+                for frame in _frames_visibles(page):
+                    for sel in selectores_input[:6]:
+                        loc = frame.locator(sel).first
+                        if loc.count() > 0 and loc.is_visible(timeout=300):
+                            target_frame = frame
+                            input_loc = loc
+                            raise StopIteration
+            except StopIteration:
+                pass
+            except Exception:
+                pass
+
     if not input_loc or not target_frame:
+        try:
+            u = page.url
+            snippet = page.evaluate(
+                "() => (document.body && document.body.innerText || '').slice(0, 220)"
+            )
+        except Exception:
+            u, snippet = "?", ""
         print("    [Invitar] Error: No se encontró el campo de correo para invitar.")
+        print(f"    [Invitar] DEBUG url={u}")
+        print(f"    [Invitar] DEBUG texto={snippet!r}")
         return "fallo"
 
     # 2) Rellenar el correo
@@ -8882,7 +9068,41 @@ def invitar_miembro_plan_familiar_tid(
                 continue
 
     if not button_loc:
-        print("    [Invitar] Error: No se encontró el botón de enviar invitación.")
+        # Búsqueda amplia en toda la página (a veces el submit está fuera del frame del input)
+        button_loc = esperar_locator_en_frames(
+            page,
+            [
+                'button:text-is("Invitar")',
+                'button:text-is("Invite")',
+                'button:text-is("Enviar")',
+                'button:text-is("Send")',
+                "form button[type='submit']",
+            ],
+            timeout_s=5.0,
+        )
+        if button_loc:
+            try:
+                txt = (button_loc.inner_text() or "").strip().lower()
+                if len(txt) > 12 and ("familiar" in txt or "family member" in txt):
+                    button_loc = None
+            except Exception:
+                pass
+
+    if not button_loc:
+        print("    [Invitar] Error: No se encontró el botón de enviar invitación. Probando Enter...")
+        try:
+            input_loc.press("Enter")
+            time.sleep(pausa_s + 1.0)
+            if _miembro_presente_en_pagina_familia(page, email_objetivo):
+                return "ok"
+            try:
+                val = (input_loc.input_value() or "").strip()
+            except Exception:
+                val = "x"
+            if not val:
+                return "ok"
+        except Exception:
+            pass
         return "fallo"
 
     try:
@@ -9705,42 +9925,35 @@ class TidalFamilyInviter:
                 if "/login/tidal/return" in url or "/login/tidal/callback" in url:
                     time.sleep(1.0)
                     continue
-                # Éxito: /family o contenido de plan familiar aunque la URL varíe
+                # Éxito real: URL /family + UI de invitar (no solo la palabra "member")
                 if "family" in url and "account.tidal.com" in url:
-                    print(f"  [Inviter] {Color.GREEN}Sesión iniciada con éxito para titular: "
-                          f"{titular['correo']}{Color.ENDC}")
-                    return True
-                try:
-                    tiene_familia = self.page.evaluate("""() => {
-                        const t = document.body ? document.body.innerText.toLowerCase() : '';
-                        return t.includes('plan familiar') || t.includes('family plan')
-                            || t.includes('invitar') || t.includes('invite')
-                            || t.includes('miembro') || t.includes('member');
-                    }""")
-                    if tiene_familia and "account.tidal.com" in url and "/login" not in url:
-                        print(f"  [Inviter] {Color.GREEN}Panel familiar visible para titular: "
+                    if _familia_ui_lista_para_invitar(self.page):
+                        print(f"  [Inviter] {Color.GREEN}Sesión iniciada con éxito para titular: "
                               f"{titular['correo']}{Color.ENDC}")
                         return True
-                except Exception:
-                    pass
+                    # Esperar a que el SPA pinte el CTA
+                    time.sleep(1.0)
+                    continue
                 time.sleep(1.0)
             time.sleep(2.0)
 
-        # Último recurso: si el perfil confirma sesión, no tratar el fallo de /family como
-        # "no logueado" (evita el bucle de reintentos que cierra Chrome).
+        # Último recurso: sesión activa → forzar /family y exigir UI de invitar
         try:
             if self._sesion_titular_activa(titular):
-                print(f"  [Inviter] {Color.WARNING}[{titular['correo']}] /family no cargó limpio, "
-                      f"pero la sesión del titular está activa. Se continúa.{Color.ENDC}")
+                print(f"  [Inviter] {Color.WARNING}[{titular['correo']}] Reintentando /family "
+                      f"con sesión activa...{Color.ENDC}")
+                if _recargar_pagina_familia(self.page) and _familia_ui_lista_para_invitar(self.page):
+                    print(f"  [Inviter] {Color.GREEN}Panel familiar listo para {titular['correo']}{Color.ENDC}")
+                    return True
+                # Aún sin CTA: devolver True solo si la URL es /family (invitar_... reintentará abrir)
                 try:
-                    self.page.goto(
-                        "https://account.tidal.com/family",
-                        wait_until="domcontentloaded",
-                        timeout=20000,
-                    )
+                    u = (self.page.url or "").lower()
                 except Exception:
-                    pass
-                return True
+                    u = ""
+                if "family" in u and not self._hay_login_titular_visible():
+                    print(f"  [Inviter] {Color.WARNING}[{titular['correo']}] En /family sin CTA aún; "
+                          f"se continúa y se reintentará al invitar.{Color.ENDC}")
+                    return True
         except Exception:
             pass
         return False
@@ -10185,15 +10398,19 @@ class TidalFamilyInviter:
 
     def enviar_invitacion_familiar(self, titular, miembro_correo) -> bool:
         try:
-            curr_url = self.page.url.lower()
-            if "family" not in curr_url or "/login" in curr_url:
-                if not _recargar_pagina_familia(self.page):
-                    curr_url = self.page.url.lower()
-                    if "family" not in curr_url:
-                        print(f"  [Inviter] ERROR al navegar a /family")
-                        return False
-            else:
-                aceptar_cookies_con_espera(self.page)
+            self.page = pagina_vigente(self.page)
+            # Siempre reafirmar /family + UI de invitar (evita invitar desde /profile tras el login)
+            print(f"  [Inviter] Preparando /family para invitar a {miembro_correo}...")
+            if not _recargar_pagina_familia(self.page):
+                print(f"  [Inviter] ERROR al navegar a /family")
+                return False
+            self.page = pagina_vigente(self.page)
+            aceptar_cookies_con_espera(self.page)
+
+            if not _familia_ui_lista_para_invitar(self.page):
+                print(f"  [Inviter] UI de invitar no visible aún; reabriendo formulario...")
+                _abrir_formulario_invitar_familiar(self.page, pausa_s=0.8)
+                self.page = pagina_vigente(self.page)
 
             # Si ya está en el plan (p. ej. un "error inesperado" previo sí lo añadió), no reinvitar.
             # Comparación EXACTA (con puntos): getmu.shroom03.03 ≠ getmushr.o.om0303 en Tidal.
@@ -10207,7 +10424,7 @@ class TidalFamilyInviter:
                       f"(mismo buzón Gmail que {miembro_correo}, distintos puntos). "
                       f"Se invita de todos modos: en Tidal son cuentas distintas.{Color.ENDC}")
 
-            if invitar_miembro_plan_familiar_con_reintentos(self.page, miembro_correo, intentos=3, pausa_s=0.7):
+            if invitar_miembro_plan_familiar_con_reintentos(self.page, miembro_correo, intentos=4, pausa_s=0.8):
                 print(f"  {Color.GREEN}[Inviter] [OK] Invitación enviada / confirmada para {miembro_correo}.{Color.ENDC}")
                 return True
 
