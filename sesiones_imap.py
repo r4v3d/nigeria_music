@@ -94,6 +94,9 @@ TMM_COOKIES_PATH = SCRIPT_DIR / "tmm_cookies.json"
 # Serializa escrituras de CSV en descargas/ (OneDrive + varias ventanas a la vez).
 DESCARGAS_CSV_LOCK = threading.Lock()
 DESCARGAS_DIR = SCRIPT_DIR / "descargas"
+# Reserva exclusiva archivo→cuenta (opción 8): evita que dos ventanas suban el mismo CSV.
+CSV_RESERVAS_LOCK = threading.Lock()
+CSV_RESERVAS: dict[str, str] = {}  # str(Path.resolve()) -> email dueño
 
 # Protege el fichero de titulares familiares: varias ventanas terminan su upgrade a la vez y
 # leer/escribir sin sincronizar hacía que unas cuentas sobrescribieran a otras.
@@ -171,29 +174,212 @@ def csv_parece_valido(path: Path, min_bytes: int = 32) -> bool:
         return False
 
 
-def resolver_csv_cuenta(client_email: str) -> Path | None:
-    """Localiza el CSV de una cuenta en descargas/ (nombre exacto o alias Gmail equivalente)."""
+def _csv_clave_reserva(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
+def csv_pertenece_a_cuenta(path: Path | None, client_email: str) -> bool:
+    """True solo si el nombre del CSV es el correo (o alias Gmail inequívoco)."""
+    if not path or not client_email:
+        return False
+    stem = path.stem.strip().lower()
+    email_l = client_email.strip().lower()
+    if not stem or "@" not in stem:
+        return False
+    return stem == email_l or son_correos_equivalentes(stem, email_l)
+
+
+def reservar_csv_para_cuenta(path: Path, client_email: str) -> bool:
+    """Reserva exclusiva del archivo para una cuenta. False si otra cuenta ya lo tiene."""
+    if not path or not client_email:
+        return False
+    email_l = client_email.strip().lower()
+    clave = _csv_clave_reserva(path)
+    with CSV_RESERVAS_LOCK:
+        dueño = CSV_RESERVAS.get(clave)
+        if dueño and dueño != email_l:
+            return False
+        CSV_RESERVAS[clave] = email_l
+        return True
+
+
+def liberar_reservas_csv_cuenta(client_email: str) -> None:
+    email_l = (client_email or "").strip().lower()
+    if not email_l:
+        return
+    with CSV_RESERVAS_LOCK:
+        for clave in [k for k, v in CSV_RESERVAS.items() if v == email_l]:
+            CSV_RESERVAS.pop(clave, None)
+
+
+def _csv_reservado_por_otra(path: Path, client_email: str) -> bool:
+    email_l = (client_email or "").strip().lower()
+    with CSV_RESERVAS_LOCK:
+        dueño = CSV_RESERVAS.get(_csv_clave_reserva(path))
+    return bool(dueño and dueño != email_l)
+
+
+def _listar_csvs_descargas() -> list[Path]:
     dest_dir = DESCARGAS_DIR
     if not dest_dir.exists():
+        return []
+    out = []
+    for f in dest_dir.glob("*.csv"):
+        if f.name.startswith("."):
+            continue
+        if csv_parece_valido(f):
+            out.append(f)
+    return out
+
+
+def _elegir_csv_preferido(candidatos: list[Path], client_email: str) -> Path | None:
+    if not candidatos:
         return None
+    email_l = client_email.strip().lower()
+
+    def _clave(p: Path):
+        try:
+            mtime = p.stat().st_mtime
+        except Exception:
+            mtime = 0.0
+        exact_case = 0 if p.stem == client_email else (1 if p.stem.lower() == email_l else 2)
+        return (exact_case, -mtime)
+
+    return sorted(candidatos, key=_clave)[0]
+
+
+def resolver_csv_cuenta(
+    client_email: str,
+    *,
+    permitir_alias: bool = True,
+    respetar_reservas: bool = True,
+) -> Path | None:
+    """Localiza el CSV de UNA cuenta en descargas/.
+
+    Orden: nombre exacto (case-insensitive) → alias Gmail solo si hay un único candidato
+    libre. Nunca usa startswith. Respeta reservas exclusivas de otras cuentas.
+    """
     email_l = (client_email or "").strip().lower()
     if not email_l:
         return None
-    exacto = dest_dir / f"{client_email}.csv"
-    if csv_parece_valido(exacto):
-        return exacto
-    # Exacto sin distinguir mayúsculas
-    for f in dest_dir.glob("*.csv"):
-        if f.stem.lower() == email_l and csv_parece_valido(f):
-            return f
-    # Alias Gmail (puntos / mayúsculas) — evita el startswith frágil que mezclaba cuentas
-    for f in dest_dir.glob("*.csv"):
-        stem = f.stem.strip().lower()
-        if "@" not in stem:
+    archivos = _listar_csvs_descargas()
+    if not archivos:
+        return None
+
+    exactos = []
+    aliases = []
+    for f in archivos:
+        if respetar_reservas and _csv_reservado_por_otra(f, email_l):
             continue
-        if son_correos_equivalentes(stem, email_l) and csv_parece_valido(f):
-            return f
+        stem = f.stem.strip().lower()
+        if stem == email_l:
+            exactos.append(f)
+        elif permitir_alias and "@" in stem and son_correos_equivalentes(stem, email_l):
+            aliases.append(f)
+
+    if exactos:
+        return _elegir_csv_preferido(exactos, client_email)
+    if permitir_alias and len(aliases) == 1:
+        return aliases[0]
     return None
+
+
+def asignar_csvs_a_cuentas(correos: list[str]) -> dict[str, Path | None]:
+    """Asigna CSV↔cuenta 1:1 para un lote (opción 8). Exacto primero; alias Gmail solo si único.
+
+    Un mismo archivo nunca se asigna a dos cuentas. Devuelve dict correo → Path|None.
+    """
+    resultado: dict[str, Path | None] = {c: None for c in correos}
+    if not correos:
+        return resultado
+
+    usados: set[str] = set()
+    archivos = _listar_csvs_descargas()
+
+    for correo in correos:
+        email_l = correo.strip().lower()
+        exactos = [
+            f for f in archivos
+            if f.stem.strip().lower() == email_l and _csv_clave_reserva(f) not in usados
+        ]
+        elegido = _elegir_csv_preferido(exactos, correo)
+        if elegido:
+            resultado[correo] = elegido
+            usados.add(_csv_clave_reserva(elegido))
+            reservar_csv_para_cuenta(elegido, correo)
+
+    for correo in correos:
+        if resultado[correo] is not None:
+            continue
+        email_l = correo.strip().lower()
+        aliases = []
+        for f in archivos:
+            clave = _csv_clave_reserva(f)
+            if clave in usados:
+                continue
+            stem = f.stem.strip().lower()
+            if "@" not in stem:
+                continue
+            if son_correos_equivalentes(stem, email_l):
+                aliases.append(f)
+        if len(aliases) == 1:
+            elegido = aliases[0]
+            resultado[correo] = elegido
+            usados.add(_csv_clave_reserva(elegido))
+            reservar_csv_para_cuenta(elegido, correo)
+        elif len(aliases) > 1:
+            nombres = ", ".join(a.name for a in aliases[:5])
+            print(f"  {Color.WARNING}[CSV] [{correo}] Alias Gmail ambiguo "
+                  f"({len(aliases)} archivos: {nombres}). "
+                  f"Renombra a '{correo}.csv' para emparejarlo.{Color.ENDC}")
+
+    return resultado
+
+
+def obtener_csv_para_subida(manager_o_email, *, reintentar_s: float = 0.0) -> Path | None:
+    """CSV definitivo para subir a TuneMyMusic: asignación previa del lote, validada.
+
+    Si hay `csv_asignado` válido y perteneciente a la cuenta, se usa ese (no se re-resuelve
+    a otro archivo). Si falta, se resuelve respetando reservas exclusivas.
+    """
+    if hasattr(manager_o_email, "client_email"):
+        email = manager_o_email.client_email
+        asignado = getattr(manager_o_email, "csv_asignado", None)
+    else:
+        email = manager_o_email
+        asignado = None
+
+    def _ok(path: Path | None) -> Path | None:
+        if not path:
+            return None
+        if not csv_parece_valido(path):
+            return None
+        if not csv_pertenece_a_cuenta(path, email):
+            print(f"  {Color.FAIL}[CSV] [{email}] Rechazado '{getattr(path, 'name', path)}': "
+                  f"no coincide con la cuenta Tidal.{Color.ENDC}")
+            return None
+        if not reservar_csv_para_cuenta(path, email):
+            print(f"  {Color.FAIL}[CSV] [{email}] '{path.name}' ya está reservado para otra cuenta.{Color.ENDC}")
+            return None
+        return path
+
+    path = _ok(asignado if isinstance(asignado, Path) else None)
+    if path:
+        return path
+
+    limite = time.time() + max(0.0, float(reintentar_s or 0.0))
+    while True:
+        path = _ok(resolver_csv_cuenta(email, permitir_alias=True, respetar_reservas=True))
+        if path:
+            if hasattr(manager_o_email, "client_email"):
+                manager_o_email.csv_asignado = path
+            return path
+        if time.time() >= limite:
+            return None
+        time.sleep(3.0)
 
 
 def guardar_csv_descarga_playwright(download, client_email: str) -> Path | None:
@@ -1890,7 +2076,11 @@ def _destinatario_es_para_alias(gmail_user: str, recipients_text: str, cuerpo_te
         return False
     objetivo_norm = _norm_dots_gmail(objetivo)
     texto = f"{recipients_text or ''} {cuerpo_text or ''}".lower()
+    texto = texto.replace("%40", "@")
     addrs = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+", texto)
+    # Alias exacto en texto (To/cuerpo), aunque el regex falle con basura HTML
+    if objetivo in texto:
+        return True
     if not addrs:
         return False
 
@@ -1915,6 +2105,81 @@ def _destinatario_es_para_alias(gmail_user: str, recipients_text: str, cuerpo_te
     #    asignar_enlaces_invitacion_a_correos(). Aquí se mantiene True para códigos/login
     #    de un solo hilo (To: canónico + alias con puntos).
     return True
+
+
+def _extraer_codigos_otp(texto: str) -> list[str]:
+    """Extrae códigos OTP de 5–6 dígitos priorizando los junto a 'code'/'código'.
+
+    Antes devolvía el primer número de 6 dígitos del HTML (fechas, tracking, etc.) y
+    descartaba OTP reales tipo 202431 por parecer un año → Tidal rechazaba el código.
+    """
+    if not texto:
+        return []
+    prioritarios: list[str] = []
+    normales: list[str] = []
+    vistos: set[str] = set()
+
+    def _es_basura(codigo: str, estricto_anio: bool) -> bool:
+        if codigo in {"00000", "000000", "11111", "111111"}:
+            return True
+        # Fechas YYYYMM sueltas en HTML (202401…) no son OTP; si viene junto a 'code', sí se acepta.
+        if estricto_anio and len(codigo) == 6 and codigo.startswith("20"):
+            try:
+                y, m = int(codigo[:4]), int(codigo[4:6])
+                if 2020 <= y <= 2039 and 1 <= m <= 12:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _add(codigo: str, prioritario: bool = False) -> None:
+        codigo = (codigo or "").strip()
+        if len(codigo) not in (5, 6) or not codigo.isdigit():
+            return
+        if _es_basura(codigo, estricto_anio=not prioritario):
+            return
+        if codigo in vistos:
+            return
+        vistos.add(codigo)
+        (prioritarios if prioritario else normales).append(codigo)
+
+    # 1) Junto a palabras de código (máxima prioridad)
+    for m in re.finditer(
+        r"(?:c[oó]digo|code|sign[-\s]?up\s*code|verification\s*code|one[-\s]?time|"
+        r"introduce|ingresa|enter|confirma|is)[^\d]{0,40}(\d{5,6})",
+        texto,
+        flags=re.I,
+    ):
+        _add(m.group(1), prioritario=True)
+
+    # 2) Dígitos partidos por HTML/espacios: "1 2 3 4 5 6"
+    for m in re.finditer(r"(?<!\d)(?:\d[\s\-]){4,5}\d(?!\d)", texto):
+        _add(re.sub(r"\D", "", m.group(0)), prioritario=True)
+
+    # 3) Cualquier 5–6 dígitos suelto (menor prioridad)
+    for m in re.findall(r"\b(\d{5,6})\b", texto):
+        _add(m, prioritario=False)
+
+    # Preferir 6 dígitos (Tidal sign-up) dentro de cada grupo
+    def _ordenar(grupo: list[str]) -> list[str]:
+        return sorted(grupo, key=lambda c: (0 if len(c) == 6 else 1, grupo.index(c)))
+
+    return _ordenar(prioritarios) + _ordenar(normales)
+
+
+def _texto_indica_codigo_invalido(texto: str) -> bool:
+    """True solo ante rechazo claro del OTP (no 'Resend' / textos genéricos)."""
+    t = (texto or "").lower()
+    if not t:
+        return False
+    frases = (
+        "código no válido", "codigo no valido", "invalid code", "incorrect code",
+        "código incorrecto", "codigo incorrecto", "wrong code", "code is incorrect",
+        "código erróneo", "codigo erroneo", "el código no es válido",
+        "the code is invalid", "code you entered is incorrect",
+        "that code isn't valid", "that code isnt valid",
+    )
+    return any(f in t for f in frases)
 
 
 KEYWORDS_INVITACION_FAMILIAR = [
@@ -2445,14 +2710,18 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             if query_exclude and query_exclude.lower() in text_to_check.lower():
                 continue
             
-            # Buscar codigo de 5 o 6 digitos - solo si no se solicita buscar un enlace exclusivamente
+            # OTP juntos, partidos por HTML ("1 2 3 4 5 6") o junto a "code/sign-up"
             if not solo_link:
-                codigos = re.findall(r"\b\d{5,6}\b", body_text)
+                codigos = _extraer_codigos_otp(text_to_check)
                 if codigos:
                     if not _reclamar_uid_correo(buzon_clave, msg_id_int):
                         continue
-                    print(f"    {Color.GREEN}[IMAP]{Color.ENDC} Código para {gmail_user} (UID {msg_id_int}).")
+                    print(f"    {Color.GREEN}[IMAP]{Color.ENDC} Código para {gmail_user} "
+                          f"(UID {msg_id_int}, OTP={codigos[0]}, asunto: {(subject_text or '')[:60]!r}).")
                     return codigos[0]
+                # Keywords OK pero sin OTP: útil para diagnosticar HTML partido / baseline
+                print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Correo Tidal UID {msg_id_int} coincide "
+                      f"({(subject_text or '')[:50]!r}) pero no se extrajo OTP de 5-6 dígitos.")
             
             # Buscar enlaces de confirmacion en el texto plano
             enlaces = []
@@ -3606,11 +3875,15 @@ def hacer_click_por_textos(page, textos: list) -> bool:
     return False
 
 def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
-    """Ingresa un código de verificación de forma inteligente (una o múltiples cajas)."""
+    """Ingresa un código de verificación (una caja o 6 cajas OTP). Exige lectura == código."""
+    codigo = re.sub(r"\D", "", str(codigo or ""))
+    if not codigo:
+        return False
+
     for frame in page.frames:
         try:
             code_inputs = []
-            for poll in range(8):
+            for poll in range(10):
                 inputs = frame.locator('input').all()
                 code_inputs = []
                 for ip in inputs:
@@ -3620,14 +3893,15 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                         type_attr = (ip.get_attribute("type") or "").lower()
                         if type_attr in ["email", "checkbox", "radio", "submit", "button", "file", "hidden", "range", "color"]:
                             continue
+                        if type_attr == "password" and (ip.get_attribute("maxlength") or "").strip() != "1":
+                            continue
                         mode = (ip.get_attribute("inputmode") or "").lower()
                         name = (ip.get_attribute("name") or "").lower()
                         placeholder = (ip.get_attribute("placeholder") or "").lower()
                         autocomplete = (ip.get_attribute("autocomplete") or "").lower()
                         maxlength = (ip.get_attribute("maxlength") or "").strip()
+                        aria = (ip.get_attribute("aria-label") or "").lower()
 
-                        # Un input sin atributo 'type' es de texto por defecto; las cajas de código
-                        # suelen llegar así, con maxlength="1" o autocomplete de un solo uso.
                         if (type_attr in ["", "text", "number", "tel", "password"] or
                             mode == "numeric" or
                             autocomplete == "one-time-code" or
@@ -3635,68 +3909,156 @@ def escribir_codigo_verificacion_inteligente(page, codigo: str) -> bool:
                             "code" in name or
                             "code" in placeholder or
                             "código" in placeholder or
-                            "codigo" in placeholder):
+                            "codigo" in placeholder or
+                            "digit" in aria or
+                            "código" in aria or
+                            "codigo" in aria):
                             code_inputs.append(ip)
                     except Exception:
                         pass
-                if len(code_inputs) >= len(codigo):
+                if len(code_inputs) >= min(4, len(codigo)) or (code_inputs and len(codigo) <= 8 and len(code_inputs) == 1):
                     break
-                time.sleep(0.5)
-            
+                time.sleep(0.35)
+
             if not code_inputs:
                 continue
-                
-            if len(code_inputs) >= 4:
-                objetivos = code_inputs[:len(codigo)]
 
-                def limpiar_cajas():
-                    for caja in objetivos:
+            def leer_cajas(objetivos):
+                leido = ""
+                for caja in objetivos:
+                    try:
+                        leido += (caja.input_value() or "").strip()
+                    except Exception:
+                        pass
+                return leido
+
+            def limpiar_cajas(objetivos):
+                for caja in objetivos:
+                    try:
+                        caja.click(timeout=800)
+                        caja.fill("")
+                    except Exception:
                         try:
-                            caja.click()
                             caja.press("Control+a")
                             caja.press("Backspace")
                         except Exception:
                             pass
 
-                def leer_cajas():
-                    leido = ""
-                    for caja in objetivos:
-                        try:
-                            leido += (caja.input_value() or "").strip()
-                        except Exception:
-                            pass
-                    return leido
+            # Varias cajas (Tidal: 6 inputs maxlength=1)
+            if len(code_inputs) >= 4:
+                objetivos = code_inputs[:len(codigo)]
+                if len(objetivos) < len(codigo):
+                    continue
 
-                # 1) Caja por caja, para componentes que no mueven el foco al teclear
-                limpiar_cajas()
-                for idx, digit in enumerate(codigo[:len(objetivos)]):
-                    try:
-                        objetivos[idx].click()
-                        objetivos[idx].type(digit, delay=120)
-                    except Exception:
-                        pass
-                    time.sleep(0.1)
-                if leer_cajas() == codigo:
-                    return True
-
-                # 2) Secuencia de teclado, para componentes que avanzan el foco solos
-                limpiar_cajas()
+                # 1) JS + eventos input/change (React controlado)
                 try:
-                    objetivos[0].click()
+                    ok_js = frame.evaluate(
+                        """([digitos]) => {
+                            const inputs = Array.from(document.querySelectorAll('input')).filter(el => {
+                                if (!el.offsetParent && el.type !== 'hidden') {
+                                    // visible check soft
+                                }
+                                const t = (el.type || '').toLowerCase();
+                                if (['email','checkbox','radio','submit','button','file','hidden'].includes(t)) return false;
+                                const max = el.getAttribute('maxlength') || '';
+                                const mode = (el.inputMode || '').toLowerCase();
+                                const ac = (el.autocomplete || '').toLowerCase();
+                                return max === '1' || mode === 'numeric' || ac === 'one-time-code' || t === '' || t === 'text' || t === 'tel' || t === 'number';
+                            }).filter(el => {
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0;
+                            });
+                            if (inputs.length < digitos.length) return false;
+                            const targets = inputs.slice(0, digitos.length);
+                            targets.forEach((el, i) => {
+                                el.focus();
+                                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                                if (setter) setter.call(el, digitos[i]);
+                                else el.value = digitos[i];
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: digitos[i] }));
+                            });
+                            return targets.every((el, i) => (el.value || '') === digitos[i]);
+                        }""",
+                        list(codigo),
+                    )
+                    if ok_js and leer_cajas(objetivos) == codigo:
+                        return True
                 except Exception:
                     pass
-                time.sleep(0.3)
+
+                # 2) Caja por caja con type()
+                limpiar_cajas(objetivos)
+                for idx, digit in enumerate(codigo):
+                    try:
+                        objetivos[idx].click(timeout=800)
+                        objetivos[idx].fill("")
+                        objetivos[idx].type(digit, delay=80)
+                    except Exception:
+                        try:
+                            objetivos[idx].fill(digit)
+                        except Exception:
+                            pass
+                    time.sleep(0.05)
+                if leer_cajas(objetivos) == codigo:
+                    return True
+
+                # 3) Secuencia de teclado desde la primera caja
+                limpiar_cajas(objetivos)
+                try:
+                    objetivos[0].click(timeout=800)
+                except Exception:
+                    pass
+                time.sleep(0.2)
                 for digit in codigo:
-                    page.keyboard.type(digit, delay=150)
-                    time.sleep(0.15)
-                leido_final = leer_cajas()
-                return leido_final == codigo or leido_final == ""
-            else:
-                target = code_inputs[0]
-                target.focus()
+                    try:
+                        page.keyboard.type(digit, delay=100)
+                    except Exception:
+                        break
+                    time.sleep(0.08)
+                if leer_cajas(objetivos) == codigo:
+                    return True
+                # Nunca tratar cajas vacías como éxito
+                continue
+
+            # Una sola caja
+            target = code_inputs[0]
+            try:
+                target.click(timeout=800)
                 target.fill("")
-                target.type(codigo, delay=150)
-                return True
+                target.type(codigo, delay=80)
+            except Exception:
+                try:
+                    target.fill(codigo)
+                except Exception:
+                    continue
+            try:
+                if (target.input_value() or "").strip() == codigo:
+                    return True
+            except Exception:
+                pass
+            # Fallback JS
+            try:
+                ok = frame.evaluate(
+                    """(code) => {
+                        const el = document.querySelector('input[autocomplete="one-time-code"]')
+                            || document.querySelector('input[name="code"]')
+                            || document.querySelector('input[inputmode="numeric"]');
+                        if (!el) return false;
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) setter.call(el, code);
+                        else el.value = code;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return (el.value || '') === code;
+                    }""",
+                    codigo,
+                )
+                if ok:
+                    return True
+            except Exception:
+                pass
         except Exception:
             continue
     return False
@@ -4505,6 +4867,8 @@ class TidalRegisterManager:
         self.pagos_bloqueados = set()
         self._rotaciones_antibot = 0
         self._recuperaciones_error_tidal = 0
+        # CSV fijado 1:1 en la opción 8 (asignar_csvs_a_cuentas); no re-resolver a otro archivo.
+        self.csv_asignado = None
         
         email_safe = re.sub(r'[^a-zA-Z0-9]', '_', client_email)
         self.main_profile = Path(tempfile.gettempdir()) / f"tidal_reg_{email_safe}_{random.randint(1000, 9999)}"
@@ -5139,70 +5503,394 @@ class TidalRegisterManager:
             """)
             time.sleep(1.0)
             
-            # Con varios alias con puntos del mismo Gmail, serializar Suscríbete + lectura del
-            # código evita que un hilo robe el correo del otro y se quede colgado en /authorize.
+            # Serializar Suscríbete + IMAP + envío OTP por buzón Gmail (aliases con puntos).
             with _lock_registro_mismo_buzon(self.client_email):
                 max_id_previo = obtener_max_email_id(self.client_email)
 
-                print("  [Registro] Pulsando botón 'Suscríbete'...")
-                btn_sub = esperar_locator_en_frames(
-                    self.page,
-                    ["button:has-text('Suscríbete')", "button:has-text('Subscribe')", "button[type='submit']"],
-                    timeout_s=5.0
-                )
-                if btn_sub:
+                def _pantalla_otp_registro() -> bool:
                     try:
-                        btn_sub.click(force=True)
+                        self.page = pagina_vigente(self.page)
+                        if not self.page or self.page.is_closed():
+                            return False
+                        return bool(self.page.evaluate("""() => {
+                            const t = document.body ? document.body.innerText.toLowerCase() : '';
+                            const frases = [
+                                'verify your email', 'verifica tu correo', 'verifica tu email',
+                                'verificar tu correo', 'verificar correo', 'confirma tu correo',
+                                'confirm your email', 'finish creating your account',
+                                'terminar de crear', '6-digit', '6 digit', '6-dígitos',
+                                '6 dígitos', '6 digitos', 'resend code', 'reenviar código',
+                                'reenviar codigo', 'email sent', 'correo enviado',
+                                'check your inbox', 'revisa tu bandeja', 'we sent',
+                                'te hemos enviado', "we've sent", 'código de 6', 'codigo de 6'
+                            ];
+                            if (frases.some(f => t.includes(f))) return true;
+                            const n = document.querySelectorAll(
+                                'input[maxlength="1"], input[autocomplete="one-time-code"]'
+                            ).length;
+                            return n >= 4;
+                        }"""))
                     except Exception:
-                        pass
-                else:
+                        try:
+                            return bool(encontrar_locator_en_frames(
+                                self.page,
+                                ['input[maxlength="1"]', 'input[autocomplete="one-time-code"]']
+                            ))
+                        except Exception:
+                            return False
+
+                def _sigue_en_formulario_registro() -> bool:
+                    try:
+                        return bool(encontrar_locator_en_frames(
+                            self.page,
+                            [
+                                "button:has-text('Suscríbete')", "button:has-text('Subscribe')",
+                                'select[name*="day" i]', 'select[name*="year" i]',
+                                'input[name*="day" i]',
+                            ]
+                        ))
+                    except Exception:
+                        return False
+
+                def _pulsar_suscribete() -> None:
+                    print("  [Registro] Pulsando botón 'Suscríbete'...")
+                    # Reafirmar términos (a veces el clic previo no quedó registrado)
                     try:
                         self.page.evaluate("""() => {
-                            const btn = document.querySelector('button[type="submit"]') || 
-                                        Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').includes('Suscríbete') || (b.textContent || '').includes('Subscribe'));
-                            if (btn) btn.click();
+                            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                                const parentText = cb.parentElement ? (cb.parentElement.textContent || '') : '';
+                                if (/términos|terms|privacidad|privacy|acuerdo|agree/i.test(parentText)) {
+                                    if (!cb.checked) {
+                                        cb.click();
+                                        if (!cb.checked && cb.parentElement) cb.parentElement.click();
+                                    }
+                                }
+                            });
                         }""")
                     except Exception:
                         pass
-                time.sleep(4.0)
-
-                print("  [Registro] Buscando código de registro enviado por correo...")
-                codigo = None
-                for intento in range(1, 8):
-                    print(f"  [Registro] Intento {intento}/7: Buscando correo...")
-                    codigo = obtener_codigo_via_imap(
-                        gmail_user=self.client_email,
-                        required_keywords=["registr", "bienven", "código", "code", "verific"],
-                        query_exclude="cancel",
-                        after_email_id=max_id_previo
+                    btn_sub = esperar_locator_en_frames(
+                        self.page,
+                        [
+                            "button:has-text('Suscríbete')", "button:has-text('Subscribe')",
+                            "button:has-text('Create account')", "button:has-text('Crear cuenta')",
+                            "button[type='submit']",
+                        ],
+                        timeout_s=5.0
                     )
-                    if codigo:
-                        break
-                    if intento < 7:
-                        print("  [Registro] Correo no encontrado aún. Esperando 8 segundos...")
-                        time.sleep(8.0)
+                    if btn_sub:
+                        try:
+                            btn_sub.click(force=True)
+                        except Exception:
+                            try:
+                                btn_sub.evaluate("b => b.click()")
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            self.page.evaluate("""() => {
+                                const btn = document.querySelector('button[type="submit"]') ||
+                                    Array.from(document.querySelectorAll('button')).find(b => {
+                                        const t = (b.textContent || '').toLowerCase();
+                                        return t.includes('suscríbete') || t.includes('suscribete')
+                                            || t.includes('subscribe') || t.includes('crear cuenta')
+                                            || t.includes('create account');
+                                    });
+                                if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); btn.click(); }
+                            }""")
+                        except Exception:
+                            pass
 
-            if not codigo:
-                raise RuntimeError("No se pudo extraer el código de verificación del correo de manera automática.")
-                
-            if codigo:
-                code_input = esperar_locator_en_frames(
-                    self.page,
-                    ['input[name="code"]', 'input[placeholder*="código" i]', 'input[placeholder*="code" i]',
-                     'input[type="text"]', 'input[inputmode="numeric"]'],
-                    timeout_s=5.0
-                )
-                if code_input:
-                    escribir_codigo_verificacion_inteligente(self.page, codigo)
-                    time.sleep(1.0)
-                    
-                    # Gatillar el envío de forma limpia (Enter + clic único)
+                def _asegurar_otp_tras_suscribirse() -> bool:
+                    """Tras Suscríbete: esperar OTP, recuperar authorize/antirobot o reintentar clic.
+
+                    Antes se abortaba a los ~8s sin OTP aunque el proxy solo fuera lento o el
+                    botón no hubiera registrado el clic → fallos falsos (g.etspooky381.9).
+                    """
+                    _pulsar_suscribete()
+                    time.sleep(2.0)
+
+                    for intento_rec in range(1, 6):
+                        # Espera activa a la pantalla OTP
+                        for _ in range(12):
+                            if _pantalla_otp_registro():
+                                return True
+                            # Si ya llegó el correo, la UI puede ir retrasada: no abortar aún
+                            time.sleep(1.0)
+
+                        if _pantalla_otp_registro():
+                            return True
+
+                        # Diagnóstico de estado actual
+                        try:
+                            url_now = (self.page.url or "")[:120]
+                            txt_snip = self.page.evaluate(
+                                "() => (document.body && document.body.innerText || '').slice(0, 180)"
+                            )
+                        except Exception:
+                            url_now, txt_snip = "?", ""
+                        print(f"  [Registro] [{self.client_email}] Aún sin OTP tras Suscríbete "
+                              f"(intento recuperación {intento_rec}/5). URL={url_now}")
+                        if txt_snip:
+                            print(f"  [Registro] [{self.client_email}] Texto visible: "
+                                  f"{(txt_snip or '').replace(chr(10), ' ')[:120]!r}")
+
+                        # Cuenta ya existente → no hace falta OTP de registro
+                        try:
+                            if encontrar_locator_en_frames(
+                                self.page,
+                                ['input[type="password"]', 'input[name="password"]']
+                            ) and not _sigue_en_formulario_registro():
+                                print(f"  {Color.WARNING}[Registro] [{self.client_email}] Apareció "
+                                      f"login por contraseña (cuenta ya existente).{Color.ENDC}")
+                                self._registro_cuenta_existente = True
+                                return False
+                        except Exception:
+                            pass
+
+                        # Antibot / Error authorize
+                        try:
+                            if detectar_pantalla_antirobot(self.page):
+                                print(f"  [Registro] [{self.client_email}] Antibot tras Suscríbete; "
+                                      f"intervención/rotación...")
+                                manejar_bloqueos_e_intervencion(self.page, "Registro tras Suscríbete")
+                        except Exception:
+                            pass
+                        try:
+                            if es_pantalla_error_login_tidal(self.page) or url_es_oauth_login_roto(
+                                getattr(self.page, "url", "") or ""
+                            ):
+                                print(f"  [Registro] [{self.client_email}] Authorize/Error tras "
+                                      f"Suscríbete; recuperando flujo...")
+                                if self.use_proxy:
+                                    self.ejecutar_rotacion_proxy_y_recargar()
+                                else:
+                                    self.recuperar_login_tras_error_tidal()
+                                # Tras recuperar estamos en login: hay que rehacer el formulario.
+                                # Señalamos al caller para reiniciar run_registration externo no;
+                                # aquí reintentamos email→fecha→suscribir en este mismo lock.
+                                raise RuntimeError("__REINICIAR_FORMULARIO_REGISTRO__")
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
+
+                        # ¿Correo de sign-up ya en IMAP aunque la UI no cambió?
+                        try:
+                            codigo_previo = obtener_codigo_via_imap(
+                                gmail_user=self.client_email,
+                                required_keywords=[
+                                    "registr", "bienven", "código", "codigo", "code",
+                                    "verific", "sign-up", "signup", "sign up",
+                                ],
+                                query_exclude="cancel",
+                                after_email_id=max_id_previo,
+                                max_age_minutes=20,
+                            )
+                            if codigo_previo and not str(codigo_previo).startswith("http"):
+                                print(f"  [Registro] [{self.client_email}] OTP ya llegó por IMAP "
+                                      f"({codigo_previo}) aunque la UI no mostró Verify. Se continúa.")
+                                # Forzar navegación a una URL de verificación no siempre existe;
+                                # devolver True y dejar que el bucle IMAP/escritura lo use.
+                                # Guardamos el código en atributo temporal.
+                                self._otp_registro_prefetch = codigo_previo
+                                return True
+                        except Exception:
+                            pass
+
+                        # Seguir en el formulario: volver a pulsar Suscríbete
+                        if _sigue_en_formulario_registro():
+                            print(f"  [Registro] [{self.client_email}] Sigue el formulario; "
+                                  f"reintentando Suscríbete...")
+                            _pulsar_suscribete()
+                            time.sleep(2.5)
+                            continue
+
+                        # Página rara: rotar proxy NG y recuperar pricing→account, luego abortar
+                        # este helper con reinicio de formulario.
+                        if self.use_proxy and intento_rec >= 3:
+                            print(f"  [Registro] [{self.client_email}] Rotando proxy NG y "
+                                  f"reiniciando formulario de registro...")
+                            try:
+                                self.ejecutar_rotacion_proxy_y_recargar()
+                            except Exception:
+                                pass
+                            raise RuntimeError("__REINICIAR_FORMULARIO_REGISTRO__")
+
+                        time.sleep(1.5)
+
+                    return _pantalla_otp_registro()
+
+                # Hasta 2 reinicios completos del formulario si authorize/proxy lo tumba
+                self._otp_registro_prefetch = None
+                self._registro_cuenta_existente = False
+                otp_listo = False
+                for _ciclo_form in range(1, 3):
+                    try:
+                        ok_otp = _asegurar_otp_tras_suscribirse()
+                        if ok_otp:
+                            otp_listo = True
+                            break
+                        if getattr(self, "_registro_cuenta_existente", False):
+                            break
+                        # False genérico: seguir al siguiente ciclo o fallar al salir
+                    except RuntimeError as e_rein:
+                        if "__REINICIAR_FORMULARIO_REGISTRO__" not in str(e_rein):
+                            raise
+                        print(f"  [Registro] [{self.client_email}] Reiniciando formulario "
+                              f"(ciclo {_ciclo_form}/2) tras fallo post-Suscríbete...")
+                        # Rehacer email + fecha + términos (mismo patrón que arriba)
+                        email_input = esperar_locator_en_frames(
+                            self.page,
+                            ['input[type="email"]', 'input[name="email"]', '#email'],
+                            timeout_s=20.0
+                        )
+                        if not email_input:
+                            try:
+                                self.recuperar_login_tras_error_tidal()
+                            except Exception:
+                                pass
+                            email_input = esperar_locator_en_frames(
+                                self.page,
+                                ['input[type="email"]', 'input[name="email"]', '#email'],
+                                timeout_s=20.0
+                            )
+                        if not email_input:
+                            continue
+                        try:
+                            email_input.fill("")
+                            email_input.fill(self.client_email)
+                            email_input.press("Enter")
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        if encontrar_locator_en_frames(
+                            self.page, ['input[type="password"]', 'input[name="password"]']
+                        ):
+                            self._registro_cuenta_existente = True
+                            break
+                        # Fecha + términos (JS compacto)
+                        try:
+                            self.page.evaluate("""() => {
+                                const selects = document.querySelectorAll('select');
+                                if (selects.length >= 3) {
+                                    selects[0].value = '15';
+                                    selects[0].dispatchEvent(new Event('change', {bubbles:true}));
+                                    if (selects[1].options.length > 8) {
+                                        selects[1].selectedIndex = selects[1].options.length === 13 ? 8 : 7;
+                                        selects[1].dispatchEvent(new Event('change', {bubbles:true}));
+                                    }
+                                    selects[2].value = '1995';
+                                    selects[2].dispatchEvent(new Event('change', {bubbles:true}));
+                                }
+                                document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                                    const p = cb.parentElement ? (cb.parentElement.textContent||'') : '';
+                                    if (/términos|terms|privacidad|privacy/i.test(p) && !cb.checked) cb.click();
+                                });
+                            }""")
+                        except Exception:
+                            pass
+                        time.sleep(0.8)
+                        max_id_previo = obtener_max_email_id(self.client_email)
+
+                if getattr(self, "_registro_cuenta_existente", False):
+                    print(f"  {Color.WARNING}[Registro] La cuenta {self.client_email} ya está "
+                          f"registrada en TIDAL. Omitiendo...{Color.ENDC}")
+                    registro_exitoso = True
+                    return True
+
+                if not otp_listo and not _pantalla_otp_registro() and not getattr(self, "_otp_registro_prefetch", None):
+                    raise RuntimeError(
+                        f"Tras Suscríbete no apareció la verificación OTP para {self.client_email} "
+                        f"tras varios reintentos/recuperaciones (proxy/authorize)."
+                    )
+
+                codigo_aceptado = False
+                ultimo_error_codigo = ""
+                for ronda in range(1, 4):
+                    print(f"  [Registro] Buscando código de registro vía IMAP (ronda {ronda}/3)...")
+                    codigo = getattr(self, "_otp_registro_prefetch", None)
+                    self._otp_registro_prefetch = None
+                    if not codigo:
+                        for intento in range(1, 11):
+                            print(f"  [Registro] Intento {intento}/10: Buscando correo...")
+                            codigo = obtener_codigo_via_imap(
+                                gmail_user=self.client_email,
+                                required_keywords=[
+                                    "registr", "bienven", "código", "codigo", "code",
+                                    "verific", "sign-up", "signup", "sign up",
+                                ],
+                                query_exclude="cancel",
+                                after_email_id=max_id_previo,
+                                max_age_minutes=20,
+                            )
+                            if codigo:
+                                break
+                            # A mitad de intentos: Resend por si Tidal no envió el primer correo
+                            if intento in (4, 7) and _pantalla_otp_registro():
+                                try:
+                                    btn_resend = esperar_locator_en_frames(
+                                        self.page,
+                                        [
+                                            "button:has-text('Resend code')", "button:has-text('Resend')",
+                                            "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
+                                            "a:has-text('Resend')", "a:has-text('Reenviar')",
+                                        ],
+                                        timeout_s=2.0,
+                                    )
+                                    if btn_resend:
+                                        print(f"  [Registro] [{self.client_email}] Pulsando Resend code...")
+                                        btn_resend.click(force=True)
+                                        time.sleep(2.0)
+                                        max_id_previo = obtener_max_email_id(self.client_email)
+                                except Exception:
+                                    pass
+                            if intento < 10:
+                                print("  [Registro] Correo no encontrado aún. Esperando 5 segundos...")
+                                time.sleep(5.0)
+
+                    if not codigo:
+                        ultimo_error_codigo = (
+                            "No se pudo extraer el código de verificación del correo de manera automática."
+                        )
+                        break
+
+                    if codigo.startswith("http"):
+                        reg_page = self.context.new_page()
+                        reg_page.goto(codigo)
+                        time.sleep(2.0)
+                        reg_page.close()
+                        codigo_aceptado = True
+                        break
+
+                    esperar_locator_en_frames(
+                        self.page,
+                        [
+                            'input[autocomplete="one-time-code"]',
+                            'input[maxlength="1"]',
+                            'input[name="code"]',
+                            'input[inputmode="numeric"]',
+                            'input[type="text"]',
+                        ],
+                        timeout_s=12.0,
+                    )
+                    time.sleep(0.4)
+
+                    print(f"  [Registro] [{self.client_email}] Escribiendo código OTP ({codigo})...")
+                    if not escribir_codigo_verificacion_inteligente(self.page, codigo):
+                        print(f"  [Registro] {Color.WARNING}[WARN] No se pudo rellenar las cajas OTP; "
+                              f"reintentando...{Color.ENDC}")
+                        ultimo_error_codigo = "No se pudieron rellenar las cajas del código OTP."
+                        time.sleep(1.0)
+                        continue
+
+                    time.sleep(0.5)
                     try:
                         self.page.keyboard.press("Enter")
-                        time.sleep(1.0)
+                        time.sleep(0.8)
                     except Exception:
                         pass
-                        
+
                     btn_confirm = esperar_locator_en_frames(
                         self.page,
                         [
@@ -5224,40 +5912,57 @@ class TidalRegisterManager:
                                 const btn = document.querySelector('button[type="submit"]') ||
                                             Array.from(document.querySelectorAll('button')).find(b => {
                                                 const t = (b.textContent || '').trim().toLowerCase();
-                                                return t === '' || t.includes('continuar') || t.includes('continue') || t.includes('confirm');
+                                                return t.includes('continuar') || t.includes('continue')
+                                                    || t.includes('confirm') || t.includes('verificar')
+                                                    || t.includes('verify');
                                             });
                                 if (btn) btn.click();
                             }""")
                         except Exception:
                             pass
 
-                    time.sleep(2.0)
-                    # Si el código era de otro alias, Tidal suele mostrar error y dejar el form
+                    time.sleep(2.5)
                     try:
                         texto_err = self.page.evaluate(
                             "() => document.body ? document.body.innerText.toLowerCase() : ''"
                         )
                     except Exception:
                         texto_err = ""
-                    if any(x in texto_err for x in (
-                        "código no válido", "codigo no valido", "invalid code", "incorrect code",
-                        "código incorrecto", "codigo incorrecto", "try again", "inténtalo de nuevo"
-                    )) and encontrar_locator_en_frames(
-                        self.page,
-                        ['input[name="code"]', 'input[inputmode="numeric"]', 'input[type="text"]']
-                    ):
-                        raise RuntimeError(
-                            f"Tidal rechazó el código de verificación para {self.client_email} "
-                            f"(posible mezcla con otro alias del mismo Gmail)."
+
+                    sigue_en_otp = _pantalla_otp_registro()
+                    if _texto_indica_codigo_invalido(texto_err) and sigue_en_otp:
+                        print(f"  [Registro] {Color.WARNING}[WARN] [{self.client_email}] Tidal rechazó "
+                              f"el código {codigo}. Solicitando uno nuevo...{Color.ENDC}")
+                        ultimo_error_codigo = (
+                            f"Tidal rechazó el código de verificación para {self.client_email}."
                         )
-                            
+                        try:
+                            btn_resend = esperar_locator_en_frames(
+                                self.page,
+                                [
+                                    "button:has-text('Resend code')", "button:has-text('Resend')",
+                                    "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
+                                    "a:has-text('Resend')", "a:has-text('Reenviar')",
+                                ],
+                                timeout_s=3.0,
+                            )
+                            if btn_resend:
+                                btn_resend.click(force=True)
+                                time.sleep(2.0)
+                        except Exception:
+                            pass
+                        max_id_previo = obtener_max_email_id(self.client_email)
+                        continue
+
+                    codigo_aceptado = True
                     print("  [Registro] Código enviado. Esperando procesamiento de la cuenta...")
-                else:
-                    if codigo.startswith("http"):
-                        reg_page = self.context.new_page()
-                        reg_page.goto(codigo)
-                        time.sleep(2.0)
-                        reg_page.close()
+                    break
+
+                if not codigo_aceptado:
+                    raise RuntimeError(
+                        ultimo_error_codigo
+                        or f"No se pudo verificar el correo de registro para {self.client_email}."
+                    )
             
             print("  [Registro] Esperando redirección automática al perfil o cuenta...")
             registro_exitoso = self._confirmar_registro_completado(timeout_s=60.0)
@@ -6086,24 +6791,24 @@ class TidalRegisterManager:
             transfer_ok = False
             mantener_abierta = False
 
-            # Localizar el archivo CSV (exacto o alias Gmail); reintentar unos segundos por si OneDrive aún sincroniza
-            csv_path = resolver_csv_cuenta(self.client_email)
+            # CSV fijado 1:1 a esta cuenta (lote opción 8). No re-resolver a otro archivo.
+            csv_path = obtener_csv_para_subida(self, reintentar_s=0.0)
             if not csv_path:
                 print(f"  {Color.WARNING}[TuneMyMusic] [{self.client_email}] CSV aún no visible en 'descargas/'. "
-                      f"Esperando hasta 90s...{Color.ENDC}")
-                limite_csv = time.time() + 90
-                while time.time() < limite_csv and not csv_path:
-                    time.sleep(3.0)
-                    csv_path = resolver_csv_cuenta(self.client_email)
+                      f"Esperando hasta 90s (solo archivos que coincidan con esta cuenta)...{Color.ENDC}")
+                csv_path = obtener_csv_para_subida(self, reintentar_s=90.0)
 
             if not csv_path:
                 print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] ERROR: No se encontró CSV válido en "
-                      f"'descargas/' para esta cuenta. La ventana se mantiene abierta para subida manual "
+                      f"'descargas/' para esta cuenta ({self.client_email}.csv). "
+                      f"La ventana se mantiene abierta para subida manual "
                       f"(hasta 15 min o hasta que la cierres).{Color.ENDC}")
                 mantener_abierta = True
             else:
                 # Tras ENTER, cada ventana puede seguir sin el input listo (usuario preparando 10 pantallas).
                 # Antes: 30s → error → cierre inmediato (error.txt: Timeout input[type=file]).
+                print(f"  [TuneMyMusic] [{self.client_email}] CSV emparejado: {csv_path.name} "
+                      f"→ cuenta {self.client_email}")
                 print(f"  [TuneMyMusic] [{self.client_email}] Esperando el selector de archivo (hasta 5 min) "
                       f"para subir {csv_path.name}...")
                 file_input = None
@@ -6136,14 +6841,20 @@ class TidalRegisterManager:
                           f"Ventana abierta para subida manual (15 min).{Color.ENDC}")
                     mantener_abierta = True
                 else:
-                    print(f"  [TuneMyMusic] [{self.client_email}] Subiendo archivo CSV: {csv_path.name}...")
-                    try:
-                        file_input.set_input_files(str(csv_path.resolve()))
-                        print(f"  [TuneMyMusic] [{self.client_email}] Archivo CSV subido con éxito.")
-                    except Exception as e:
-                        print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] ERROR al subir el archivo CSV: {e}. "
-                              f"Ventana abierta para reintento manual (15 min).{Color.ENDC}")
+                    if not csv_pertenece_a_cuenta(csv_path, self.client_email) or not csv_parece_valido(csv_path):
+                        print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] Abortada subida: "
+                              f"'{csv_path.name}' ya no coincide con la cuenta.{Color.ENDC}")
                         mantener_abierta = True
+                    else:
+                        print(f"  [TuneMyMusic] [{self.client_email}] Subiendo archivo CSV: {csv_path.name}...")
+                        try:
+                            file_input.set_input_files(str(csv_path.resolve()))
+                            print(f"  [TuneMyMusic] [{self.client_email}] Archivo CSV subido con éxito "
+                                  f"({csv_path.name} → {self.client_email}).")
+                        except Exception as e:
+                            print(f"  {Color.FAIL}[TuneMyMusic] [{self.client_email}] ERROR al subir el archivo CSV: {e}. "
+                                  f"Ventana abierta para reintento manual (15 min).{Color.ENDC}")
+                            mantener_abierta = True
 
             # Monitorear transferencia (también si la subida fue manual: el usuario puede completar solo)
             if not self.page or self.page.is_closed():
@@ -11425,26 +12136,31 @@ def registrar_cuentas_tidal(correos):
     if successful_managers:
         print(f"\n{Color.CYAN}{Color.BOLD}Iniciando transferencia en TuneMyMusic para las {len(successful_managers)} cuentas exitosas...{Color.ENDC}")
 
-        # Pre-chequeo: avisar qué CSV faltan ANTES de abrir 10 Chrome (caso getmushro.om.30.12)
+        # Pre-chequeo exclusivo 1:1: avisar qué CSV faltan ANTES de abrir TuneMyMusic
         DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
+        asignaciones = asignar_csvs_a_cuentas([mgr.client_email for mgr in successful_managers])
         con_csv = []
         sin_csv = []
         for mgr in successful_managers:
-            ruta = resolver_csv_cuenta(mgr.client_email)
-            if ruta:
+            ruta = asignaciones.get(mgr.client_email)
+            mgr.csv_asignado = ruta
+            if ruta and csv_pertenece_a_cuenta(ruta, mgr.client_email):
                 con_csv.append((mgr.client_email, ruta.name, ruta.stat().st_size))
             else:
+                mgr.csv_asignado = None
                 sin_csv.append(mgr.client_email)
 
-        print(f"\n{Color.CYAN}[CSV] Encontrados {len(con_csv)}/{len(successful_managers)} archivos en 'descargas/'.{Color.ENDC}")
+        print(f"\n{Color.CYAN}[CSV] Emparejados {len(con_csv)}/{len(successful_managers)} "
+              f"(1 archivo ↔ 1 cuenta Tidal) en 'descargas/'.{Color.ENDC}")
         for email, nombre, nbytes in con_csv:
-            print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes)")
+            marca = "" if nombre.lower() == f"{email.lower()}.csv" else " [alias]"
+            print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes){marca}")
         if sin_csv:
-            print(f"\n{Color.WARNING}[CSV] Sin archivo (o vacío) para:{Color.ENDC}")
+            print(f"\n{Color.WARNING}[CSV] Sin archivo exclusivo (o ambiguo) para:{Color.ENDC}")
             for email in sin_csv:
-                print(f"  {Color.FAIL}✗{Color.ENDC} {email}")
+                print(f"  {Color.FAIL}✗{Color.ENDC} {email}  (espera: descargas/{email}.csv)")
             print(f"{Color.WARNING}Esas ventanas se abrirán igual y permanecerán abiertas para subida manual "
-                  f"si al pulsar ENTER aún no hay CSV.{Color.ENDC}")
+                  f"si al pulsar ENTER aún no hay CSV con el nombre exacto de la cuenta.{Color.ENDC}")
             cont = input("¿Continuar con TuneMyMusic de todas formas? (s/n, por defecto 's'): ").strip().lower()
             if cont in ("n", "no"):
                 print(f"{Color.CYAN}Transferencia TuneMyMusic cancelada. Regresa cuando los CSV estén en 'descargas/'.{Color.ENDC}")
@@ -11467,6 +12183,7 @@ def registrar_cuentas_tidal(correos):
         
         input(f"\n{Color.BOLD}>>> Prepara el selector de archivo CSV en CADA TuneMyMusic "
               f"(todas las ventanas) y luego presiona ENTER.\n"
+              f"    Cada ventana subirá SOLO su CSV emparejado (nombre = correo de la cuenta).\n"
               f"    Tras ENTER cada ventana esperará hasta 5 min a que el input esté listo "
               f"(ya no se cierra a los 30s). <<<{Color.ENDC}")
         
