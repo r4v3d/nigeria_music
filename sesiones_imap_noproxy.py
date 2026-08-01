@@ -105,7 +105,7 @@ CSV_RESERVAS: dict[str, str] = {}  # str(Path.resolve()) -> email dueño
 
 # Protege el fichero de titulares familiares: varias ventanas terminan su upgrade a la vez y
 # leer/escribir sin sincronizar hacía que unas cuentas sobrescribieran a otras.
-TITULARES_FILE_LOCK = threading.Lock()
+TITULARES_FILE_LOCK = threading.RLock()
 
 # Igual para 'sesiones_imap_cuentas.txt', donde se anotan las contraseñas de las cuentas creadas.
 CUENTAS_FILE_LOCK = threading.Lock()
@@ -8884,37 +8884,38 @@ def guardar_titulares_familiares(titulares: list[dict], path: Path):
     """Guarda en formato por bloques TITULAR / MIEMBROS, preservando el plan de invitaciones."""
     # Conservar miembros_invitar del archivo si el dict en memoria no lo trae.
     # Clave EXACTA (con puntos): no usar clean_email/son_correos_equivalentes.
-    if path.exists():
-        try:
-            existentes, _ = parsear_titular_familiar_txt_opcion11(path)
-            by_key = {
-                (t.get("correo") or "").strip().lower(): t for t in existentes
-            }
-            for t in titulares:
-                key = (t.get("correo") or "").strip().lower()
-                if not t.get("miembros_invitar") and key in by_key:
-                    t["miembros_invitar"] = list(by_key[key].get("miembros_invitar") or [])
-        except Exception:
-            pass
+    with TITULARES_FILE_LOCK:
+        if path.exists():
+            try:
+                existentes, _ = parsear_titular_familiar_txt_opcion11(path)
+                by_key = {
+                    (t.get("correo") or "").strip().lower(): t for t in existentes
+                }
+                for t in titulares:
+                    key = (t.get("correo") or "").strip().lower()
+                    if not t.get("miembros_invitar") and key in by_key:
+                        t["miembros_invitar"] = list(by_key[key].get("miembros_invitar") or [])
+            except Exception:
+                pass
 
-    lines = [
-        "# Cuentas Familiares Titulares de Tidal (Nigeria)",
-        "# Formato por bloques:",
-        "# TITULAR",
-        "# correo_titular, miembros_actuales, estado, [miembros_detalles]",
-        "# MIEMBROS:",
-        "# miembro1@gmail.com",
-        "#",
-    ]
-    for t in titulares:
-        lines.append("TITULAR")
-        lines.append(f"{t['correo']}, {t['usados']}, {t['estado']}, {t.get('miembros', [])}")
-        lines.append("MIEMBROS:")
-        for m in (t.get("miembros_invitar") or []):
-            lines.append(str(m))
-        lines.append("")
+        lines = [
+            "# Cuentas Familiares Titulares de Tidal (Nigeria)",
+            "# Formato por bloques:",
+            "# TITULAR",
+            "# correo_titular, miembros_actuales, estado, [miembros_detalles]",
+            "# MIEMBROS:",
+            "# miembro1@gmail.com",
+            "#",
+        ]
+        for t in titulares:
+            lines.append("TITULAR")
+            lines.append(f"{t['correo']}, {t['usados']}, {t['estado']}, {t.get('miembros', [])}")
+            lines.append("MIEMBROS:")
+            for m in (t.get("miembros_invitar") or []):
+                lines.append(str(m))
+            lines.append("")
 
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def agrupar_miembros_por_titular_familiar(
@@ -9695,10 +9696,15 @@ class TidalFamilyInviter:
         client_email: str = "titular_familiar",
         perfil_dir: Path | None = None,
         trabajos_por_titular: list[dict] | None = None,
+        titulares_shared: list[dict] | None = None,
+        path_titulares: Path | None = None,
     ):
         self.queue_miembros = queue_miembros
         # Trabajos explícitos opción 9: [{correo_titular, miembros}, ...] según titular_familiar.txt
         self.trabajos_por_titular = list(trabajos_por_titular or [])
+        # Lista compartida entre invitadores paralelos (evita que un save pise al otro)
+        self.titulares_shared = titulares_shared
+        self.path_titulares = path_titulares
         self.playwright = None
         self.context = None
         self.page = None
@@ -11032,7 +11038,10 @@ class TidalFamilyInviter:
 
     def run_inviter(self):
         try:
-            titulares, path = cargar_titulares_familiares()
+            if self.titulares_shared is not None and self.path_titulares is not None:
+                titulares, path = self.titulares_shared, self.path_titulares
+            else:
+                titulares, path = cargar_titulares_familiares()
             if not titulares:
                 print(f"  {Color.FAIL}[Inviter] ERROR: No se encontraron titulares en "
                       f"perfiles/familiar_titular.txt ni titular_familiar.txt{Color.ENDC}")
@@ -11060,7 +11069,7 @@ class TidalFamilyInviter:
                       f"en {path.name}.{Color.ENDC}")
                 return
 
-            print(f"  [Inviter] {Color.CYAN}Plan de invitaciones según {path.name}:{Color.ENDC}")
+            print(f"  [Inviter] {Color.CYAN}[{self.client_email}] Plan según {path.name}:{Color.ENDC}")
             for tj in trabajos:
                 print(f"    • Titular {tj['correo_titular']} → {len(tj['miembros'])} miembro(s): "
                       f"{tj['miembros']}")
@@ -11232,8 +11241,7 @@ def restablecer_contrasenas_tidal(correos=None):
             input(">>> Presiona Enter para volver al menú principal <<<")
             return
 
-    inviter = None
-    inviter_thread = None
+    inviter_threads: list[threading.Thread] = []
     # Invitar solo los correos procesados, cada uno al titular de su bloque en titular_familiar.txt
     path_titular = SCRIPT_DIR / "titular_familiar.txt"
     if not path_titular.exists():
@@ -11244,7 +11252,7 @@ def restablecer_contrasenas_tidal(correos=None):
     )
     if sin_mapa_inv:
         print(f"\n{Color.WARNING}[Paso 9] Sin titular en {path_titular.name} para "
-              f"{len(sin_mapa_inv)} correo(s) (no estánarán a invitación):{Color.ENDC}")
+              f"{len(sin_mapa_inv)} correo(s) (no pasarán a invitación):{Color.ENDC}")
         for m in sin_mapa_inv:
             print(f"    ✗ {m}")
     if trabajos_inv:
@@ -11255,15 +11263,64 @@ def restablecer_contrasenas_tidal(correos=None):
             print(f"    • {tj['correo_titular']} ← {tj['miembros']}")
         print(f"  [Paso 9] Total miembros a invitar: {total_m}")
 
-        family_invite_queue = queue.Queue()
-        family_invite_queue.put(None)  # sentinel por si el hilo cae al modo cola
-        inviter = TidalFamilyInviter(
-            family_invite_queue,
-            trabajos_por_titular=trabajos_inv,
-        )
-        inviter_thread = threading.Thread(target=inviter.run_inviter, daemon=True)
-        inviter_thread.start()
-        print(f"  [Paso 9] Invitador familiar iniciado en paralelo con los restablecimientos.")
+        titulares_shared, path_tit_shared = cargar_titulares_familiares()
+        if path_titular.exists():
+            path_tit_shared = path_titular
+
+        def _slug_titular(correo: str) -> str:
+            c = (correo or "").strip().lower()
+            if "@" in c:
+                local, dom = c.split("@", 1)
+                return f"{local.replace('.', '')}@{dom}"
+            return re.sub(r"[^a-z0-9]+", "_", c) or "titular"
+
+        def _run_inviter_titular(idx: int, tj: dict):
+            if idx > 1:
+                time.sleep((idx - 1) * 0.4)
+            correo_t = (tj.get("correo_titular") or "").strip()
+            temp_dir = Path(tempfile.mkdtemp(prefix=f"tidal_op9_{_slug_titular(correo_t)}_"))
+            inv = TidalFamilyInviter(
+                queue.Queue(),
+                client_email=correo_t or f"titular_{idx}",
+                perfil_dir=temp_dir,
+                trabajos_por_titular=[tj],
+                titulares_shared=titulares_shared,
+                path_titulares=path_tit_shared,
+            )
+            try:
+                print(f"  [Paso 9] {Color.CYAN}Invitador paralelo #{idx}: {correo_t} "
+                      f"({len(tj.get('miembros') or [])} miembro(s)){Color.ENDC}")
+                inv.run_inviter()
+            finally:
+                try:
+                    inv.cerrar_recursos()
+                except Exception:
+                    pass
+                cerrar_sesion_imap_hilo()
+
+                def _rm_async(p_dir):
+                    time.sleep(2.0)
+                    try:
+                        shutil.rmtree(p_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_rm_async, args=(temp_dir,), daemon=True).start()
+
+        n_tit = len(trabajos_inv)
+        if n_tit > 1:
+            print(f"  [Paso 9] {Color.GREEN}{n_tit} titulares → invitaciones en SIMULTÁNEO "
+                  f"(Chrome independiente por titular).{Color.ENDC}")
+        for idx, tj in enumerate(trabajos_inv, 1):
+            th = threading.Thread(
+                target=_run_inviter_titular,
+                args=(idx, tj),
+                daemon=True,
+                name=f"op9-inviter-{idx}",
+            )
+            inviter_threads.append(th)
+            th.start()
+        print(f"  [Paso 9] Invitador(es) familiar(es) iniciado(s) en paralelo con los restablecimientos.")
     else:
         print(f"\n{Color.WARNING}[Paso 9] Ningún correo procesado figura como MIEMBROS en "
               f"{path_titular.name}. Se omite la invitación al plan familiar.{Color.ENDC}")
@@ -11335,12 +11392,15 @@ def restablecer_contrasenas_tidal(correos=None):
                     print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
                     fail_count += 1
 
-    if inviter_thread and inviter_thread.is_alive():
-        print(f"\n{Color.CYAN}Esperando a que finalice el proceso de invitación familiar...{Color.ENDC}")
-        inviter_thread.join(timeout=1200.0)
-        if inviter_thread.is_alive():
-            print(f"  {Color.WARNING}[Paso 9] El invitador sigue en curso tras 20 min; "
-                  f"el hilo daemon terminará al cerrar el proceso.{Color.ENDC}")
+    vivos = [t for t in inviter_threads if t.is_alive()]
+    if vivos:
+        print(f"\n{Color.CYAN}Esperando a que finalicen {len(vivos)} invitador(es) familiar(es)...{Color.ENDC}")
+        for th in vivos:
+            th.join(timeout=1200.0)
+        vivos2 = [t for t in inviter_threads if t.is_alive()]
+        if vivos2:
+            print(f"  {Color.WARNING}[Paso 9] {len(vivos2)} invitador(es) siguen en curso tras 20 min; "
+                  f"los hilos daemon terminarán al cerrar el proceso.{Color.ENDC}")
     
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL RESTABLECIMIENTO{Color.ENDC}")
