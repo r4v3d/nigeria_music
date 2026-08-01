@@ -1052,33 +1052,52 @@ def _invite_eval_modo_contrasena(page, accion: str):
 
 
 def _invite_hay_pantalla_codigo(page) -> bool:
+    """True solo con UI OTP real (inputs), no por el enlace 'con un código' del password."""
     try:
         return bool(page.evaluate("""() => {
-            const txt = document.body ? document.body.innerText.toLowerCase() : '';
-            const frases = ['revisa tu correo', 'check your email', 'te hemos enviado un código',
-                            'te hemos enviado un codigo', "we've sent", 'we have sent',
-                            'reenviar código', 'reenviar codigo', 'resend code',
-                            'código de acceso', 'access code', 'one-time',
-                            'código de inicio', 'codigo de inicio', 'sign-in code', 'signin code',
-                            'login code', 'enter the code', 'introduce el código', 'introduce el codigo',
-                            'verification code', 'código de verificación', 'codigo de verificacion'];
-            if (frases.some(f => txt.includes(f))) return true;
             const inputs = Array.from(document.querySelectorAll('input'));
             let digitos = 0, unica = 0;
             for (const el of inputs) {
+                const t = (el.type || '').toLowerCase();
+                if (['email','password','checkbox','radio','submit','button','file','hidden'].includes(t))
+                    continue;
                 const st = window.getComputedStyle(el);
                 if (st.display === 'none' || st.visibility === 'hidden') continue;
                 const r = el.getBoundingClientRect();
                 if (r.width < 8 || r.height < 8) continue;
                 const max = (el.getAttribute('maxlength') || '').trim();
+                const mn = Number(max);
                 const ac = (el.autocomplete || '').toLowerCase();
                 const mode = (el.inputMode || '').toLowerCase();
+                const name = (el.name || '').toLowerCase();
+                const ph = (el.placeholder || '').toLowerCase();
                 if (max === '1') digitos++;
                 if (ac === 'one-time-code') unica++;
-                const mn = Number(max);
                 if (mode === 'numeric' && mn >= 4 && mn <= 8) unica++;
+                if (mn >= 4 && mn <= 8) unica++;
+                if (name.includes('code') || name.includes('otp')
+                    || ph.includes('code') || ph.includes('código') || ph.includes('codigo'))
+                    unica++;
             }
-            return digitos >= 4 || unica >= 1;
+            if (digitos >= 4 || unica >= 1) return true;
+            // Texto de pantalla OTP solo si además hay al menos un input no-email/password
+            const txt = document.body ? document.body.innerText.toLowerCase() : '';
+            const frases = ['te hemos enviado un código', 'te hemos enviado un codigo',
+                            "we've sent you a code", 'we have sent you a code',
+                            'introduce el código', 'introduce el codigo', 'enter the code',
+                            'código de inicio de sesión', 'codigo de inicio de sesion',
+                            'sign-in code', 'your sign-in code'];
+            const hayFrase = frases.some(f => txt.includes(f));
+            if (!hayFrase) return false;
+            return inputs.some(el => {
+                const t = (el.type || '').toLowerCase();
+                if (['email','password','checkbox','radio','submit','button','file','hidden'].includes(t))
+                    return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                const r = el.getBoundingClientRect();
+                return r.width >= 8 && r.height >= 8;
+            });
         }"""))
     except Exception:
         return False
@@ -4234,15 +4253,19 @@ def contar_cajas_otp_visibles(page) -> int:
 
 
 def leer_otp_cajas_visibles(page) -> str:
-    """Lee el valor concatenado de las cajas OTP visibles."""
+    """Lee el valor concatenado de las cajas OTP visibles (N dígitos o 1 caja 4–8)."""
     try:
         page = pagina_vigente(page)
         return page.evaluate("""() => {
             const esOtp = (el) => {
                 const max = (el.getAttribute('maxlength') || '').trim();
+                const mn = Number(max);
                 const ac = (el.autocomplete || '').toLowerCase();
                 const mode = (el.inputMode || '').toLowerCase();
                 const name = (el.name || '').toLowerCase();
+                const t = (el.type || '').toLowerCase();
+                if (['email','password','checkbox','radio','submit','button','file','hidden'].includes(t))
+                    return false;
                 const st = window.getComputedStyle(el);
                 if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
                     return false;
@@ -4250,12 +4273,15 @@ def leer_otp_cajas_visibles(page) -> str:
                 if (r.width < 8 || r.height < 8) return false;
                 return max === '1' || ac === 'one-time-code'
                     || (mode === 'numeric' && max === '1')
-                    || ((name.includes('code') || name.includes('otp')) && max === '1');
+                    || ((name.includes('code') || name.includes('otp')) && max === '1')
+                    || (ac === 'one-time-code')
+                    || (mn >= 4 && mn <= 8);
             };
-            return Array.from(document.querySelectorAll('input'))
-                .filter(esOtp)
-                .map(el => (el.value || '').trim())
-                .join('');
+            const boxes = Array.from(document.querySelectorAll('input')).filter(esOtp);
+            // Preferir 6 cajas de 1 dígito si coexisten con una caja larga
+            const digitos = boxes.filter(el => (el.getAttribute('maxlength') || '').trim() === '1');
+            const fuente = digitos.length >= 4 ? digitos : boxes;
+            return fuente.map(el => (el.value || '').trim()).join('');
         }""") or ""
     except Exception:
         return ""
@@ -4751,6 +4777,136 @@ def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
                 pass
         except Exception:
             continue
+    return False
+
+
+def escribir_otp_login_titular(page, codigo: str) -> bool:
+    """Escritura OTP específica del login del titular (opción 9/11).
+
+    Más tolerante que el escritor genérico (eliminación/registro): limpia cookies,
+    acepta 1 caja sin maxlength, y valida por lectura O por avance de URL.
+    """
+    codigo = re.sub(r"\D", "", str(codigo or ""))
+    if not codigo or len(codigo) < 4:
+        return False
+
+    page = pagina_vigente(page)
+    try:
+        aceptar_cookies_con_espera(page, intentos=1, pausa_s=0.1)
+    except Exception:
+        pass
+    try:
+        _invite_limpiar_cookies_agresivo(page)
+    except Exception:
+        pass
+
+    if escribir_codigo_verificacion_inteligente(page, codigo):
+        return True
+
+    # Fallback JS: cualquier input visible no-email/password (UI login Tidal variable)
+    for frame in page.frames:
+        try:
+            ok = frame.evaluate(
+                """(code) => {
+                    const bad = new Set(['email','password','checkbox','radio','submit','button','file','hidden','range','color']);
+                    const visibles = Array.from(document.querySelectorAll('input')).filter(el => {
+                        const t = (el.type || '').toLowerCase();
+                        if (bad.has(t)) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width >= 8 && r.height >= 8;
+                    });
+                    if (!visibles.length) return false;
+                    const digitos = visibles.filter(el => (el.getAttribute('maxlength') || '') === '1');
+                    const targets = digitos.length >= Math.min(4, code.length)
+                        ? digitos.slice(0, code.length)
+                        : [visibles[0]];
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value')?.set;
+                    const setVal = (el, v) => {
+                        el.focus();
+                        if (setter) setter.call(el, v);
+                        else el.value = v;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        try {
+                            el.dispatchEvent(new InputEvent('input', {
+                                bubbles: true, data: v, inputType: 'insertText'
+                            }));
+                        } catch (e) {}
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    };
+                    if (targets.length === 1) {
+                        setVal(targets[0], code);
+                        return (targets[0].value || '') === code;
+                    }
+                    for (let i = 0; i < targets.length; i++) {
+                        setVal(targets[i], code[i] || '');
+                    }
+                    return targets.every((el, i) => (el.value || '') === (code[i] || ''));
+                }""",
+                codigo,
+            )
+            if ok:
+                return True
+            leido = leer_otp_cajas_visibles(page)
+            if leido == codigo:
+                return True
+        except Exception:
+            continue
+
+    # Teclado humano sobre el primer input candidato
+    try:
+        caja = esperar_locator_en_frames(
+            page,
+            [
+                'input[autocomplete="one-time-code"]',
+                'input[maxlength="1"]',
+                'input[maxlength="6"]',
+                'input[maxlength="5"]',
+                'input[inputmode="numeric"]',
+                'input[name*="code" i]',
+                'input[type="tel"]',
+                'input[type="text"]',
+                'input[type="number"]',
+            ],
+            timeout_s=2.5,
+        )
+        if caja:
+            try:
+                caja.click(timeout=800)
+            except Exception:
+                pass
+            try:
+                caja.fill("")
+            except Exception:
+                pass
+            try:
+                page.keyboard.type(codigo, delay=70)
+            except Exception:
+                try:
+                    caja.type(codigo, delay=70)
+                except Exception:
+                    pass
+            time.sleep(0.35)
+            try:
+                if (caja.input_value() or "").strip() == codigo:
+                    return True
+            except Exception:
+                pass
+            if leer_otp_cajas_visibles(page) == codigo:
+                return True
+            # A veces React no expone value pero el código ya se aceptó
+            try:
+                u = (page.url or "").lower()
+            except Exception:
+                u = ""
+            if "login" not in u and "authorize" not in u and (
+                "account.tidal.com" in u or "listen.tidal.com" in u
+            ):
+                return True
+    except Exception:
+        pass
     return False
 
 
@@ -9774,9 +9930,28 @@ class TidalFamilyInviter:
             url = (self.page.url or "").lower()
             if "/login/tidal/return" in url or "/login/tidal/callback" in url:
                 return False
+            # En /family|/profile el input email de invitar NO es login
+            if (
+                "account.tidal.com" in url
+                and "/login" not in url
+                and "authorize" not in url
+                and any(p in url for p in (
+                    "/family", "/profile", "/subscription", "/overview",
+                    "/payment", "/store", "/overview",
+                ))
+            ):
+                return False
             if "login.tidal.com" in url or "/authorize" in url:
                 return True
-            return bool(_formulario_login_visible(self.page))
+            # account.tidal.com/login* sigue siendo login (aunque no haya input email aún)
+            if "account.tidal.com" in url and "/login" in url:
+                return True
+            if _formulario_login_visible(self.page):
+                return True
+            # Pantalla OTP del titular (6 cajas o 1 caja) sin email/password clásico
+            if contar_cajas_otp_visibles(self.page) >= 1 or _invite_hay_pantalla_codigo(self.page):
+                return True
+            return False
         except Exception:
             return False
 
@@ -10016,32 +10191,39 @@ class TidalFamilyInviter:
                     url = (self.page.url or "").lower()
                 except Exception:
                     break
-                if self._hay_login_titular_visible():
+                if self._hay_login_titular_visible() and "family" not in url:
                     break
                 if "/login/tidal/return" in url or "/login/tidal/callback" in url:
                     time.sleep(1.0)
                     continue
-                # Éxito real: URL /family + UI de invitar (no solo la palabra "member")
-                if "family" in url and "account.tidal.com" in url:
+                # Como en sesiones_imap.py: /family autenticado = éxito (CTA puede tardar)
+                if "family" in url and "account.tidal.com" in url and "login" not in url:
                     if _familia_ui_lista_para_invitar(self.page):
                         print(f"  [Inviter] {Color.GREEN}Sesión iniciada con éxito para titular: "
                               f"{titular['correo']}{Color.ENDC}")
                         return True
-                    # Esperar a que el SPA pinte el CTA
                     time.sleep(1.0)
                     continue
                 time.sleep(1.0)
+
+            try:
+                url_fin = (self.page.url or "").lower()
+            except Exception:
+                url_fin = ""
+            if "family" in url_fin and "account.tidal.com" in url_fin and "login" not in url_fin:
+                print(f"  [Inviter] {Color.GREEN}Sesión iniciada con éxito para titular: "
+                      f"{titular['correo']}{Color.ENDC}")
+                return True
             time.sleep(2.0)
 
-        # Último recurso: sesión activa → forzar /family y exigir UI de invitar
+        # Último recurso: sesión activa → forzar /family
         try:
             if self._sesion_titular_activa(titular):
                 print(f"  [Inviter] {Color.WARNING}[{titular['correo']}] Reintentando /family "
                       f"con sesión activa...{Color.ENDC}")
-                if _recargar_pagina_familia(self.page) and _familia_ui_lista_para_invitar(self.page):
+                if _recargar_pagina_familia(self.page):
                     print(f"  [Inviter] {Color.GREEN}Panel familiar listo para {titular['correo']}{Color.ENDC}")
                     return True
-                # Aún sin CTA: devolver True solo si la URL es /family (invitar_... reintentará abrir)
                 try:
                     u = (self.page.url or "").lower()
                 except Exception:
@@ -10286,13 +10468,13 @@ class TidalFamilyInviter:
             pass
 
         email_selectors = ['input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]', '#email']
-        email_input = esperar_locator_en_frames(self.page, email_selectors, timeout_s=12.0)
+        email_input = esperar_locator_en_frames(self.page, email_selectors, timeout_s=20.0)
         if not email_input:
             # Puede que el login haya terminado mientras esperábamos el input
             print(f"  [Inviter] [WARN] No apareció el campo de correo para {titular['correo']}. "
                   f"Comprobando si ya quedó logueado...")
-            if self._sesion_titular_activa(titular):
-                return self._abrir_panel_familia(titular)
+            if self._sesion_titular_activa(titular) or self._sesion_cuenta_ya_abierta():
+                return self._abrir_panel_familia(titular) or True
             print(f"  [Inviter] [WARN] Sin campo de correo ni sesión activa para {titular['correo']}.")
             return False
 
@@ -10345,10 +10527,16 @@ class TidalFamilyInviter:
             print(f"  [Inviter] [{titular['correo']}] Hay campo password pero no hay "
                   f"contraseña en sesiones_imap_cuentas.txt. Cambiando a modo código...")
             if not self._cambiar_a_modo_codigo_si_hay_password(titular):
-                print(f"  [Inviter] {Color.FAIL}[{titular['correo']}] Sigue en password y "
-                      f"no hay clave guardada ni modo código. Anota la contraseña del "
-                      f"titular en sesiones_imap_cuentas.txt.{Color.ENDC}")
-                return False
+                print(f"  [Inviter] {Color.WARNING}[{titular['correo']}] Sigue el campo password; "
+                      f"se insiste en modo código / IMAP (como en sesiones_imap.py). "
+                      f"Conviene anotar la clave en sesiones_imap_cuentas.txt.{Color.ENDC}")
+                # No abortar: a veces el switch tarda o el OTP llega igual
+                for _extra in range(3):
+                    time.sleep(1.2)
+                    if self._cambiar_a_modo_codigo_si_hay_password(titular):
+                        break
+                    if _invite_hay_pantalla_codigo(self.page) or contar_cajas_otp_visibles(self.page) >= 1:
+                        break
         else:
             # Por si aparece password más tarde, intentamos forzar código de todas formas
             self._cambiar_a_modo_codigo_si_hay_password(titular)
@@ -10492,41 +10680,10 @@ class TidalFamilyInviter:
                     pass
                 # Reutilizar el mismo OTP (p.ej. 009740): no perder ceros a la izquierda
                 codigo_otp = re.sub(r"\D", "", str(code_or_link or ""))
-                if escribir_codigo_verificacion_inteligente(self.page, codigo_otp):
+                if escribir_otp_login_titular(self.page, codigo_otp):
                     escrito = True
                     print(f"  [Inviter] [{titular['correo']}] Código OTP escrito correctamente.")
                     break
-                # Fallback: una sola caja visible no-email
-                try:
-                    caja = esperar_locator_en_frames(
-                        self.page,
-                        [
-                            'input[autocomplete="one-time-code"]',
-                            'input[maxlength="6"]',
-                            'input[maxlength="5"]',
-                            'input[inputmode="numeric"]',
-                            'input[name*="code" i]',
-                            'input[type="tel"]',
-                            'input[type="text"]',
-                        ],
-                        timeout_s=3.0,
-                    )
-                    if caja:
-                        caja.click(timeout=800)
-                        caja.fill("")
-                        caja.type(codigo_otp, delay=70)
-                        time.sleep(0.3)
-                        leido = ""
-                        try:
-                            leido = (caja.input_value() or "").strip()
-                        except Exception:
-                            pass
-                        if leido == codigo_otp or leer_otp_cajas_visibles(self.page) == codigo_otp:
-                            escrito = True
-                            print(f"  [Inviter] [{titular['correo']}] Código OTP escrito (fallback 1 caja).")
-                            break
-                except Exception:
-                    pass
                 print(f"  [Inviter] [WARN] No se pudo escribir el código "
                       f"(intento {reintento}/5). Reintentando...")
                 time.sleep(1.8)
@@ -10569,6 +10726,13 @@ class TidalFamilyInviter:
             if not self.page or self.page.is_closed():
                 return False
             if self._hay_login_titular_visible():
+                return False
+            # Password / OTP todavía = no hay sesión
+            if encontrar_locator_en_frames(
+                self.page, ['input[type="password"]', 'input[name="password"]']
+            ):
+                return False
+            if contar_cajas_otp_visibles(self.page) >= 1:
                 return False
             if _familia_ui_lista_para_invitar(self.page):
                 return True
@@ -10665,10 +10829,18 @@ class TidalFamilyInviter:
             self.page = pagina_vigente(self.page)
             # Siempre reafirmar /family + UI de invitar (evita invitar desde /profile tras el login)
             print(f"  [Inviter] Preparando /family para invitar a {miembro_correo}...")
-            if not _recargar_pagina_familia(self.page):
+            family_ok = _recargar_pagina_familia(self.page)
+            self.page = pagina_vigente(self.page)
+            try:
+                url_now = (self.page.url or "").lower()
+            except Exception:
+                url_now = ""
+            # Como sesiones_imap.py: si la URL ya es /family, no abortar aunque el CTA tarde
+            if not family_ok and ("family" not in url_now or "login" in url_now or "authorize" in url_now):
                 print(f"  [Inviter] ERROR al navegar a /family")
                 return False
-            self.page = pagina_vigente(self.page)
+            if not family_ok:
+                print(f"  [Inviter] [WARN] /family cargó lento; se intenta invitar igual...")
             aceptar_cookies_con_espera(self.page)
 
             if not _familia_ui_lista_para_invitar(self.page):
@@ -10935,15 +11107,8 @@ def restablecer_contrasenas_tidal(correos=None):
             total_m += len(tj["miembros"])
             print(f"    • {tj['correo_titular']} ← {tj['miembros']}")
         print(f"  [Paso 9] Total miembros a invitar: {total_m}")
-
-        family_invite_queue = queue.Queue()
-        family_invite_queue.put(None)  # sentinel por si el hilo cae al modo cola
-        inviter = TidalFamilyInviter(
-            family_invite_queue,
-            trabajos_por_titular=trabajos_inv,
-        )
-        inviter_thread = threading.Thread(target=inviter.run_inviter, daemon=True)
-        inviter_thread.start()
+        print(f"  [Paso 9] El invitador arrancará DESPUÉS de los restablecimientos "
+              f"(evita pelear la misma IP real con N ventanas Chrome).")
     else:
         print(f"\n{Color.WARNING}[Paso 9] Ningún correo procesado figura como MIEMBROS en "
               f"{path_titular.name}. Se omite la invitación al plan familiar.{Color.ENDC}")
@@ -11015,7 +11180,25 @@ def restablecer_contrasenas_tidal(correos=None):
                     print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
                     fail_count += 1
 
-    if inviter_thread and inviter_thread.is_alive():
+    # Tras los resets: una sola ventana del titular (misma IP real, sin competencia)
+    if trabajos_inv:
+        print(f"\n{Color.CYAN}{Color.BOLD}[Paso 9] Restablecimientos listos. "
+              f"Iniciando invitaciones al plan familiar...{Color.ENDC}")
+        time.sleep(random.uniform(2.0, 4.0))
+        family_invite_queue = queue.Queue()
+        family_invite_queue.put(None)  # sentinel por si el hilo cae al modo cola
+        inviter = TidalFamilyInviter(
+            family_invite_queue,
+            trabajos_por_titular=trabajos_inv,
+        )
+        inviter_thread = threading.Thread(target=inviter.run_inviter, daemon=True)
+        inviter_thread.start()
+        print(f"\n{Color.CYAN}Esperando a que finalice el proceso de invitación familiar...{Color.ENDC}")
+        inviter_thread.join(timeout=1200.0)
+        if inviter_thread.is_alive():
+            print(f"  {Color.WARNING}[Paso 9] El invitador sigue en curso tras 20 min; "
+                  f"el hilo daemon terminará al cerrar el proceso.{Color.ENDC}")
+    elif inviter_thread and inviter_thread.is_alive():
         print(f"\n{Color.CYAN}Esperando a que finalice el proceso de invitación familiar...{Color.ENDC}")
         inviter_thread.join(timeout=1200.0)
         if inviter_thread.is_alive():
