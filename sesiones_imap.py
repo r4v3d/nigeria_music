@@ -182,14 +182,13 @@ def _csv_clave_reserva(path: Path) -> str:
 
 
 def csv_pertenece_a_cuenta(path: Path | None, client_email: str) -> bool:
-    """True solo si el nombre del CSV es el correo (o alias Gmail inequívoco)."""
+    """True solo si el nombre del CSV es el correo EXACTO (respetando puntos Gmail)."""
     if not path or not client_email:
         return False
-    stem = path.stem.strip().lower()
-    email_l = client_email.strip().lower()
+    stem = path.stem.strip()
     if not stem or "@" not in stem:
         return False
-    return stem == email_l or son_correos_equivalentes(stem, email_l)
+    return correos_iguales_exacto(stem, client_email)
 
 
 def reservar_csv_para_cuenta(path: Path, client_email: str) -> bool:
@@ -254,13 +253,13 @@ def _elegir_csv_preferido(candidatos: list[Path], client_email: str) -> Path | N
 def resolver_csv_cuenta(
     client_email: str,
     *,
-    permitir_alias: bool = True,
+    permitir_alias: bool = False,
     respetar_reservas: bool = True,
 ) -> Path | None:
-    """Localiza el CSV de UNA cuenta en descargas/.
+    """Localiza el CSV de UNA cuenta en descargas/ por nombre EXACTO (con puntos).
 
-    Orden: nombre exacto (case-insensitive) → alias Gmail solo si hay un único candidato
-    libre. Nunca usa startswith. Respeta reservas exclusivas de otras cuentas.
+    permitir_alias se ignora (legacy): nunca emparejar hermanos Gmail
+    (getm.ushroom9470.csv ≠ getm.ushro.om94.70.csv).
     """
     email_l = (client_email or "").strip().lower()
     if not email_l:
@@ -270,25 +269,19 @@ def resolver_csv_cuenta(
         return None
 
     exactos = []
-    aliases = []
     for f in archivos:
         if respetar_reservas and _csv_reservado_por_otra(f, email_l):
             continue
-        stem = f.stem.strip().lower()
-        if stem == email_l:
+        if correos_iguales_exacto(f.stem.strip(), client_email):
             exactos.append(f)
-        elif permitir_alias and "@" in stem and son_correos_equivalentes(stem, email_l):
-            aliases.append(f)
 
     if exactos:
         return _elegir_csv_preferido(exactos, client_email)
-    if permitir_alias and len(aliases) == 1:
-        return aliases[0]
     return None
 
 
 def asignar_csvs_a_cuentas(correos: list[str]) -> dict[str, Path | None]:
-    """Asigna CSV↔cuenta 1:1 para un lote (opción 8). Exacto primero; alias Gmail solo si único.
+    """Asigna CSV↔cuenta 1:1 para un lote (opción 8). Solo nombre EXACTO con puntos.
 
     Un mismo archivo nunca se asigna a dos cuentas. Devuelve dict correo → Path|None.
     """
@@ -300,41 +293,28 @@ def asignar_csvs_a_cuentas(correos: list[str]) -> dict[str, Path | None]:
     archivos = _listar_csvs_descargas()
 
     for correo in correos:
-        email_l = correo.strip().lower()
         exactos = [
             f for f in archivos
-            if f.stem.strip().lower() == email_l and _csv_clave_reserva(f) not in usados
+            if correos_iguales_exacto(f.stem.strip(), correo)
+            and _csv_clave_reserva(f) not in usados
         ]
         elegido = _elegir_csv_preferido(exactos, correo)
         if elegido:
             resultado[correo] = elegido
             usados.add(_csv_clave_reserva(elegido))
             reservar_csv_para_cuenta(elegido, correo)
-
-    for correo in correos:
-        if resultado[correo] is not None:
-            continue
-        email_l = correo.strip().lower()
-        aliases = []
-        for f in archivos:
-            clave = _csv_clave_reserva(f)
-            if clave in usados:
-                continue
-            stem = f.stem.strip().lower()
-            if "@" not in stem:
-                continue
-            if son_correos_equivalentes(stem, email_l):
-                aliases.append(f)
-        if len(aliases) == 1:
-            elegido = aliases[0]
-            resultado[correo] = elegido
-            usados.add(_csv_clave_reserva(elegido))
-            reservar_csv_para_cuenta(elegido, correo)
-        elif len(aliases) > 1:
-            nombres = ", ".join(a.name for a in aliases[:5])
-            print(f"  {Color.WARNING}[CSV] [{correo}] Alias Gmail ambiguo "
-                  f"({len(aliases)} archivos: {nombres}). "
-                  f"Renombra a '{correo}.csv' para emparejarlo.{Color.ENDC}")
+        else:
+            # Aviso si hay CSV de hermanos Gmail (no se usan)
+            hermanos = [
+                f.name for f in archivos
+                if "@" in f.stem
+                and son_correos_equivalentes(f.stem, correo)
+                and not correos_iguales_exacto(f.stem, correo)
+            ]
+            if hermanos:
+                print(f"  {Color.WARNING}[CSV] [{correo}] Sin '{correo}.csv'. "
+                      f"Hay CSV de hermanos Gmail (NO se usan): {hermanos}. "
+                      f"Renombra el archivo al correo exacto.{Color.ENDC}")
 
     return resultado
 
@@ -600,11 +580,10 @@ def filtrar_cuentas_por_correos_activos(
     cuentas_map: dict[str, str],
     correos_activos: list[str] | None,
 ) -> dict[str, str] | None:
-    """Deja solo las cuentas del archivo que coinciden con los correos activos del menú.
+    """Deja solo las cuentas del archivo que coinciden EXACTO con los correos del menú.
 
-    Los correos activos se fijan al inicio o con la opción 6. Así varias instancias del
-    script pueden compartir el mismo sesiones_imap_cuentas.txt y procesar subsets distintos
-    en paralelo, sin preguntar.
+    Clave del resultado = correo del menú (con sus puntos). Nunca sustituir por un
+    hermano Gmail del .txt (getm.ushroom9470 ≠ getm.ushro.om94.70 en Tidal).
 
     Devuelve None si había activos pero ninguno está en el archivo (caller debe abortar).
     Si correos_activos está vacío/None, devuelve el mapa completo.
@@ -626,15 +605,32 @@ def filtrar_cuentas_por_correos_activos(
         for c_arch in cuentas_map:
             if c_arch in usados_arch:
                 continue
-            # Exacto con puntos: aliases Gmail ≠ cuentas Tidal distintas
             if correos_iguales_exacto(c_arch, c_menu):
                 elegido = c_arch
                 break
         if elegido is None:
+            # Aviso: hay hermanos en el archivo (mismo buzón, otros puntos) — NO usarlos
+            hermanos = [
+                c for c in cuentas_map
+                if son_correos_equivalentes(c, c_menu) and not correos_iguales_exacto(c, c_menu)
+            ]
             sin_match.append(c_menu)
+            if hermanos:
+                print(f"  {Color.WARNING}[Correos activos] '{c_menu}' no está EXACTO en el .txt; "
+                      f"hay hermanos Gmail (NO se usan): {hermanos}{Color.ENDC}")
             continue
-        filtrado[elegido] = cuentas_map[elegido]
+        # Conservar el correo del menú (no el del archivo, aunque sea igual ignorando mayúsculas)
+        filtrado[c_menu] = cuentas_map[elegido]
         usados_arch.add(elegido)
+        hermanos = [
+            c for c in cuentas_map
+            if c not in usados_arch
+            and son_correos_equivalentes(c, c_menu)
+            and not correos_iguales_exacto(c, c_menu)
+        ]
+        if hermanos:
+            print(f"  {Color.CYAN}[Correos activos] '{c_menu}' → fila exacta OK. "
+                  f"Hermanos en archivo (ignorados): {hermanos}{Color.ENDC}")
 
     total_arch = len(cuentas_map)
     print(f"\n{Color.CYAN}[Correos activos]{Color.ENDC} Menú: {len(correos_activos)} | "
@@ -642,14 +638,15 @@ def filtrar_cuentas_por_correos_activos(
     for c_arch in filtrado:
         print(f"  {Color.GREEN}✓{Color.ENDC} {c_arch}")
     if sin_match:
-        print(f"{Color.WARNING}[Correos activos] Sin fila en sesiones_imap_cuentas.txt "
+        print(f"{Color.WARNING}[Correos activos] Sin fila EXACTA en sesiones_imap_cuentas.txt "
               f"(se omiten):{Color.ENDC}")
         for c in sin_match:
             print(f"  {Color.FAIL}✗{Color.ENDC} {c}")
 
     if not filtrado:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} Ningún correo activo del menú está en "
-              f"sesiones_imap_cuentas.txt. Usa la opción 6 o anota correo+contraseña en el archivo.")
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} Ningún correo activo del menú está EXACTO en "
+              f"sesiones_imap_cuentas.txt. Usa la opción 6 o anota correo+contraseña (con los "
+              f"mismos puntos) en el archivo.")
         return None
 
     if len(filtrado) < total_arch:
@@ -661,13 +658,11 @@ def filtrar_cuentas_por_correos_activos(
 def guardar_credencial_cuenta(correo: str, pwd: str) -> bool:
     """Registra 'correo<TAB>contraseña' en sesiones_imap_cuentas.txt si aún no está.
 
-    Sin esto, las cuentas creadas por la opción 14 quedaban sin su contraseña de Tidal anotada
-    y las opciones 9/10/11 no podían iniciar sesión con ellas después.
+    Compara EXACTO con puntos: un hermano Gmail es otra fila Tidal y se puede añadir.
     """
     if not correo or not pwd:
         return False
     path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
-    correo_clean = clean_email(correo)
     with CUENTAS_FILE_LOCK:
         try:
             existentes = []
@@ -678,7 +673,7 @@ def guardar_credencial_cuenta(correo: str, pwd: str) -> bool:
                 if not line or line.startswith("#"):
                     continue
                 parts = line.replace(",", " ").replace("=", " ").split()
-                if parts and clean_email(parts[0].strip().strip('"').strip("'")) == correo_clean:
+                if parts and correos_iguales_exacto(parts[0].strip().strip('"').strip("'"), correo):
                     return False
             with open(path_cuentas, "a", encoding="utf-8") as f:
                 if existentes and existentes[-1].strip():
@@ -10327,26 +10322,71 @@ class TidalAutoLoginManager:
         return bool(self.hay_campo_codigo())
 
     def verificar_destino_del_codigo(self, target_email_clean: str) -> bool:
-        """Confirma que Tidal muestra el correo de la cuenta como destino del código de eliminación."""
+        """Confirma que el destino del código es usable vía IMAP (correo registrado / passwords.txt).
+
+        Exacto con puntos: hermano Gmail ≠ misma cuenta Tidal.
+        """
+        target = (target_email_clean or "").strip().lower()
+        login = (self.client_email or "").strip().lower()
+        perfil = (getattr(self, "correo_registrado_perfil", None) or "").strip().lower()
+        if perfil and not target:
+            target = perfil
+
         try:
-            del_body = self.page.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''")
+            del_body = self.page.evaluate("() => document.body ? document.body.innerText : ''")
         except Exception:
             return True
 
-        candidatos = [
-            c for c in re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', del_body)
-            if not c.endswith("tidal.com")
-        ]
+        candidatos = []
+        vistos = set()
+        for c in re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', del_body or ""):
+            c_l = c.strip().lower()
+            if c_l.endswith("tidal.com") or c_l in vistos:
+                continue
+            vistos.add(c_l)
+            candidatos.append(c_l)
+
         if not candidatos:
-            print(f"  [Eliminación] [{self.client_email}] [Info] La pantalla no muestra el correo de destino; se continúa sin esa comprobación.")
+            print(f"  [Eliminación] [{self.client_email}] [Info] La pantalla no muestra el correo de "
+                  f"destino; se continúa (IMAP → {target or login}).")
             return True
 
-        correo_destino = candidatos[0]
-        if not son_correos_equivalentes(correo_destino, target_email_clean):
-            print(f"  [Eliminación] {Color.FAIL}[ALERTA] Tidal envía el código a '{correo_destino}', que NO coincide con '{self.client_email}'.{Color.ENDC}")
-            return False
-        print(f"  [Eliminación] {Color.GREEN}[OK] Confirmado: Tidal enviará el código a '{correo_destino}' (coincide con la cuenta IMAP).{Color.ENDC}")
-        return True
+        for c in candidatos:
+            if target and correos_iguales_exacto(c, target):
+                print(f"  [Eliminación] {Color.GREEN}[OK] Destino visible '{c}' coincide EXACTO "
+                      f"con '{target}'.{Color.ENDC}")
+                return True
+
+        if target and perfil and correos_iguales_exacto(perfil, target):
+            for c in candidatos:
+                if correos_iguales_exacto(c, login):
+                    print(f"  [Eliminación] {Color.WARNING}[Info] La pantalla muestra el nombre de "
+                          f"acceso '{c}', no el correo registrado.{Color.ENDC}")
+                    print(f"  [Eliminación] {Color.GREEN}[OK] Se continúa: IMAP en '{target}'.{Color.ENDC}")
+                    return True
+
+        if login:
+            for c in candidatos:
+                if correos_iguales_exacto(c, login) and (
+                    not target or correos_iguales_exacto(login, target)
+                ):
+                    print(f"  [Eliminación] {Color.GREEN}[OK] Destino '{c}' coincide EXACTO "
+                          f"con la cuenta de acceso/IMAP.{Color.ENDC}")
+                    return True
+
+        for c in candidatos:
+            if target and son_correos_equivalentes(c, target) and not correos_iguales_exacto(c, target):
+                print(f"  [Eliminación] {Color.FAIL}[ALERTA] Visible '{c}' es hermano Gmail de "
+                      f"'{target}' (puntos distintos = otra cuenta Tidal).{Color.ENDC}")
+                if login and correos_iguales_exacto(c, login):
+                    return True
+                if perfil and correos_iguales_exacto(c, perfil):
+                    return True
+
+        print(f"  [Eliminación] {Color.FAIL}[ALERTA] Correos visibles: {', '.join(candidatos)}."
+              f"{Color.ENDC}")
+        print(f"  [Eliminación] {Color.FAIL}Ninguno coincide EXACTO con '{target or login}'.{Color.ENDC}")
+        return False
 
     def forzar_reenvio_codigo(self) -> bool:
         """Pulsa 'Reenviar' si el botón está libre (sin cuenta atrás), señal de que no llegó nada."""
@@ -11761,13 +11801,18 @@ class TidalAutoLoginManager:
 
                     print(f"  [Verificación Email] Correo REAL registrado en perfil: '{current_email_value}' (Objetivo: '{target_email_clean}')")
 
-                    if current_email_value and son_correos_equivalentes(current_email_value, target_email_clean):
-                        print(f"  [Verificación Email] {Color.GREEN}[OK] El correo registrado ya coincide con el de acceso: {self.client_email}{Color.ENDC}")
+                    if current_email_value and correos_iguales_exacto(current_email_value, target_email_clean):
+                        print(f"  [Verificación Email] {Color.GREEN}[OK] El correo registrado ya coincide "
+                              f"EXACTO con el de acceso: {self.client_email}{Color.ENDC}")
                         correo_perfil_correcto = True
                         break
-
-                    # El correo NO coincide — hay que cambiarlo
-                    print(f"  [Verificación Email] {Color.WARNING}[ACTUALIZANDO] Reemplazando correo registrado '{current_email_value}' por '{self.client_email}'...{Color.ENDC}")
+                    if current_email_value and son_correos_equivalentes(current_email_value, target_email_clean):
+                        print(f"  [Verificación Email] {Color.WARNING}[ACTUALIZANDO] Perfil tiene hermano "
+                              f"Gmail '{current_email_value}' ≠ '{self.client_email}' (puntos distintos). "
+                              f"Se fuerza el correo EXACTO del menú.{Color.ENDC}")
+                    else:
+                        print(f"  [Verificación Email] {Color.WARNING}[ACTUALIZANDO] Reemplazando correo "
+                              f"registrado '{current_email_value}' por '{self.client_email}'...{Color.ENDC}")
                     try:
                         email_input.click(timeout=3000)
                         self.page.keyboard.press("Control+A")
@@ -11862,12 +11907,17 @@ class TidalAutoLoginManager:
                         except Exception:
                             pass
 
-                    if val_post and son_correos_equivalentes(val_post, target_email_clean):
-                        print(f"  [Verificación Email] {Color.GREEN}[ÉXITO] Correo actualizado y verificado correctamente: {self.client_email}{Color.ENDC}")
+                    if val_post and correos_iguales_exacto(val_post, target_email_clean):
+                        print(f"  [Verificación Email] {Color.GREEN}[ÉXITO] Correo actualizado y verificado "
+                              f"EXACTO: {self.client_email}{Color.ENDC}")
                         correo_perfil_correcto = True
                         break
+                    if val_post and son_correos_equivalentes(val_post, target_email_clean):
+                        print(f"  [Verificación Email] {Color.WARNING}[WARN] Perfil aún muestra hermano "
+                              f"Gmail '{val_post}' ≠ '{self.client_email}'. Reintentando...{Color.ENDC}")
                     else:
-                        print(f"  [Verificación Email] {Color.WARNING}[WARN] El correo aún no coincide tras guardar (leído: '{val_post}'). Reintentando...{Color.ENDC}")
+                        print(f"  [Verificación Email] {Color.WARNING}[WARN] El correo aún no coincide "
+                              f"tras guardar (leído: '{val_post}'). Reintentando...{Color.ENDC}")
 
                 except Exception as e_edit:
                     print(f"  [Verificación Email] [WARN] Error durante verificación/edición de perfil "
