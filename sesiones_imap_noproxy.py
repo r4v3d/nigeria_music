@@ -653,12 +653,17 @@ def clean_email(email_str: str) -> str:
     return email_str
 
 def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
-    """Busca la contraseña de una cuenta en sesiones_imap_cuentas.txt o passwords.txt."""
+    """Busca la contraseña Tidal EXACTA en sesiones_imap_cuentas.txt (o passwords.txt).
+
+    Crítico: en Tidal getm.us.hroom19.55 ≠ get.mushroom1.9.55 aunque Gmail sea el mismo
+    buzón. Nunca usar son_correos_equivalentes aquí: devolvía la clave de otra fila
+    (p.ej. 292949 en vez de 153351) y tras el reset el login fallaba con 'incorrecta'.
+    """
     if not correo_solicitado:
         return None
-    correo_clean = clean_email(correo_solicitado)
-    
-    # 1. Buscar en sesiones_imap_cuentas.txt
+    correo_solicitado = (correo_solicitado or "").strip()
+
+    # 1. Exacto en sesiones_imap_cuentas.txt (primera pasada: igualdad con puntos)
     path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
     if path_cuentas.exists():
         try:
@@ -666,23 +671,29 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                # Soportar separadores: espacios, comillas, coma, tab, signo igual
-                line_normalized = line.replace(",", " ").replace("=", " ")
-                parts = line_normalized.split()
-                if len(parts) >= 2:
-                    c = parts[0].strip().strip('"').strip("'")
+                # Separadores: tab, espacios, coma, =
+                if "\t" in line:
+                    parts = [p for p in line.split("\t") if p.strip()]
+                else:
+                    line_normalized = line.replace(",", " ").replace("=", " ")
+                    parts = line_normalized.split()
+                if len(parts) < 2:
+                    continue
+                c = parts[0].strip().strip('"').strip("'")
+                # Contraseña = resto de la línea (por si tiene espacios)
+                if "\t" in line and len(parts) >= 2:
                     p = parts[1].strip().strip('"').strip("'")
-                    if clean_email(c) == correo_clean:
-                        return p
-                    try:
-                        if son_correos_equivalentes(c, correo_solicitado) and p:
-                            return p
-                    except Exception:
-                        pass
+                else:
+                    # Tras el correo: unir el resto por si la clave tuviera espacios
+                    p = " ".join(parts[1:]).strip().strip('"').strip("'")
+                if not c or "@" not in c or not p:
+                    continue
+                if correos_iguales_exacto(c, correo_solicitado):
+                    return p
         except Exception:
             pass
 
-    # 2. Fallback a passwords.txt
+    # 2. Fallback passwords.txt (clave IMAP / genérica): solo match exacto del correo
     path_pwds = SCRIPT_DIR / "passwords.txt"
     if path_pwds.exists():
         try:
@@ -691,9 +702,9 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                k_clean = k.strip().lower()
+                k_clean = k.strip()
                 v_clean = v.strip().strip('"').strip("'")
-                if correo_clean in clean_email(k_clean) and v_clean:
+                if correos_iguales_exacto(k_clean, correo_solicitado) and v_clean:
                     return v_clean
         except Exception:
             pass
@@ -754,7 +765,8 @@ def filtrar_cuentas_por_correos_activos(
         for c_arch, pwd in cuentas_map.items():
             if c_arch in usados_arch:
                 continue
-            if clean_email(c_arch) == clean_email(c_menu) or son_correos_equivalentes(c_arch, c_menu):
+            # Exacto con puntos: aliases Gmail ≠ cuentas Tidal distintas
+            if correos_iguales_exacto(c_arch, c_menu):
                 elegido = c_arch
                 break
         if elegido is None:
@@ -1990,89 +2002,216 @@ def abrir_enlace_restablecimiento_con_autocierre(url: str, correo: str, proxy_pe
         # Rellenar nueva contraseña + confirmación y enviar
         if pwd_cuenta:
             try:
-                print(f"    [Reset] [{correo}] Colocando contraseña a restablecer...")
-                pwd_new1 = page.locator(
-                    'input[name="newPassword"], input[type="password"], input[name="password"]'
-                ).first
-                if esperar_visibilidad(pwd_new1, 15000):
-                    rellenar_campo_humanizado(pwd_new1, pwd_cuenta)
+                # Mostrar huella (no la clave completa) para detectar mismatches de alias Gmail
+                _huella = f"{pwd_cuenta[:2]}…{pwd_cuenta[-2:]}" if len(pwd_cuenta) >= 4 else "(corta)"
+                print(f"    [Reset] [{correo}] Colocando contraseña a restablecer "
+                      f"(exacta del .txt, len={len(pwd_cuenta)}, huella={_huella})...")
+
+                def _rellenar_pwd_reset(locator, valor: str) -> bool:
+                    """Rellena password de forma fiable (fill + type + JS) y verifica valor."""
+                    if not locator:
+                        return False
                     try:
-                        pwd_new2 = page.locator(
-                            'input[name="confirmNewPassword"], input[id*="confirm" i]'
-                        ).first
-                        if pwd_new2.count() > 0 and pwd_new2.is_visible():
-                            rellenar_campo_humanizado(pwd_new2, pwd_cuenta)
+                        locator.click(timeout=3000)
                     except Exception:
                         pass
-                    time.sleep(0.8)
-
-                    btn_submit = (
-                        page.locator("button[type='submit']")
-                        .or_(page.locator("button:has-text('Restablecer contraseña')"))
-                        .or_(page.locator("button:has-text('Reset password')"))
-                        .or_(page.locator("button:has-text('Guardar')"))
-                        .or_(page.locator("button:has-text('Save')"))
-                        .or_(page.locator("button:has-text('Continuar')"))
-                        .or_(page.locator("button:has-text('Continue')"))
-                        .first
-                    )
-                    if esperar_visibilidad(btn_submit, 8000):
+                    try:
+                        locator.fill("")
+                    except Exception:
+                        pass
+                    try:
+                        locator.fill(valor)
+                    except Exception:
                         try:
-                            btn_submit.evaluate("el => el.click()")
-                        except Exception:
-                            try:
-                                btn_submit.click(force=True)
-                            except Exception:
-                                page.keyboard.press("Enter")
-                    else:
-                        page.keyboard.press("Enter")
-
-                    # Confirmar éxito (URL / texto) unos segundos
-                    for _ in range(20):
-                        time.sleep(0.5)
-                        try:
-                            u = (page.url or "").lower()
-                        except Exception:
-                            u = ""
-                        if any(x in u for x in ("/success", "/login", "signin", "account.tidal")):
-                            # Evitar falsos positivos si seguimos en la misma página de reset
-                            if "reset" not in u and "newpassword" not in u and "token" not in u:
-                                success_detected = True
-                                break
-                        try:
-                            if page.locator(
-                                "text=contraseña se ha restablecido"
-                            ).or_(page.locator("text=password has been reset")).or_(
-                                page.locator("text=Password updated")
-                            ).or_(page.locator("text=contraseña actualizada")).or_(
-                                page.locator("text=Ya puedes iniciar")
-                            ).or_(page.locator("text=You can now")).count() > 0:
-                                success_detected = True
-                                break
+                            locator.type(valor, delay=40)
                         except Exception:
                             pass
-                        # Si el formulario de nueva contraseña desapareció, dar por bueno
+                    time.sleep(0.2)
+                    leido = ""
+                    try:
+                        leido = (locator.input_value() or "")
+                    except Exception:
+                        leido = ""
+                    if leido == valor:
+                        return True
+                    # JS + setter nativo (React a veces ignora fill)
+                    try:
+                        ok = locator.evaluate(
+                            """(el, v) => {
+                                el.focus();
+                                const setter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'value')?.set;
+                                if (setter) setter.call(el, v);
+                                else el.value = v;
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                try {
+                                    el.dispatchEvent(new InputEvent('input', {
+                                        bubbles: true, data: v, inputType: 'insertText'
+                                    }));
+                                } catch (e) {}
+                                return (el.value || '') === v;
+                            }""",
+                            valor,
+                        )
+                        if ok:
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        locator.click(timeout=1500)
+                        locator.press("Control+a")
+                        locator.type(valor, delay=50)
+                        time.sleep(0.15)
+                        return (locator.input_value() or "") == valor
+                    except Exception:
+                        return False
+
+                # Preferir name=newPassword (no confundir con confirm)
+                pwd_new1 = esperar_locator_en_frames(
+                    page,
+                    [
+                        'input[name="newPassword"]',
+                        'input[id*="newPassword" i]',
+                        'input[autocomplete="new-password"]',
+                        'input[type="password"]',
+                    ],
+                    timeout_s=8.0,
+                )
+                if not pwd_new1:
+                    pwd_new1 = page.locator(
+                        'input[name="newPassword"], input[type="password"], input[name="password"]'
+                    ).first
+                    if not esperar_visibilidad(pwd_new1, 8000):
+                        pwd_new1 = None
+
+                if pwd_new1:
+                    if not _rellenar_pwd_reset(pwd_new1, pwd_cuenta):
+                        print(f"    {Color.FAIL}[Reset] [{correo}] No se pudo escribir la "
+                              f"contraseña en el campo principal.{Color.ENDC}")
+                    else:
+                        # Confirmación (mismo valor exacto)
                         try:
-                            still = page.locator('input[name="newPassword"]').first
-                            if still.count() == 0 or not still.is_visible():
-                                # Puede haber navegado; comprobar que no sea error
-                                if "error" not in u and "blocked" not in u:
+                            pwd_new2 = esperar_locator_en_frames(
+                                page,
+                                [
+                                    'input[name="confirmNewPassword"]',
+                                    'input[id*="confirm" i]',
+                                    'input[name*="confirm" i]',
+                                    'input[autocomplete="new-password"]',
+                                ],
+                                timeout_s=2.0,
+                            )
+                            # Si hay varios password, el 2º suele ser confirm
+                            if not pwd_new2:
+                                todos = page.locator('input[type="password"]').all()
+                                visibles = []
+                                for ip in todos:
+                                    try:
+                                        if ip.is_visible():
+                                            visibles.append(ip)
+                                    except Exception:
+                                        pass
+                                if len(visibles) >= 2:
+                                    pwd_new2 = visibles[1]
+                            if pwd_new2:
+                                if not _rellenar_pwd_reset(pwd_new2, pwd_cuenta):
+                                    print(f"    {Color.WARNING}[Reset] [{correo}] Confirmación "
+                                          f"de contraseña no coincidió al escribir; reintento...")
+                                    _rellenar_pwd_reset(pwd_new2, pwd_cuenta)
+                        except Exception:
+                            pass
+
+                        # Verificar que ambos campos (si hay) tienen el valor del .txt
+                        try:
+                            v1 = (pwd_new1.input_value() or "")
+                            if v1 != pwd_cuenta:
+                                print(f"    {Color.FAIL}[Reset] [{correo}] Tras rellenar, el campo "
+                                      f"no tiene la contraseña del .txt (len leída={len(v1)} vs "
+                                      f"{len(pwd_cuenta)}).{Color.ENDC}")
+                        except Exception:
+                            pass
+
+                        time.sleep(0.8)
+
+                        btn_submit = (
+                            page.locator("button[type='submit']")
+                            .or_(page.locator("button:has-text('Restablecer contraseña')"))
+                            .or_(page.locator("button:has-text('Reset password')"))
+                            .or_(page.locator("button:has-text('Guardar')"))
+                            .or_(page.locator("button:has-text('Save')"))
+                            .or_(page.locator("button:has-text('Continuar')"))
+                            .or_(page.locator("button:has-text('Continue')"))
+                            .first
+                        )
+                        if esperar_visibilidad(btn_submit, 8000):
+                            try:
+                                btn_submit.evaluate("el => el.click()")
+                            except Exception:
+                                try:
+                                    btn_submit.click(force=True)
+                                except Exception:
+                                    page.keyboard.press("Enter")
+                        else:
+                            page.keyboard.press("Enter")
+
+                        # Confirmar éxito (URL / texto) — sin falsos positivos agresivos
+                        for _ in range(24):
+                            time.sleep(0.5)
+                            try:
+                                u = (page.url or "").lower()
+                            except Exception:
+                                u = ""
+                            try:
+                                if page.locator(
+                                    "text=contraseña se ha restablecido"
+                                ).or_(page.locator("text=password has been reset")).or_(
+                                    page.locator("text=Password updated")
+                                ).or_(page.locator("text=contraseña actualizada")).or_(
+                                    page.locator("text=Ya puedes iniciar")
+                                ).or_(page.locator("text=You can now")).count() > 0:
                                     success_detected = True
                                     break
-                        except Exception:
-                            success_detected = True
-                            break
-
-                    if not success_detected:
-                        # Tras submit, si no hay error claro, asumir OK (Tidal a veces no cambia URL)
-                        try:
-                            err = page.locator("text=Algo salió mal").or_(
-                                page.locator("text=Something went wrong")
-                            ).or_(page.locator("text=invalid")).count()
-                            if err == 0:
+                            except Exception:
+                                pass
+                            if any(x in u for x in ("/success",)):
                                 success_detected = True
-                        except Exception:
-                            success_detected = True
+                                break
+                            if any(x in u for x in ("/login", "signin", "account.tidal")):
+                                if "reset" not in u and "newpassword" not in u and "token" not in u:
+                                    # Solo si el formulario de nueva pwd ya no está
+                                    try:
+                                        still = page.locator(
+                                            'input[name="newPassword"], input[type="password"]'
+                                        ).first
+                                        if still.count() == 0 or not still.is_visible():
+                                            success_detected = True
+                                            break
+                                    except Exception:
+                                        pass
+                            # Error explícito → no marcar OK
+                            try:
+                                if page.locator("text=Algo salió mal").or_(
+                                    page.locator("text=Something went wrong")
+                                ).or_(page.locator("text=incorrecta")).or_(
+                                    page.locator("text=do not match")
+                                ).count() > 0:
+                                    success_detected = False
+                                    break
+                            except Exception:
+                                pass
+
+                        if not success_detected:
+                            try:
+                                err = page.locator("text=Algo salió mal").or_(
+                                    page.locator("text=Something went wrong")
+                                ).or_(page.locator("text=do not match")).count()
+                                still = page.locator('input[name="newPassword"]').first
+                                form_gone = still.count() == 0 or not still.is_visible()
+                                if err == 0 and form_gone:
+                                    success_detected = True
+                            except Exception:
+                                pass
                 else:
                     print(f"    {Color.WARNING}[Reset] [{correo}] Campo de nueva contraseña no visible.{Color.ENDC}")
             except Exception as e_fill:
