@@ -11107,8 +11107,16 @@ def restablecer_contrasenas_tidal(correos=None):
             total_m += len(tj["miembros"])
             print(f"    • {tj['correo_titular']} ← {tj['miembros']}")
         print(f"  [Paso 9] Total miembros a invitar: {total_m}")
-        print(f"  [Paso 9] El invitador arrancará DESPUÉS de los restablecimientos "
-              f"(evita pelear la misma IP real con N ventanas Chrome).")
+
+        family_invite_queue = queue.Queue()
+        family_invite_queue.put(None)  # sentinel por si el hilo cae al modo cola
+        inviter = TidalFamilyInviter(
+            family_invite_queue,
+            trabajos_por_titular=trabajos_inv,
+        )
+        inviter_thread = threading.Thread(target=inviter.run_inviter, daemon=True)
+        inviter_thread.start()
+        print(f"  [Paso 9] Invitador familiar iniciado en paralelo con los restablecimientos.")
     else:
         print(f"\n{Color.WARNING}[Paso 9] Ningún correo procesado figura como MIEMBROS en "
               f"{path_titular.name}. Se omite la invitación al plan familiar.{Color.ENDC}")
@@ -11180,25 +11188,7 @@ def restablecer_contrasenas_tidal(correos=None):
                     print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
                     fail_count += 1
 
-    # Tras los resets: una sola ventana del titular (misma IP real, sin competencia)
-    if trabajos_inv:
-        print(f"\n{Color.CYAN}{Color.BOLD}[Paso 9] Restablecimientos listos. "
-              f"Iniciando invitaciones al plan familiar...{Color.ENDC}")
-        time.sleep(random.uniform(2.0, 4.0))
-        family_invite_queue = queue.Queue()
-        family_invite_queue.put(None)  # sentinel por si el hilo cae al modo cola
-        inviter = TidalFamilyInviter(
-            family_invite_queue,
-            trabajos_por_titular=trabajos_inv,
-        )
-        inviter_thread = threading.Thread(target=inviter.run_inviter, daemon=True)
-        inviter_thread.start()
-        print(f"\n{Color.CYAN}Esperando a que finalice el proceso de invitación familiar...{Color.ENDC}")
-        inviter_thread.join(timeout=1200.0)
-        if inviter_thread.is_alive():
-            print(f"  {Color.WARNING}[Paso 9] El invitador sigue en curso tras 20 min; "
-                  f"el hilo daemon terminará al cerrar el proceso.{Color.ENDC}")
-    elif inviter_thread and inviter_thread.is_alive():
+    if inviter_thread and inviter_thread.is_alive():
         print(f"\n{Color.CYAN}Esperando a que finalice el proceso de invitación familiar...{Color.ENDC}")
         inviter_thread.join(timeout=1200.0)
         if inviter_thread.is_alive():
