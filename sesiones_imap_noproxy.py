@@ -6574,111 +6574,170 @@ class TidalRegisterManager:
             
 
 
+            # Checkbox + Suscríbete: restaurar interacción Playwright real (el clic solo-JS
+            # reportaba "enviado" pero React no avanzaba al OTP). El lock del buzón solo
+            # serializa IMAP más abajo, no el clic UI.
             print("  [Registro] Marcando checkbox de términos...", flush=True)
-
-            def _marcar_terminos_y_habilitar_suscribir():
-                """Marca términos SIN cb.click()/label.click() (abre /terms y congela Playwright)."""
-                try:
-                    self.page.evaluate("""() => {
-                        const setChecked = (cb) => {
-                            try {
-                                const desc = Object.getOwnPropertyDescriptor(
-                                    window.HTMLInputElement.prototype, 'checked'
-                                );
-                                if (desc && desc.set) desc.set.call(cb, true);
-                                else cb.checked = true;
-                                cb.dispatchEvent(new Event('input', { bubbles: true }));
-                                cb.dispatchEvent(new Event('change', { bubbles: true }));
-                                cb.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                            } catch (e) {}
-                        };
-                        document.querySelectorAll('input[type="checkbox"]').forEach(setChecked);
-                        Array.from(document.querySelectorAll('button')).forEach(b => {
-                            const t = (b.textContent || '').toLowerCase();
-                            if (t.includes('suscríbete') || t.includes('suscribete') || t.includes('subscribe')
-                                || t.includes('crear cuenta') || t.includes('create account')
-                                || (b.getAttribute('type') || '') === 'submit') {
-                                b.disabled = false;
-                                b.removeAttribute('disabled');
-                                b.setAttribute('aria-disabled', 'false');
+            try:
+                self.page.evaluate("""() => {
+                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                    checkboxes.forEach(cb => {
+                        const parentText = cb.parentElement ? (cb.parentElement.textContent || '') : '';
+                        if (/Términos|Terms|Privacidad|Privacy|acuerdo|Agree/i.test(parentText)) {
+                            if (!cb.checked) {
+                                cb.click();
+                                if (!cb.checked) {
+                                    // Evitar label.click() si el label tiene <a href=/terms>
+                                    try { cb.focus(); } catch (e) {}
+                                }
                             }
-                        });
-                        return true;
-                    }""")
-                except Exception as e_chk:
-                    print(f"  [Registro] [{self.client_email}] [WARN] Checkbox: {e_chk}", flush=True)
-
-            def _pulsar_suscribete_js() -> bool:
-                """Clic inmediato por JS — sin esperar_locator (antibot/timeouts congelaban aquí)."""
-                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...", flush=True)
-                _marcar_terminos_y_habilitar_suscribir()
-                try:
-                    clicked = self.page.evaluate("""() => {
-                        const match = (b) => {
-                            const t = (b.textContent || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-                            return t.includes('suscríbete') || t.includes('suscribete')
-                                || t.includes('subscribe') || t.includes('crear cuenta')
-                                || t.includes('create account');
-                        };
-                        let btn = Array.from(document.querySelectorAll('button')).find(match);
-                        if (!btn) {
-                            btn = document.querySelector('button[type="submit"]')
-                               || document.querySelector('[type="submit"]');
                         }
-                        if (!btn) return false;
-                        btn.disabled = false;
-                        btn.removeAttribute('disabled');
-                        btn.setAttribute('aria-disabled', 'false');
-                        try { btn.focus(); } catch (e) {}
-                        try { btn.click(); } catch (e) {}
-                        try {
-                            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        } catch (e) {}
-                        return true;
-                    }""")
-                    return bool(clicked)
-                except Exception as e_click:
-                    print(f"  [Registro] [{self.client_email}] [WARN] Clic Suscríbete: {e_click}", flush=True)
-                    return False
+                    });
+                }""")
+            except Exception as e_chk:
+                print(f"  [Registro] [{self.client_email}] [WARN] Checkbox: {e_chk}", flush=True)
+            # Playwright check() es más fiable con controles custom/React
+            try:
+                for loc in self.page.locator('input[type="checkbox"]').all():
+                    try:
+                        if loc.is_visible(timeout=500) and not loc.is_checked():
+                            loc.check(force=True, timeout=1500)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(0.8)
 
-            # 1) Marcar + 2) Suscríbete YA (antes de cualquier IMAP / esperas largas)
-            _marcar_terminos_y_habilitar_suscribir()
-            time.sleep(0.4)
-            otp_ui_ok = False
-            for intento_sub in range(1, 4):
-                if _pulsar_suscribete_js():
-                    print(f"  [Registro] [{self.client_email}] Clic Suscríbete enviado "
-                          f"(intento {intento_sub}/3).", flush=True)
-                else:
-                    print(f"  [Registro] [{self.client_email}] No se encontró botón Suscríbete "
-                          f"(intento {intento_sub}/3).", flush=True)
-                time.sleep(1.8)
-                try:
-                    if self._sesion_post_registro_detectada():
-                        otp_ui_ok = True
-                        break
-                    if contar_cajas_otp_visibles(self.page) >= 1:
-                        otp_ui_ok = True
-                        break
-                except Exception:
-                    pass
-                if intento_sub < 3:
-                    print(f"  [Registro] [{self.client_email}] Reintentando Suscríbete...", flush=True)
-
-            # Baseline IMAP DESPUÉS del clic (antes bloqueaba todas las ventanas aquí)
-            print(f"  [Registro] [{self.client_email}] Baseline IMAP tras Suscríbete...", flush=True)
+            print(f"  [Registro] [{self.client_email}] Baseline IMAP antes de Suscríbete...", flush=True)
             try:
                 max_id_previo = obtener_max_email_id(self.client_email)
             except Exception as e_base:
                 print(f"  [Registro] [{self.client_email}] [WARN] Baseline IMAP: {e_base}", flush=True)
                 max_id_previo = 0
 
-            if not otp_ui_ok:
-                print(f"  [Registro] [{self.client_email}] [WARN] OTP UI no visible aún; "
-                      f"se busca código por IMAP de todos modos.", flush=True)
+            def _pantalla_otp_o_exito() -> bool:
+                try:
+                    if self._sesion_post_registro_detectada():
+                        return True
+                    if contar_cajas_otp_visibles(self.page) >= 1:
+                        return True
+                    return bool(self.page.evaluate("""() => {
+                        const t = (document.body && document.body.innerText || '').toLowerCase();
+                        const frases = [
+                            'verify your email', 'verifica tu correo', 'verifica tu email',
+                            'verificar tu correo', 'confirm your email', '6-digit', '6 dígitos',
+                            'resend code', 'reenviar', 'we sent', 'te hemos enviado'
+                        ];
+                        if (frases.some(f => t.includes(f))) return true;
+                        return document.querySelectorAll(
+                            'input[maxlength="1"], input[autocomplete="one-time-code"]'
+                        ).length >= 4;
+                    }"""))
+                except Exception:
+                    return False
 
-            print(f"  [Registro] [{self.client_email}] Turno IMAP del buzón "
-                  f"(Suscríbete ya se pulsó)...", flush=True)
+            def _pulsar_suscribete_real() -> bool:
+                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...", flush=True)
+                # Reafirmar términos (solo si no están marcados)
+                try:
+                    self.page.evaluate("""() => {
+                        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                            const parentText = cb.parentElement ? (cb.parentElement.textContent || '') : '';
+                            if (/términos|terms|privacidad|privacy|acuerdo|agree/i.test(parentText) && !cb.checked) {
+                                cb.click();
+                            }
+                        });
+                    }""")
+                except Exception:
+                    pass
+                time.sleep(0.25)
+                clicked = False
+                # Clic Playwright real (como antes, cuando funcionaba)
+                for sel in (
+                    "button:has-text('Suscríbete')",
+                    "button:has-text('Subscribe')",
+                    "button:has-text('Create account')",
+                    "button:has-text('Crear cuenta')",
+                    "button[type='submit']",
+                ):
+                    try:
+                        loc = self.page.locator(sel).first
+                        if loc.count() == 0:
+                            continue
+                        loc.scroll_into_view_if_needed(timeout=2000)
+                        loc.click(force=True, timeout=4000)
+                        clicked = True
+                        break
+                    except Exception:
+                        try:
+                            loc = self.page.locator(sel).first
+                            loc.evaluate("b => { b.disabled=false; b.removeAttribute('disabled'); b.click(); }")
+                            clicked = True
+                            break
+                        except Exception:
+                            continue
+                if not clicked:
+                    try:
+                        clicked = bool(self.page.evaluate("""() => {
+                            const btn = Array.from(document.querySelectorAll('button')).find(b => {
+                                const t = (b.textContent || '').toLowerCase();
+                                return t.includes('suscríbete') || t.includes('suscribete')
+                                    || t.includes('subscribe') || t.includes('crear cuenta')
+                                    || t.includes('create account');
+                            }) || document.querySelector('button[type="submit"]');
+                            if (!btn) {
+                                const form = document.querySelector('form');
+                                if (form) { try { form.requestSubmit(); return true; } catch(e) {} }
+                                return false;
+                            }
+                            btn.disabled = false;
+                            btn.removeAttribute('disabled');
+                            btn.click();
+                            return true;
+                        }"""))
+                    except Exception as e_js:
+                        print(f"  [Registro] [{self.client_email}] [WARN] Fallback JS: {e_js}", flush=True)
+                # Diagnóstico si el botón sigue disabled / checkbox off
+                try:
+                    info = self.page.evaluate("""() => {
+                        const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]')).map(c => !!c.checked);
+                        const btn = Array.from(document.querySelectorAll('button')).find(b => {
+                            const t = (b.textContent || '').toLowerCase();
+                            return t.includes('suscríb') || t.includes('subscribe');
+                        });
+                        return {
+                            checkboxes: cbs,
+                            btnDisabled: btn ? !!btn.disabled : null,
+                            btnText: btn ? (btn.textContent || '').trim().slice(0, 40) : null,
+                            url: location.href.slice(0, 120),
+                        };
+                    }""")
+                    print(f"  [Registro] [{self.client_email}] Post-clic: {info}", flush=True)
+                except Exception:
+                    pass
+                return clicked
+
+            otp_ui_ok = False
+            for intento_sub in range(1, 5):
+                _pulsar_suscribete_real()
+                # Esperar a que Tidal procese el submit
+                for _ in range(8):
+                    time.sleep(0.75)
+                    if _pantalla_otp_o_exito():
+                        otp_ui_ok = True
+                        break
+                if otp_ui_ok:
+                    print(f"  [Registro] [{self.client_email}] OTP/éxito tras Suscríbete "
+                          f"(intento {intento_sub}/4).", flush=True)
+                    break
+                print(f"  [Registro] [{self.client_email}] Aún en formulario tras Suscríbete "
+                      f"(intento {intento_sub}/4); reintentando...", flush=True)
+
+            if not otp_ui_ok:
+                print(f"  [Registro] [{self.client_email}] [WARN] Sin pantalla OTP tras clics; "
+                      f"se continúa con IMAP por si el mail sí salió.", flush=True)
+
+            print(f"  [Registro] [{self.client_email}] Turno IMAP del buzón...", flush=True)
             with _lock_registro_mismo_buzon(self.client_email):
                 codigo_aceptado = False
                 ultimo_error_codigo = ""
