@@ -6349,7 +6349,7 @@ class TidalRegisterManager:
             self.proxy_pe_user = None
             self.proxy_pe_pass = None
 
-    def run_registration(self, cerrar_navegador_al_final=True) -> bool:
+    def run_registration(self, cerrar_navegador_al_final=True, timeout_confirmacion_s: float | None = None) -> bool:
         registro_exitoso = False
         try:
             self.asegurar_navegador_abierto()
@@ -7116,10 +7116,19 @@ class TidalRegisterManager:
                         )
 
             print("  [Registro] Esperando redirección automática al perfil o cuenta...")
-            # Opción 8: confirmación más corta; no hace falta quemar 60s si la sesión ya está.
-            registro_exitoso = self._confirmar_registro_completado(
-                timeout_s=25.0 if not cerrar_navegador_al_final else 60.0
-            )
+            # Si la sesión ya está activa tras el OTP, no quemar 60s esperando texto del DOM.
+            if self._sesion_post_registro_detectada():
+                print(f"  [Registro] [{self.client_email}] Sesión detectada al instante; "
+                      f"registro OK sin espera larga.")
+                registro_exitoso = True
+            else:
+                if timeout_confirmacion_s is not None:
+                    t_conf = float(timeout_confirmacion_s)
+                elif cerrar_navegador_al_final:
+                    t_conf = 12.0  # opción 8/17: antes 60s de más
+                else:
+                    t_conf = 25.0
+                registro_exitoso = self._confirmar_registro_completado(timeout_s=t_conf)
 
             if registro_exitoso:
                 if cerrar_navegador_al_final:
@@ -7257,6 +7266,9 @@ class TidalRegisterManager:
         intentos_perfil = 0
         while time.time() - start < timeout_s:
             try:
+                # Salida rápida: OTP ya dejó sesión (account/listen sin login)
+                if self._sesion_post_registro_detectada():
+                    return True
                 self.page = pagina_vigente(self.page)
                 if not self.page or self.page.is_closed():
                     return False
@@ -7327,7 +7339,7 @@ class TidalRegisterManager:
 
                 # Tras el código, Tidal a menudo se queda en /authorize o en tidal.com:
                 # forzar la entrada al perfil varias veces en vez de esperar pasivamente.
-                if elapsed > 2.0 and intentos_perfil < 6 and (
+                if elapsed > 1.0 and intentos_perfil < 6 and (
                     "/authorize" in curr_url
                     or "login.tidal.com" in curr_url
                     or curr_url.rstrip("/").endswith("tidal.com")
@@ -7343,7 +7355,7 @@ class TidalRegisterManager:
                             wait_until="domcontentloaded",
                             timeout=15000
                         )
-                        time.sleep(1.5)
+                        time.sleep(0.8)
                         aceptar_cookies_con_espera(self.page, intentos=1, pausa_s=0.2)
                         u2 = (self.page.url or "").lower()
                         if self._url_indica_cuenta_activa(u2) and "login.tidal.com" not in u2:
@@ -7362,7 +7374,7 @@ class TidalRegisterManager:
                         print(f"  [Registro] [{self.client_email}] [WARN] No se pudo abrir /profile: {e_nav}")
             except Exception:
                 pass
-            time.sleep(0.6)
+            time.sleep(0.3)
         return False
 
     def run_register_and_upgrade_family(self) -> bool:
@@ -15066,7 +15078,11 @@ def registrar_y_restablecer_opcion17(correos):
 
                 print(f"\n{Color.CYAN}{Color.BOLD}[Registro] [{correo}] Intento "
                       f"{intento}/{max_intentos_reg}{Color.ENDC}")
-                exito = manager.run_registration(cerrar_navegador_al_final=True)
+                # Confirmación corta: si ya hay sesión tras OTP, no esperar 60s antes del reset
+                exito = manager.run_registration(
+                    cerrar_navegador_al_final=True,
+                    timeout_confirmacion_s=8.0,
+                )
                 _limpiar_manager_reg(manager, p_ng_server, p_pe_server)
                 manager = None
 
@@ -15119,8 +15135,8 @@ def registrar_y_restablecer_opcion17(correos):
         print(f"{Color.FAIL}[Error]{Color.ENDC} Ninguna cuenta registrada; se omite restablecer contraseña.")
         return False
 
-    print(f"\n{Color.CYAN}Pausa 2s entre registro y restablecer...{Color.ENDC}")
-    time.sleep(2)
+    print(f"\n{Color.CYAN}Pausa 0.5s entre registro y restablecer...{Color.ENDC}")
+    time.sleep(0.5)
 
     # ── Fase 2: restablecer (como opción 9, sin invitaciones familiares) ──
     print(f"\n{Color.CYAN}{Color.BOLD}── FASE 2/2: RESTABLECER CONTRASEÑA ──{Color.ENDC}\n")
