@@ -6574,24 +6574,25 @@ class TidalRegisterManager:
             
 
 
-            print("  [Registro] Marcando checkbox de términos...")
+            print("  [Registro] Marcando checkbox de términos...", flush=True)
 
             def _marcar_terminos_y_habilitar_suscribir():
-                """Fuerza términos + habilita Suscríbete (React a veces deja el botón disabled)."""
+                """Marca términos SIN cb.click()/label.click() (abre /terms y congela Playwright)."""
                 try:
                     self.page.evaluate("""() => {
-                        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                            const wrap = cb.closest('label') || cb.parentElement || cb;
+                        const setChecked = (cb) => {
                             try {
-                                cb.checked = true;
+                                const desc = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'checked'
+                                );
+                                if (desc && desc.set) desc.set.call(cb, true);
+                                else cb.checked = true;
                                 cb.dispatchEvent(new Event('input', { bubbles: true }));
                                 cb.dispatchEvent(new Event('change', { bubbles: true }));
-                                if (typeof cb.click === 'function') cb.click();
+                                cb.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                             } catch (e) {}
-                            try {
-                                if (wrap && wrap !== cb) wrap.click();
-                            } catch (e) {}
-                        });
+                        };
+                        document.querySelectorAll('input[type="checkbox"]').forEach(setChecked);
                         Array.from(document.querySelectorAll('button')).forEach(b => {
                             const t = (b.textContent || '').toLowerCase();
                             if (t.includes('suscríbete') || t.includes('suscribete') || t.includes('subscribe')
@@ -6602,71 +6603,56 @@ class TidalRegisterManager:
                                 b.setAttribute('aria-disabled', 'false');
                             }
                         });
+                        return true;
                     }""")
-                except Exception:
-                    pass
+                except Exception as e_chk:
+                    print(f"  [Registro] [{self.client_email}] [WARN] Checkbox: {e_chk}", flush=True)
 
-            def _pulsar_suscribete():
-                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...")
+            def _pulsar_suscribete_js() -> bool:
+                """Clic inmediato por JS — sin esperar_locator (antibot/timeouts congelaban aquí)."""
+                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...", flush=True)
                 _marcar_terminos_y_habilitar_suscribir()
-                time.sleep(0.35)
-                btn_sub = esperar_locator_en_frames(
-                    self.page,
-                    [
-                        "button:has-text('Suscríbete')", "button:has-text('Subscribe')",
-                        "button:has-text('Create account')", "button:has-text('Crear cuenta')",
-                        "button[type='submit']",
-                    ],
-                    timeout_s=4.0,
-                )
-                if btn_sub:
-                    try:
-                        btn_sub.evaluate("""b => {
-                            b.disabled = false;
-                            b.removeAttribute('disabled');
-                            b.click();
-                        }""")
-                    except Exception:
-                        try:
-                            btn_sub.click(force=True)
-                        except Exception:
-                            pass
                 try:
-                    self.page.evaluate("""() => {
-                        const btn = document.querySelector('button[type="submit"]') ||
-                            Array.from(document.querySelectorAll('button')).find(b => {
-                                const t = (b.textContent || '').toLowerCase();
-                                return t.includes('suscríbete') || t.includes('suscribete')
-                                    || t.includes('subscribe') || t.includes('crear cuenta')
-                                    || t.includes('create account');
-                            });
-                        if (btn) {
-                            btn.disabled = false;
-                            btn.removeAttribute('disabled');
-                            btn.click();
+                    clicked = self.page.evaluate("""() => {
+                        const match = (b) => {
+                            const t = (b.textContent || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                            return t.includes('suscríbete') || t.includes('suscribete')
+                                || t.includes('subscribe') || t.includes('crear cuenta')
+                                || t.includes('create account');
+                        };
+                        let btn = Array.from(document.querySelectorAll('button')).find(match);
+                        if (!btn) {
+                            btn = document.querySelector('button[type="submit"]')
+                               || document.querySelector('[type="submit"]');
                         }
+                        if (!btn) return false;
+                        btn.disabled = false;
+                        btn.removeAttribute('disabled');
+                        btn.setAttribute('aria-disabled', 'false');
+                        try { btn.focus(); } catch (e) {}
+                        try { btn.click(); } catch (e) {}
+                        try {
+                            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        } catch (e) {}
+                        return true;
                     }""")
-                except Exception:
-                    pass
+                    return bool(clicked)
+                except Exception as e_click:
+                    print(f"  [Registro] [{self.client_email}] [WARN] Clic Suscríbete: {e_click}", flush=True)
+                    return False
 
+            # 1) Marcar + 2) Suscríbete YA (antes de cualquier IMAP / esperas largas)
             _marcar_terminos_y_habilitar_suscribir()
-            time.sleep(0.6)
-
-            # Baseline IMAP ANTES del clic y FUERA del lock largo: si se hacía dentro del
-            # lock, el resto de aliases del mismo Gmail se quedaban en "Marcando checkbox..."
-            # sin pulsar Suscríbete (opción 17 / varios puntos).
-            print(f"  [Registro] [{self.client_email}] Leyendo baseline IMAP antes de Suscríbete...")
-            try:
-                max_id_previo = obtener_max_email_id(self.client_email)
-            except Exception as e_base:
-                print(f"  [Registro] [{self.client_email}] [WARN] Baseline IMAP: {e_base}")
-                max_id_previo = 0
-
-            # Clic Suscríbete YA (no esperar el turno IMAP de otros aliases)
+            time.sleep(0.4)
             otp_ui_ok = False
             for intento_sub in range(1, 4):
-                _pulsar_suscribete()
-                time.sleep(2.0)
+                if _pulsar_suscribete_js():
+                    print(f"  [Registro] [{self.client_email}] Clic Suscríbete enviado "
+                          f"(intento {intento_sub}/3).", flush=True)
+                else:
+                    print(f"  [Registro] [{self.client_email}] No se encontró botón Suscríbete "
+                          f"(intento {intento_sub}/3).", flush=True)
+                time.sleep(1.8)
                 try:
                     if self._sesion_post_registro_detectada():
                         otp_ui_ok = True
@@ -6674,31 +6660,25 @@ class TidalRegisterManager:
                     if contar_cajas_otp_visibles(self.page) >= 1:
                         otp_ui_ok = True
                         break
-                    if encontrar_locator_en_frames(
-                        self.page,
-                        [
-                            'input[autocomplete="one-time-code"]',
-                            'input[maxlength="1"]',
-                            'input[name="code"]',
-                        ],
-                    ):
-                        otp_ui_ok = True
-                        break
                 except Exception:
                     pass
                 if intento_sub < 3:
-                    print(f"  [Registro] [{self.client_email}] Aún en formulario tras Suscríbete "
-                          f"(intento {intento_sub}/3); re-marcando términos y reintentando...")
-                    _marcar_terminos_y_habilitar_suscribir()
-                    time.sleep(0.8)
+                    print(f"  [Registro] [{self.client_email}] Reintentando Suscríbete...", flush=True)
+
+            # Baseline IMAP DESPUÉS del clic (antes bloqueaba todas las ventanas aquí)
+            print(f"  [Registro] [{self.client_email}] Baseline IMAP tras Suscríbete...", flush=True)
+            try:
+                max_id_previo = obtener_max_email_id(self.client_email)
+            except Exception as e_base:
+                print(f"  [Registro] [{self.client_email}] [WARN] Baseline IMAP: {e_base}", flush=True)
+                max_id_previo = 0
 
             if not otp_ui_ok:
-                print(f"  [Registro] [{self.client_email}] [WARN] No se vio OTP aún; "
-                      f"se continúa buscando el código por IMAP de todos modos.")
+                print(f"  [Registro] [{self.client_email}] [WARN] OTP UI no visible aún; "
+                      f"se busca código por IMAP de todos modos.", flush=True)
 
-            # Solo serializar la LECTURA IMAP entre aliases del mismo buzón (no el clic UI)
             print(f"  [Registro] [{self.client_email}] Turno IMAP del buzón "
-                  f"(si hay otros aliases, esperan aquí — Suscríbete ya se pulsó)...")
+                  f"(Suscríbete ya se pulsó)...", flush=True)
             with _lock_registro_mismo_buzon(self.client_email):
                 codigo_aceptado = False
                 ultimo_error_codigo = ""
