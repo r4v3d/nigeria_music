@@ -6408,7 +6408,7 @@ class TidalRegisterManager:
                           f"Cerrando ventana automáticamente...{Color.ENDC}")
                 else:
                     print(f"  {Color.GREEN}[OK] ¡Registro completado y verificado con éxito para {self.client_email}! "
-                          f"Chrome se mantiene para TuneMyMusic...{Color.ENDC}")
+                          f"Registro confirmado.{Color.ENDC}")
                 try:
                     cookies_proxy = self.context.cookies()
                     self.cookies_tidal = [c for c in cookies_proxy if "tidal.com" in c.get("domain", "")]
@@ -6440,9 +6440,8 @@ class TidalRegisterManager:
             return False
         finally:
             if cerrar_navegador_al_final:
-                # Tras un registro OK la opción 8 reutiliza el PE en TuneMyMusic: no liberarlo aquí.
-                # El NG sí se libera siempre; la fase Nigeria ya terminó.
-                self.cerrar_navegador(liberar_ng=True, liberar_pe=not registro_exitoso)
+                # Opción 8 ya no continúa a TuneMyMusic: liberar NG y PE al cerrar.
+                self.cerrar_navegador(liberar_ng=True, liberar_pe=True)
             elif registro_exitoso:
                 if getattr(self, "proxy_ng_server", None):
                     try:
@@ -12695,10 +12694,10 @@ def registrar_cuentas_tidal(correos):
             print("Operación cancelada.")
             return
 
-    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para el pago y para TuneMyMusic...{Color.ENDC}")
+    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para el pago del registro...{Color.ENDC}")
     proxies_pe = asegurar_proxies_peru(cantidad_necesaria=len(correos))
     if not proxies_pe:
-        print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Perú válidos: el pago y TuneMyMusic usarían tu IP actual.")
+        print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Perú válidos: el pago del registro usaría tu IP actual.")
         confirm_pe = input("¿Deseas continuar sin proxy de Perú? (s/n, por defecto 'n'): ").strip().lower()
         if confirm_pe not in ("s", "si", "sí", "yes", "y"):
             print("Operación cancelada. Valida la lista de proxies de Perú con la opción 13.")
@@ -12709,33 +12708,14 @@ def registrar_cuentas_tidal(correos):
     
     success_count = 0
     fail_count = 0
-    successful_managers = []
     estado_lock = threading.Lock()
-    pendientes_fase_registro = len(correos)
-    fase_registro_lista = threading.Event()
-    event_subir_csv = threading.Event()
-    cancelar_tmm = threading.Event()
 
-    def _marcar_fin_fase_registro(marcado_ref: dict):
-        """Marca fin de fase una sola vez por hilo (evita deadlock si falla tras el registro)."""
-        nonlocal pendientes_fase_registro
-        if marcado_ref.get("ok"):
-            return
-        with estado_lock:
-            if marcado_ref.get("ok"):
-                return
-            marcado_ref["ok"] = True
-            pendientes_fase_registro -= 1
-            if pendientes_fase_registro <= 0:
-                fase_registro_lista.set()
-    
     def registrar_un_correo(idx, correo):
         nonlocal success_count, fail_count
         p_ng_server = p_ng_user = p_ng_pass = None
         p_pe_server = p_pe_user = p_pe_pass = None
         manager = None
         exito = False
-        fase_marcada = {"ok": False}
         try:
             if use_proxy and valid_ng_list:
                 p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico()
@@ -12743,13 +12723,12 @@ def registrar_cuentas_tidal(correos):
                     print(f"  {Color.FAIL}[Proxy NG] [{correo}] Sin proxy de Nigeria libre; se omite la cuenta.{Color.ENDC}")
                     with estado_lock:
                         fail_count += 1
-                    return correo, False, None
+                    return correo, False
                 p_ng_server = p_ng.get("server")
                 p_ng_user = p_ng.get("username")
                 p_ng_pass = p_ng.get("password")
 
-            # Reservar PE desde el inicio (pago / TuneMyMusic). Si __init__ o el registro
-            # fallan, el finally lo devuelve al pool para no dejarlo huérfano.
+            # PE solo para el pago del registro (opción 8 ya no abre TuneMyMusic).
             if proxies_pe:
                 p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
                 if p_pe:
@@ -12770,7 +12749,6 @@ def registrar_cuentas_tidal(correos):
             )
 
             print(f"\n{Color.CYAN}{Color.BOLD}[Registro Concurrente] Iniciando proceso para: {correo}{Color.ENDC}")
-            # Cierra Chrome NG al terminar: TuneMyMusic se relanza con proxy PE en este mismo hilo.
             exito = manager.run_registration(cerrar_navegador_al_final=True)
             if not exito:
                 try:
@@ -12783,16 +12761,23 @@ def registrar_cuentas_tidal(correos):
                     pass
                 with estado_lock:
                     fail_count += 1
-                return correo, False, manager
+                return correo, False
 
+            # Registro OK: liberar PE (ya no se reutiliza en TuneMyMusic) y limpiar perfil.
+            try:
+                manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+            except Exception:
+                pass
+            try:
+                manager.limpiar_perfil_temporal()
+            except Exception:
+                pass
             with estado_lock:
                 success_count += 1
-                successful_managers.append(manager)
-
-            # Liberar el resumen principal YA (no esperar a completar TMM ni a cuentas lentas).
-            _marcar_fin_fase_registro(fase_marcada)
-
-            if cancelar_tmm.is_set():
+            print(f"  {Color.GREEN}[Registro] [{correo}] Completado. Opción 8 finaliza aquí (sin TuneMyMusic).{Color.ENDC}")
+            return correo, True
+        except Exception as e_reg:
+            if manager is not None:
                 try:
                     manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
                 except Exception:
@@ -12801,29 +12786,13 @@ def registrar_cuentas_tidal(correos):
                     manager.limpiar_perfil_temporal()
                 except Exception:
                     pass
-                return correo, True, manager
-
-            print(f"  [TuneMyMusic] [{correo}] Abriendo TuneMyMusic (proxy PE) tras el registro...")
-            try:
-                manager.run_tmm_transfer(event_subir_csv, cancelar_event=cancelar_tmm)
-            except Exception as e_tmm:
-                print(f"  {Color.FAIL}[TuneMyMusic] [{correo}] Falló la transferencia: {e_tmm}{Color.ENDC}")
-            return correo, True, manager
-        except Exception as e_reg:
-            if manager is not None:
-                try:
-                    manager.cerrar_navegador(liberar_ng=False, liberar_pe=False)
-                except Exception:
-                    pass
             with estado_lock:
                 if not exito:
                     fail_count += 1
-            print(f"  {Color.FAIL}[ERROR] Excepción en registro/TMM de {correo}: {e_reg}{Color.ENDC}")
+            print(f"  {Color.FAIL}[ERROR] Excepción en registro de {correo}: {e_reg}{Color.ENDC}")
             raise
         finally:
             cerrar_sesion_imap_hilo()
-            # Si el registro no tuvo éxito, devolver ambos proxies. Si tuvo éxito, NG ya lo
-            # liberó run_registration y el PE se libera al cerrar TuneMyMusic.
             if not exito:
                 try:
                     GLOBAL_NG_PROXY_POOL.liberar_proxy(p_ng_server)
@@ -12836,99 +12805,16 @@ def registrar_cuentas_tidal(correos):
                 if manager is not None:
                     manager.proxy_ng_server = None
                     manager.proxy_pe_server = None
-            _marcar_fin_fase_registro(fase_marcada)
 
     if not correos:
         print(f"\n{Color.WARNING}[Opción 8] No hay correos para registrar.{Color.ENDC}")
         return
     workers = min(10, len(correos))
     print(f"\n{Color.CYAN}{Color.BOLD}Iniciando registro de {len(correos)} cuentas de forma simultánea (usando {workers} hilos)...{Color.ENDC}\n")
-    print(f"{Color.CYAN}Cada cuenta abrirá TuneMyMusic en cuanto termine su registro "
-          f"(sin esperar a que el lote entero acabe).{Color.ENDC}\n")
-    
+    print(f"{Color.CYAN}Opción 8: solo registro Tidal. Al terminar cada cuenta se cierra el proceso (sin TuneMyMusic).{Color.ENDC}\n")
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(registrar_un_correo, idx, correo): correo for idx, correo in enumerate(correos, 1)}
-
-        # Esperar a que TODOS terminen el registro (éxito o fallo) antes del ENTER.
-        # Las cuentas OK ya están abriendo/esperando en TMM en paralelo.
-        while not fase_registro_lista.wait(timeout=0.5):
-            pass
-
-        with estado_lock:
-            ok_n = success_count
-            fail_n = fail_count
-            managers_ok = list(successful_managers)
-
-        print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-        print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO{Color.ENDC}")
-        print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-        print(f" Cuentas procesadas con éxito: {Color.GREEN}{ok_n}{Color.ENDC}")
-        print(f" Cuentas fallidas: {Color.FAIL}{fail_n}{Color.ENDC}")
-        print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
-
-        if managers_ok:
-            print(f"\n{Color.CYAN}{Color.BOLD}TuneMyMusic se abre (o ya está abierto) para las "
-                  f"{len(managers_ok)} cuentas exitosas.{Color.ENDC}")
-
-            try:
-                DESCARGAS_DIR.mkdir(parents=True, exist_ok=True)
-                asignaciones = asignar_csvs_a_cuentas([mgr.client_email for mgr in managers_ok])
-                con_csv = []
-                sin_csv = []
-                for mgr in managers_ok:
-                    ruta = asignaciones.get(mgr.client_email)
-                    mgr.csv_asignado = ruta
-                    if ruta and csv_pertenece_a_cuenta(ruta, mgr.client_email):
-                        try:
-                            nbytes = ruta.stat().st_size
-                        except Exception:
-                            nbytes = 0
-                        con_csv.append((mgr.client_email, ruta.name, nbytes))
-                    else:
-                        mgr.csv_asignado = None
-                        sin_csv.append(mgr.client_email)
-
-                print(f"\n{Color.CYAN}[CSV] Emparejados {len(con_csv)}/{len(managers_ok)} "
-                      f"(1 archivo ↔ 1 cuenta Tidal) en 'descargas/'.{Color.ENDC}")
-                for email, nombre, nbytes in con_csv:
-                    marca = "" if nombre.lower() == f"{email.lower()}.csv" else " [alias]"
-                    print(f"  {Color.GREEN}✓{Color.ENDC} {email} → {nombre} ({nbytes} bytes){marca}")
-                if sin_csv:
-                    print(f"\n{Color.WARNING}[CSV] Sin archivo exclusivo (o ambiguo) para:{Color.ENDC}")
-                    for email in sin_csv:
-                        print(f"  {Color.FAIL}✗{Color.ENDC} {email}  (espera: descargas/{email}.csv)")
-                    print(f"{Color.WARNING}Esas ventanas permanecerán abiertas para subida manual "
-                          f"si al pulsar ENTER aún no hay CSV con el nombre exacto de la cuenta.{Color.ENDC}")
-                    cont = input("¿Continuar con la subida en TuneMyMusic de todas formas? (s/n, por defecto 's'): ").strip().lower()
-                    if cont in ("n", "no"):
-                        print(f"{Color.CYAN}Transferencia TuneMyMusic cancelada. Cerrando ventanas...{Color.ENDC}")
-                        cancelar_tmm.set()
-                        event_subir_csv.set()
-                        for future in as_completed(futures):
-                            try:
-                                future.result()
-                            except Exception:
-                                pass
-                        print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
-                        return
-            except Exception as e_csv:
-                print(f"  {Color.FAIL}[CSV] Error al emparejar archivos tras el registro: {e_csv}{Color.ENDC}")
-                print(f"  {Color.WARNING}Se continúa igual: pulsa ENTER cuando el selector CSV esté listo "
-                      f"en cada TuneMyMusic.{Color.ENDC}")
-
-            input(f"\n{Color.BOLD}>>> Prepara el selector de archivo CSV en CADA TuneMyMusic "
-                  f"(todas las ventanas) y luego presiona ENTER.\n"
-                  f"    Cada ventana subirá SOLO su CSV emparejado (nombre = correo de la cuenta).\n"
-                  f"    Tras ENTER cada ventana esperará hasta 5 min a que el input esté listo "
-                  f"(ya no se cierra a los 30s). <<<{Color.ENDC}")
-
-            event_subir_csv.set()
-            print(f"\n{Color.CYAN}Subida disparada. Cada ventana espera su propio input; "
-                  f"si falla, permanece abierta para corrección manual.{Color.ENDC}")
-        else:
-            cancelar_tmm.set()
-            event_subir_csv.set()
-
         for future in as_completed(futures):
             correo = futures[future]
             try:
@@ -12936,10 +12822,14 @@ def registrar_cuentas_tidal(correos):
             except Exception as e:
                 print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
 
-        if managers_ok:
-            print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso de transferencia TuneMyMusic finalizado para todas las cuentas exitosas.{Color.ENDC}")
-        
-    print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f" Cuentas procesadas con éxito: {Color.GREEN}{success_count}{Color.ENDC}")
+    print(f" Cuentas fallidas: {Color.FAIL}{fail_count}{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
+    print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso de registro finalizado. Regresando al menú principal...{Color.ENDC}\n")
+
 
 
 def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[str]]:
