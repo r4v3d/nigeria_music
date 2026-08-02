@@ -2242,7 +2242,13 @@ def _reclamar_uid_correo(buzon_clave: str, uid: int) -> bool:
         return True
 
 
-def _destinatario_es_para_alias(gmail_user: str, recipients_text: str, cuerpo_text: str = "") -> bool:
+def _destinatario_es_para_alias(
+    gmail_user: str,
+    recipients_text: str,
+    cuerpo_text: str = "",
+    *,
+    exigir_exacto: bool = False,
+) -> bool:
     """True solo si el correo de Tidal es para ESTE alias con puntos, no para un hermano.
 
     Gmail ignora puntos, así que getspoo.ky49.28 y getspoo.ky.4928 comparten buzón. Si se
@@ -2252,6 +2258,9 @@ def _destinatario_es_para_alias(gmail_user: str, recipients_text: str, cuerpo_te
     Atención (opción 4): si To: solo trae la forma canónica sin puntos, el paso 3 devolvía
     True para TODOS los alias hermanos → un solo UID reclamado y el resto sin enlace.
     Para invitaciones familiares usar asignar_enlaces_invitacion_a_correos().
+
+    exigir_exacto=True (opción 15): nunca aceptar To: canónico sin puntos si el alias pedido
+    lleva puntos. Obliga a que el mensaje mencione el alias exacto (evita cruce de hermanos).
     """
     objetivo = (gmail_user or "").strip().lower()
     if not objetivo:
@@ -2283,17 +2292,22 @@ def _destinatario_es_para_alias(gmail_user: str, recipients_text: str, cuerpo_te
         return False
 
     # 3) Solo aparece la forma canónica del buzón (Tidal a veces escribe el base).
-    #    Para invitaciones con N alias concurrentes NO usar esta vía: option 4 llama a
-    #    asignar_enlaces_invitacion_a_correos(). Aquí se mantiene True para códigos/login
-    #    de un solo hilo (To: canónico + alias con puntos).
+    local = objetivo.split("@", 1)[0]
+    if exigir_exacto and "." in local:
+        # Alias con puntos: sin mención exacta no asumir que el canónico es nuestro
+        return False
+
+    # Para invitaciones/códigos de un solo hilo: aceptar canónico
     return True
 
 
-def _extraer_codigos_otp(texto: str) -> list[str]:
+def _extraer_codigos_otp(texto: str, preferir_len: int | None = None) -> list[str]:
     """Extrae códigos OTP de 5–6 dígitos priorizando los junto a 'code'/'código'.
 
     Antes devolvía el primer número de 6 dígitos del HTML (fechas, tracking, etc.) y
     descartaba OTP reales tipo 202431 por parecer un año → Tidal rechazaba el código.
+
+    preferir_len: si es 5 o 6, esos códigos van primero (p. ej. 6 cajas en eliminación).
     """
     if not texto:
         return []
@@ -2334,19 +2348,39 @@ def _extraer_codigos_otp(texto: str) -> list[str]:
     ):
         _add(m.group(1), prioritario=True)
 
-    # 2) Dígitos partidos por HTML/espacios: "1 2 3 4 5 6"
-    for m in re.finditer(r"(?<!\d)(?:\d[\s\-]){4,5}\d(?!\d)", texto):
+    # 2) Dígitos partidos por HTML/espacios: "1 2 3 4 5 6" o spans sueltos
+    for m in re.finditer(r"(?<!\d)(?:\d[\s\-\u00a0]){4,5}\d(?!\d)", texto):
+        _add(re.sub(r"\D", "", m.group(0)), prioritario=True)
+    # Dígitos separados solo por etiquetas HTML: >1</span><span>2</...
+    solo_digitos_html = re.sub(r"(?<=>)\s+(\d)\s+(?=<)", r"\1", texto)
+    for m in re.finditer(
+        r"(?<!\d)(?:\d(?:\s*</?(?:span|b|strong|td|font)[^>]*>\s*)+){4,5}\d(?!\d)",
+        solo_digitos_html,
+        flags=re.I,
+    ):
         _add(re.sub(r"\D", "", m.group(0)), prioritario=True)
 
     # 3) Cualquier 5–6 dígitos suelto (menor prioridad)
     for m in re.findall(r"\b(\d{5,6})\b", texto):
         _add(m, prioritario=False)
 
-    # Preferir 6 dígitos (Tidal sign-up) dentro de cada grupo
+    # Preferir longitud pedida (6 en eliminación) y luego 6 dígitos genéricos
     def _ordenar(grupo: list[str]) -> list[str]:
-        return sorted(grupo, key=lambda c: (0 if len(c) == 6 else 1, grupo.index(c)))
+        pref = int(preferir_len) if preferir_len in (5, 6) else 6
 
-    return _ordenar(prioritarios) + _ordenar(normales)
+        def _clave(c: str):
+            return (0 if len(c) == pref else 1, 0 if len(c) == 6 else 1, grupo.index(c))
+
+        return sorted(grupo, key=_clave)
+
+    combined = _ordenar(prioritarios) + _ordenar(normales)
+    # Reordenar el resultado global: un 6 dígitos "normal" debe ganar a un 5 prioritario
+    # cuando preferir_len=6 (asistente de eliminación con 6 cajas).
+    if preferir_len in (5, 6):
+        pref = [c for c in combined if len(c) == preferir_len]
+        otros = [c for c in combined if len(c) != preferir_len]
+        return pref + otros
+    return combined
 
 
 def _texto_indica_codigo_invalido(texto: str) -> bool:
@@ -2363,6 +2397,35 @@ def _texto_indica_codigo_invalido(texto: str) -> bool:
     )
     return any(f in t for f in frases)
 
+
+KEYWORDS_ELIMINACION_CUENTA = [
+    # Frases específicas del OTP de borrado (evitar "elimin" suelto → correos de Family).
+    "verificación de la eliminación", "verificacion de la eliminacion",
+    "eliminación de tu cuenta", "eliminacion de tu cuenta",
+    "eliminar tu cuenta", "delete your account", "account deletion",
+    "confirm that you want to delete", "confirma que deseas eliminar",
+    "código para eliminar", "codigo para eliminar", "code to delete",
+    "para eliminar tu cuenta", "to delete your account",
+    "verificación para eliminar", "verificacion para eliminar",
+    "confirmation code", "código de confirmación", "codigo de confirmacion",
+]
+
+# Asuntos/cuerpos que NO son el OTP de borrado de cuenta (opción 15).
+EXCLUDE_ELIMINACION_CUENTA = [
+    "plan tidal family", "tidal family", "family plan", "plan familiar",
+    "eliminado de un plan", "removed from a", "removed from your",
+    "se ha eliminado de un plan", "has been removed from",
+    "invites you to join", "te ha invitado",
+]
+
+
+def _texto_excluido_por_frases(texto: str, frases) -> bool:
+    t = (texto or "").lower()
+    if not t or not frases:
+        return False
+    if isinstance(frases, str):
+        frases = [frases]
+    return any((f or "").lower() in t for f in frases if f)
 
 KEYWORDS_INVITACION_FAMILIAR = [
     "invites you to join", "welcome to the family", "family plan", "family subscription",
@@ -2723,10 +2786,19 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
 
 def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_password=None, 
                              query_from="tidal", required_keywords=None, query_exclude=None, 
-                             max_age_minutes=15, after_email_id=0, solo_link=False) -> str | None:
+                             max_age_minutes=15, after_email_id=0, solo_link=False,
+                             aliases_extra=None, preferir_otp_len: int | None = None,
+                             exigir_destinatario_exacto: bool = False) -> str | None:
     """Lee correos de Gmail via IMAP sin necesidad de abrir el navegador.
     Requiere una 'App Password' de Google.
-    Busca dinámicamente en passwords.txt la contraseña específica del correo."""
+    Busca dinámicamente en passwords.txt la contraseña específica del correo.
+
+    aliases_extra: otros correos/alias que también cuentan como destinatario válido
+    (p. ej. nombre de acceso + correo registrado en opción 15).
+    preferir_otp_len: 5 o 6 para priorizar esa longitud (p. ej. 6 cajas en eliminación).
+    exigir_destinatario_exacto: si True, no aceptar To: canónico sin puntos cuando el alias
+    pedido lleva puntos (crítico en opción 15 con hermanos del mismo buzón).
+    """
     import imaplib
     import email
     from email.header import decode_header
@@ -2736,6 +2808,12 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
     if not user_real or not app_pwd:
         print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No se encontraron credenciales de IMAP válidas para {gmail_user}.")
         return None
+
+    aliases_ok = []
+    for a in [gmail_user, *(aliases_extra or [])]:
+        a_l = (a or "").strip().lower()
+        if a_l and a_l not in aliases_ok:
+            aliases_ok.append(a_l)
     
     # ExitStack en lugar de un 'with' anidado para no reindentar todo el recorrido de mensajes:
     # el cierre queda garantizado igualmente al salir de la función.
@@ -2811,7 +2889,11 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
 
             # El cuerpo se mira después; aquí solo headers. Si no hay match por headers aún
             # no descartamos del todo hasta tener body (por si el alias solo aparece ahí).
-            match_headers = _destinatario_es_para_alias(gmail_user, recipients, "")
+            match_headers = any(
+                _destinatario_es_para_alias(
+                    a, recipients, "", exigir_exacto=exigir_destinatario_exacto
+                ) for a in aliases_ok
+            )
             
             # Extraer asunto
             subject_text = ""
@@ -2871,7 +2953,11 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             if not body_text:
                 continue
 
-            if not match_headers and not _destinatario_es_para_alias(gmail_user, recipients, body_text):
+            if not match_headers and not any(
+                _destinatario_es_para_alias(
+                    a, recipients, body_text, exigir_exacto=exigir_destinatario_exacto
+                ) for a in aliases_ok
+            ):
                 continue
 
             buzon_clave = _buzon_imap_clave(gmail_user, user_real)
@@ -2888,13 +2974,13 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 if not cumple:
                     continue
             
-            # Verificar exclusion
-            if query_exclude and query_exclude.lower() in text_to_check.lower():
+            # Verificar exclusion (una frase o lista)
+            if query_exclude and _texto_excluido_por_frases(text_to_check, query_exclude):
                 continue
             
-            # OTP juntos, partidos por HTML ("1 2 3 4 5 6") o junto a "code/sign-up"
+            # Buscar codigo OTP (juntos o partidos por HTML) en asunto + cuerpo
             if not solo_link:
-                codigos = _extraer_codigos_otp(text_to_check)
+                codigos = _extraer_codigos_otp(text_to_check, preferir_len=preferir_otp_len)
                 if codigos:
                     if not _reclamar_uid_correo(buzon_clave, msg_id_int):
                         continue
@@ -4065,6 +4151,157 @@ def hacer_click_por_textos(page, textos: list) -> bool:
                 return True
         except Exception:
             pass
+    return False
+
+def boton_eliminar_cuenta_habilitado(page):
+    """Localiza el botón rosa del asistente ('delete-button') habilitado.
+
+    NO usa enlaces genéricos 'Eliminar cuenta' del menú/sidebar: esos están siempre
+    clicables y al pulsarlos se sale del paso de verificación hacia el inicio sin borrar.
+    """
+    page = pagina_vigente(page)
+    for frame in page.frames:
+        try:
+            loc = frame.locator("button.delete-button")
+            cnt = loc.count()
+            for idx in range(cnt):
+                btn = loc.nth(idx)
+                try:
+                    if not btn.is_visible():
+                        continue
+                    if btn.is_disabled():
+                        continue
+                    # Preferir el CTA ancho del asistente
+                    return btn
+                except Exception:
+                    continue
+        except Exception:
+            continue
+        # Fallback estricto: botón cuyo texto exacto es Eliminar cuenta / Delete account
+        # y que NO esté en el nav lateral (sin .delete-button a veces en A/B).
+        try:
+            clicked_info = frame.evaluate("""() => {
+                const isVisible = (e) => {
+                    const st = window.getComputedStyle(e);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    const r = e.getBoundingClientRect();
+                    return r.width > 40 && r.height > 20;
+                };
+                const inNav = (e) => !!(e.closest('nav, aside, [class*="sidebar"], [class*="SideBar"], header'));
+                const cand = Array.from(document.querySelectorAll('button'))
+                    .filter(b => {
+                        if (b.disabled || !isVisible(b) || inNav(b)) return false;
+                        const t = (b.textContent || '').trim().toLowerCase();
+                        return t === 'eliminar cuenta' || t === 'delete account';
+                    });
+                if (!cand.length) return null;
+                // Preferir fullwidth / delete-button
+                cand.sort((a, b) => {
+                    const score = (el) => (el.classList.contains('delete-button') ? 0 : 1)
+                        + (el.classList.contains('fullwidth') ? 0 : 1);
+                    return score(a) - score(b);
+                });
+                const el = cand[0];
+                el.setAttribute('data-tidal-del-btn', '1');
+                return true;
+            }""")
+            if clicked_info:
+                btn = frame.locator('button[data-tidal-del-btn="1"]').first
+                if btn.count() > 0 and btn.is_visible() and not btn.is_disabled():
+                    return btn
+        except Exception:
+            continue
+    return None
+
+
+def esperar_boton_eliminar_cuenta_habilitado(page, timeout_s: float = 12.0):
+    """Espera a que el botón delete-button del asistente se habilite tras un OTP válido."""
+    limite = time.time() + max(1.0, float(timeout_s))
+    while time.time() < limite:
+        page = pagina_vigente(page)
+        btn = boton_eliminar_cuenta_habilitado(page)
+        if btn:
+            return btn
+        time.sleep(0.35)
+    return None
+
+
+def clic_confirmar_eliminacion_asistente(page) -> bool:
+    """Pulsa el CTA real del asistente de borrado (nunca el enlace del menú)."""
+    page = pagina_vigente(page)
+    btn = boton_eliminar_cuenta_habilitado(page)
+    if btn:
+        try:
+            btn.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        try:
+            btn.click(timeout=8000)
+            return True
+        except Exception:
+            try:
+                btn.click(force=True, timeout=5000)
+                return True
+            except Exception:
+                pass
+    # JS: solo button.delete-button enabled, fuera del nav
+    try:
+        return bool(page.evaluate("""() => {
+            const isVisible = (e) => {
+                const st = window.getComputedStyle(e);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                const r = e.getBoundingClientRect();
+                return r.width > 40 && r.height > 20;
+            };
+            const inNav = (e) => !!(e.closest('nav, aside, [class*="sidebar"], [class*="SideBar"], header'));
+            const btns = Array.from(document.querySelectorAll('button.delete-button, button'))
+                .filter(b => {
+                    if (b.disabled || !isVisible(b) || inNav(b)) return false;
+                    if (b.classList.contains('delete-button')) return true;
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    return t === 'eliminar cuenta' || t === 'delete account';
+                });
+            if (!btns.length) return false;
+            btns.sort((a, b) => (b.classList.contains('delete-button') ? 1 : 0)
+                - (a.classList.contains('delete-button') ? 1 : 0));
+            btns[0].click();
+            return true;
+        }"""))
+    except Exception:
+        return False
+
+
+def url_parece_exito_o_fin_eliminacion(url: str) -> bool:
+    u = (url or "").lower()
+    if not u:
+        return False
+    if "account-deleted" in u or "deletion-success" in u or "deleted=true" in u:
+        return True
+    if "login.tidal.com" in u or "/authorize" in u:
+        return True
+    return False
+
+
+def url_parece_abandono_eliminacion(url: str) -> bool:
+    """True si salimos del asistente hacia el inicio/overview sin completar el borrado."""
+    u = (url or "").lower()
+    if not u:
+        return False
+    if "account-deletion" in u:
+        return False
+    if url_parece_exito_o_fin_eliminacion(u):
+        return False
+    # tidal.com marketing / overview de cuenta = se salió del wizard
+    if u.rstrip("/") in ("https://tidal.com", "http://tidal.com", "https://www.tidal.com"):
+        return True
+    if "tidal.com" in u and "account.tidal.com" not in u and "login.tidal.com" not in u:
+        return True
+    if "account.tidal.com" in u and any(x in u for x in (
+        "/profile", "/subscription", "/overview", "/payment", "/family", "/store"
+    )):
+        return True
+    if u.rstrip("/").endswith("account.tidal.com"):
+        return True
     return False
 
 def contar_cajas_otp_visibles(page) -> int:
@@ -10023,6 +10260,7 @@ class TidalAutoLoginManager:
         self.login_ok = False
         self.export_ok = False
         self.eliminacion_ok = False
+        self.correo_registrado_perfil = None
         self._rotaciones_antibot = 0
         self._recuperaciones_error_tidal = 0
         
@@ -11309,7 +11547,8 @@ class TidalAutoLoginManager:
             and not es_pantalla_error_login_tidal(self.page)
         )
 
-    def run_auto_login(self) -> bool:
+    def run_auto_login(self, modo: str = "tmm") -> bool:
+        """modo='tmm' → opción 10 (login + TuneMyMusic). modo='eliminar' → opción 15 (login + borrar)."""
         try:
             self.asegurar_navegador_abierto()
             
@@ -11891,6 +12130,9 @@ class TidalAutoLoginManager:
                     return self.finalizar_sin_exito("Sesión no consolidada tras el login.")
             self.login_ok = True
             print(f"  [Login] {Color.GREEN}[OK] [{self.client_email}] Inicio de sesión listo.{Color.ENDC}")
+
+            if modo == "eliminar":
+                return self._flujo_eliminar_cuenta_opcion15()
             
             # 2. Comprobar y cambiar correo si no coincide en el perfil
             target_email_clean = self.client_email.strip().lower()
@@ -12418,6 +12660,390 @@ class TidalAutoLoginManager:
             self.abortar_barreras()
             return self.finalizar_sin_exito("El proceso terminó con una excepción.")
 
+    def leer_correo_electronico_perfil(self) -> str | None:
+        """Lee el 'Correo electrónico' de Información general en /profile (NO lo cambia).
+
+        Distinto del 'Nombre de acceso' del sidebar/login: el código de eliminación llega
+        al correo registrado en Información general.
+        """
+        print(f"  [Perfil] [{self.client_email}] Abriendo account.tidal.com/profile para leer "
+              f"'Correo electrónico'...")
+        navegar_tidal_tolerante(
+            self.page,
+            "https://account.tidal.com/profile",
+            timeout_ms=60000,
+        )
+        manejar_bloqueos_e_intervencion(self.page, "Perfil Tidal")
+        aceptar_cookies_con_espera(self.page)
+        self.page = pagina_vigente(self.page)
+        time.sleep(1.5)
+
+        url = (self.page.url or "").lower()
+        if ("login.tidal.com" in url or "/authorize" in url
+                or self.hay_formulario_login_visible()):
+            print(f"  [Perfil] {Color.WARNING}[WARN] [{self.client_email}] Redirigió al login. "
+                  f"Rehaciendo sesión...{Color.ENDC}")
+            if not self.rehacer_login_credenciales():
+                return None
+            navegar_tidal_tolerante(self.page, "https://account.tidal.com/profile", timeout_ms=45000)
+            manejar_bloqueos_e_intervencion(self.page, "Perfil Tidal")
+            time.sleep(1.5)
+
+        correo = None
+        try:
+            correo = self.page.evaluate(r"""() => {
+                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const esEmail = (s) => /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test((s || '').trim());
+                const labelsOk = new Set([
+                    'correo electrónico', 'correo electronico', 'email address', 'e-mail', 'email'
+                ]);
+                // Evitar el bloque de "Nombre de acceso" / login name
+                const labelsEvitar = ['nombre de acceso', 'username', 'login name', 'nombre de usuario'];
+
+                const nodos = Array.from(document.querySelectorAll(
+                    'p, span, div, label, dt, dd, li, h2, h3, h4, strong, b'
+                ));
+                for (let i = 0; i < nodos.length; i++) {
+                    const el = nodos[i];
+                    const txt = norm(el.textContent);
+                    if (!labelsOk.has(txt)) continue;
+                    // Si el ancestro habla de "nombre de acceso", saltar
+                    const ancestro = el.closest('section, article, div, li, form') || el.parentElement;
+                    const ancTxt = norm(ancestro ? ancestro.innerText.slice(0, 220) : '');
+                    if (labelsEvitar.some(l => ancTxt.startsWith(l) || ancTxt.includes('\n' + l))) {
+                        // puede ser el mismo card; mirar solo el contenedor pequeño
+                    }
+                    const cont = el.parentElement || el;
+                    const bloque = cont.closest('div') || cont;
+                    const candidatos = [];
+                    const pushEmails = (root) => {
+                        if (!root) return;
+                        const t = (root.innerText || root.textContent || '');
+                        for (const m of t.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || []) {
+                            if (!m.toLowerCase().endsWith('@tidal.com')) candidatos.push(m.trim());
+                        }
+                    };
+                    pushEmails(bloque);
+                    if (el.nextElementSibling) pushEmails(el.nextElementSibling);
+                    if (cont.nextElementSibling) pushEmails(cont.nextElementSibling);
+                    // Deduplicar preservando orden
+                    const vistos = new Set();
+                    for (const c of candidatos) {
+                        const k = c.toLowerCase();
+                        if (vistos.has(k)) continue;
+                        vistos.add(k);
+                        if (esEmail(c)) return c;
+                    }
+                }
+
+                // Fallback: sección "Información general" / "General information"
+                const body = document.body ? document.body.innerText : '';
+                const reSec = /informaci[oó]n\s+general|general\s+information/i;
+                const idx = body.search(reSec);
+                if (idx >= 0) {
+                    const trozo = body.slice(idx, idx + 800);
+                    const mCorreo = trozo.match(
+                        /correo\s+electr[oó]nico|email\s+address|e-?mail[\s\S]{0,80}?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i
+                    );
+                    if (mCorreo && mCorreo[1] && !mCorreo[1].toLowerCase().endsWith('@tidal.com')) {
+                        return mCorreo[1].trim();
+                    }
+                }
+                return null;
+            }""")
+        except Exception as e_js:
+            print(f"  [Perfil] [{self.client_email}] [WARN] No se pudo leer el DOM del perfil: {e_js}")
+            correo = None
+
+        if correo:
+            correo = correo.strip()
+            print(f"  [Perfil] [{self.client_email}] Correo electrónico registrado en perfil: "
+                  f"{Color.CYAN}{correo}{Color.ENDC}")
+            return correo
+
+        print(f"  [Perfil] {Color.FAIL}[ERROR] [{self.client_email}] No se encontró el campo "
+              f"'Correo electrónico' en Información general.{Color.ENDC}")
+        return None
+
+    def _flujo_eliminar_cuenta_opcion15(self) -> bool:
+        """Tras login: verifica correo del perfil en passwords.txt (IMAP) y elimina la cuenta."""
+        print(f"  [Eliminación] [{self.client_email}] Modo opción 15: verificar correo registrado → "
+              f"eliminar cuenta (sin TuneMyMusic ni cambio de correo).")
+
+        if not self.es_sesion_activa() and not self.confirmar_sesion_en_perfil(15.0):
+            print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Sesión perdida antes del perfil. "
+                  f"Intentando recuperar...{Color.ENDC}")
+            if not self.rehacer_login_credenciales():
+                self.abortar_barreras()
+                return self.finalizar_sin_exito("Sin sesión Tidal antes de leer el perfil.")
+
+        correo_perfil = None
+        for intento in range(1, 4):
+            try:
+                correo_perfil = self.leer_correo_electronico_perfil()
+                if correo_perfil:
+                    break
+            except Exception as e_perf:
+                print(f"  [Perfil] [{self.client_email}] [WARN] Intento {intento}/3 falló: {e_perf}")
+            time.sleep(1.5)
+
+        if not correo_perfil:
+            self.abortar_barreras()
+            return self.finalizar_sin_exito(
+                "No se pudo leer el 'Correo electrónico' del perfil. No se elimina la cuenta."
+            )
+
+        self.correo_registrado_perfil = correo_perfil.strip().lower()
+        login_email = (self.client_email or "").strip().lower()
+        if not correos_iguales_exacto(self.correo_registrado_perfil, login_email):
+            print(f"  [Perfil] [{self.client_email}] Nombre de acceso/login: {login_email}")
+            print(f"  [Perfil] [{self.client_email}] Correo registrado (destino del código): "
+                  f"{self.correo_registrado_perfil}")
+            if son_correos_equivalentes(self.correo_registrado_perfil, login_email):
+                print(f"  [Perfil] [{self.client_email}] {Color.WARNING}[WARN] Login y correo "
+                      f"registrado son hermanos Gmail (puntos distintos = cuentas Tidal distintas). "
+                      f"El OTP se leerá del correo registrado EXACTO.{Color.ENDC}")
+
+        if not tiene_contrasena_imap_registrada(self.correo_registrado_perfil):
+            print(f"  [IMAP] {Color.FAIL}[ABORTADO] [{self.client_email}] El correo registrado "
+                  f"'{self.correo_registrado_perfil}' NO tiene App Password / IMAP en "
+                  f"passwords.txt.{Color.ENDC}")
+            print(f"  [IMAP] Sin eso no llegaría el código de eliminación. Añádelo y reintenta.")
+            self.abortar_barreras()
+            return self.finalizar_sin_exito(
+                f"Correo del perfil '{self.correo_registrado_perfil}' ausente en passwords.txt."
+            )
+
+        user_imap, _pwd_imap = obtener_credenciales_imap_reales(self.correo_registrado_perfil)
+        print(f"  [IMAP] {Color.GREEN}[OK] [{self.client_email}] '{self.correo_registrado_perfil}' "
+              f"está en passwords.txt (buzón IMAP: {user_imap or self.correo_registrado_perfil})."
+              f"{Color.ENDC}")
+
+        # --- Eliminación ---
+        exito_eliminacion = False
+        print(f"\n  [Eliminación] [{self.client_email}] Iniciando eliminación de cuenta Tidal...")
+        try:
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
+
+            # Baseline del buzón del correo REGISTRADO (ahí llega el código)
+            base_del_id = obtener_max_email_id(self.correo_registrado_perfil, "tidal")
+            print(f"  [Eliminación] [{self.client_email}] Baseline IMAP de "
+                  f"{self.correo_registrado_perfil} antes de disparar el envío: {base_del_id}")
+
+            print(f"  [Eliminación] [{self.client_email}] Abriendo asistente de eliminación...")
+            self.page.goto(
+                "https://account.tidal.com/account-deletion",
+                wait_until="domcontentloaded",
+                timeout=35000,
+            )
+            time.sleep(2.0)
+            aceptar_cookies_con_espera(self.page)
+            manejar_bloqueos_e_intervencion(self.page, "Eliminación de Cuenta")
+
+            if "account-deletion" not in (self.page.url or ""):
+                print(f"  [Eliminación] [{self.client_email}] Redirigido fuera del asistente. "
+                      f"Buscando enlace 'Eliminar cuenta'...")
+                btn_entrada = encontrar_locator_en_frames(
+                    self.page,
+                    ["a:has-text('Eliminar cuenta')", "button:has-text('Eliminar cuenta')",
+                     "a:has-text('Delete account')", "button:has-text('Delete account')"]
+                )
+                if btn_entrada:
+                    btn_entrada.click()
+                    time.sleep(3.0)
+                else:
+                    self.page.goto(
+                        "https://account.tidal.com/account-deletion",
+                        wait_until="domcontentloaded",
+                        timeout=25000,
+                    )
+                    time.sleep(2.5)
+                if "account-deletion" not in (self.page.url or ""):
+                    raise RuntimeError("Tidal no permitió abrir el asistente de eliminación de cuenta.")
+
+            if not self.recorrer_asistente_eliminacion():
+                raise RuntimeError("No se alcanzó la pantalla del código del asistente de eliminación.")
+
+            if not self.verificar_destino_del_codigo(self.correo_registrado_perfil):
+                raise RuntimeError(
+                    f"Tidal enviaría el código a un correo distinto de '{self.correo_registrado_perfil}'."
+                )
+
+            codigo_eliminacion = None
+            # Solo alias EXACTOS (con puntos). No mezclar hermanos del mismo buzón Gmail.
+            aliases_imap = [self.correo_registrado_perfil]
+            if self.client_email and not correos_iguales_exacto(
+                self.client_email, self.correo_registrado_perfil
+            ):
+                aliases_imap.append(self.client_email)
+            buzones_a_probar = [self.correo_registrado_perfil]
+            if (
+                self.client_email
+                and not correos_iguales_exacto(self.client_email, self.correo_registrado_perfil)
+                and tiene_contrasena_imap_registrada(self.client_email)
+            ):
+                buzones_a_probar.append(self.client_email)
+
+            # Cuántas cajas OTP hay (Tidal eliminación suele ser 5 dígitos). Guía la extracción IMAP.
+            n_cajas_otp = contar_cajas_otp_visibles(self.page)
+            prefer_len = n_cajas_otp if n_cajas_otp in (5, 6) else 5
+            print(f"  [Eliminación] [{self.client_email}] Cajas OTP visibles: {n_cajas_otp or '?'}; "
+                  f"se prioriza código de {prefer_len} dígitos.")
+
+            print(f"  [Eliminación] [{self.client_email}] Buscando código en IMAP "
+                  f"({', '.join(buzones_a_probar)}; destinatario exacto con puntos)...")
+            for intento in range(1, 19):
+                if intento in (2, 8, 14):
+                    self.forzar_reenvio_codigo()
+                # Tras varios intentos: incluir correos recientes aunque el UID sea <= baseline
+                # (reintentos previos ya dispararon el código y el baseline lo excluía).
+                usar_baseline = base_del_id if intento <= 4 else 0
+                print(f"  [Eliminación] [{self.client_email}] Intento {intento}/18: "
+                      f"buscando correo de eliminación"
+                      f"{'' if usar_baseline else ' (ventana reciente sin baseline)'}...")
+                for buzon in buzones_a_probar:
+                    codigo_eliminacion = obtener_codigo_via_imap(
+                        gmail_user=buzon,
+                        required_keywords=KEYWORDS_ELIMINACION_CUENTA,
+                        query_exclude=EXCLUDE_ELIMINACION_CUENTA,
+                        after_email_id=usar_baseline,
+                        max_age_minutes=45,
+                        aliases_extra=aliases_imap,
+                        preferir_otp_len=prefer_len,
+                        exigir_destinatario_exacto=True,
+                    )
+                    if codigo_eliminacion:
+                        if not correos_iguales_exacto(buzon, self.correo_registrado_perfil):
+                            print(f"  [Eliminación] [{self.client_email}] Código hallado en buzón "
+                                  f"de acceso '{buzon}' (no en el registrado).")
+                        break
+                if codigo_eliminacion:
+                    digs = re.sub(r"\D", "", str(codigo_eliminacion))
+                    n_ahora = contar_cajas_otp_visibles(self.page) or prefer_len
+                    if n_ahora >= 5 and len(digs) != n_ahora:
+                        print(f"  [Eliminación] [{self.client_email}] OTP '{digs}' "
+                              f"({len(digs)} dígitos) vs {n_ahora} cajas visibles; "
+                              f"se intentará escribir/adaptar de todos modos.")
+                    break
+                if intento < 18:
+                    time.sleep(8.0)
+
+            if not codigo_eliminacion:
+                print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se obtuvo el código "
+                      f"vía IMAP en {self.correo_registrado_perfil}.{Color.ENDC}")
+            else:
+                print(f"  [Eliminación] [{self.client_email}] {Color.GREEN}Código obtenido: "
+                      f"{codigo_eliminacion}{Color.ENDC}")
+                # Tras la espera IMAP la pestaña puede haber perdido foco o el DOM OTP.
+                try:
+                    self.page = pagina_vigente(self.page)
+                    self.page.bring_to_front()
+                except Exception:
+                    pass
+                if not self.hay_campo_codigo():
+                    print(f"  [Eliminación] [{self.client_email}] [WARN] Sin cajas OTP visibles "
+                          f"tras IMAP; reabriendo asistente...")
+                    try:
+                        self.page.goto(
+                            "https://account.tidal.com/account-deletion",
+                            wait_until="domcontentloaded",
+                            timeout=35000,
+                        )
+                        time.sleep(1.5)
+                        aceptar_cookies_con_espera(self.page)
+                        self.recorrer_asistente_eliminacion()
+                    except Exception as e_re:
+                        print(f"  [Eliminación] [{self.client_email}] [WARN] Reapertura: {e_re}")
+
+                codigo_escrito = False
+                for intento_write in range(1, 5):
+                    if not self.hay_campo_codigo():
+                        print(f"  [Eliminación] [{self.client_email}] [WARN] Intento escritura "
+                              f"{intento_write}/4: aún no hay campo de código.")
+                        time.sleep(1.0)
+                        continue
+                    if escribir_codigo_verificacion_inteligente(self.page, codigo_eliminacion):
+                        # Éxito real = delete-button del asistente habilitado (NO el menú lateral)
+                        btn_ready = esperar_boton_eliminar_cuenta_habilitado(self.page, timeout_s=8.0)
+                        if btn_ready:
+                            codigo_escrito = True
+                            break
+                        print(f"  [Eliminación] [{self.client_email}] [WARN] OTP escrito pero "
+                              f"button.delete-button sigue deshabilitado (intento {intento_write}/4). "
+                              f"Reescribiendo...")
+                        time.sleep(0.8)
+                        continue
+                    print(f"  [Eliminación] [{self.client_email}] [WARN] Escritura OTP falló "
+                          f"({intento_write}/4). Reintentando...")
+                    time.sleep(1.2)
+
+                if codigo_escrito:
+                    print(f"  [Eliminación] [{self.client_email}] Código ingresado correctamente "
+                          f"(CTA delete-button habilitado).")
+                    time.sleep(0.6)
+                    print(f"  [Eliminación] [{self.client_email}] Confirmando eliminación "
+                          f"(asistente, no menú)...")
+                    clicked = clic_confirmar_eliminacion_asistente(self.page)
+                    if not clicked:
+                        print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo pulsar "
+                              f"button.delete-button del asistente.{Color.ENDC}")
+                    else:
+                        time.sleep(1.5)
+                        # Si tras el clic seguimos en verify con OTP, el clic no aplicó
+                        try:
+                            url_mid = (pagina_vigente(self.page).url or "").lower()
+                        except Exception:
+                            url_mid = ""
+                        if "view=verify" in url_mid and self.hay_campo_codigo():
+                            print(f"  [Eliminación] [{self.client_email}] [WARN] Seguimos en "
+                                  f"view=verify tras el clic; reintentando CTA...")
+                            time.sleep(1.0)
+                            clic_confirmar_eliminacion_asistente(self.page)
+                            time.sleep(1.5)
+
+                        if self.esperar_y_confirmar_eliminacion(45.0):
+                            print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
+                                  f"eliminada correctamente.{Color.ENDC}")
+                            exito_eliminacion = True
+                        else:
+                            url_post = ""
+                            try:
+                                url_post = (pagina_vigente(self.page).url or "").lower()
+                            except Exception:
+                                pass
+                            if url_parece_exito_o_fin_eliminacion(url_post):
+                                print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
+                                      f"eliminada (URL login/authorize).{Color.ENDC}")
+                                exito_eliminacion = True
+                            elif url_parece_abandono_eliminacion(url_post):
+                                print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] El flujo "
+                                      f"terminó en inicio/overview ({url_post[:70]}) sin borrar la cuenta."
+                                      f"{Color.ENDC}")
+                            else:
+                                # Último intento: Paso 4 residual
+                                if clic_confirmar_eliminacion_asistente(self.page):
+                                    if self.esperar_y_confirmar_eliminacion(30.0):
+                                        print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta "
+                                              f"{self.client_email} eliminada (confirmación "
+                                              f"secundaria).{Color.ENDC}")
+                                        exito_eliminacion = True
+                else:
+                    print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo ingresar "
+                          f"el código de forma que habilite button.delete-button del asistente."
+                          f"{Color.ENDC}")
+        except Exception as ex_el:
+            print(f"  {Color.FAIL}[Eliminación] [ERROR] [{self.client_email}] {ex_el}{Color.ENDC}")
+
+        self.eliminacion_ok = exito_eliminacion
+        if exito_eliminacion:
+            print(f"  [Navegador] [{self.client_email}] Cerrando ventana de Chrome...")
+            self.cerrar_recursos()
+            return True
+        return self.finalizar_sin_exito("No se completó la eliminación de la cuenta.")
+
     def cerrar_recursos(self):
         """Cierra Chrome de forma agresiva: páginas → contexto → playwright.
 
@@ -12641,6 +13267,372 @@ def iniciar_sesion_automatico_tidal(correos):
         print(f"{Color.WARNING}Las ventanas de las cuentas incompletas ya se cerraron tras el plazo de revisión manual.{Color.ENDC}")
 
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+
+
+def eliminar_cuentas_tidal_automatico_opcion15(correos):
+    """Opción 15: eliminar cuenta (proxy PE) y luego registrar de nuevo (proxy NG + PE pago)."""
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   ELIMINAR + REGISTRAR CUENTA TIDAL AUTOMÁTICO{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f"{Color.CYAN}Fase 1 (Perú): login → leer correo del perfil → IMAP → eliminar.{Color.ENDC}")
+    print(f"{Color.CYAN}Fase 2 (Nigeria): registrar de nuevo las cuentas eliminadas "
+          f"(pago con proxy PE).{Color.ENDC}")
+
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except ImportError:
+        print(f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. Ejecute 'pip install playwright' "
+              f"e instale los navegadores con 'playwright install'.")
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
+
+    path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+    if not path_cuentas.exists():
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe en la carpeta actual.")
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
+
+    cuentas_map = cargar_mapa_cuentas_sesiones()
+    if not cuentas_map:
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en "
+              f"'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
+
+    cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
+    if cuentas_map is None:
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
+
+    correos_lista = list(cuentas_map.keys())
+    print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
+
+    headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
+    headless = headless_opt in ("s", "si", "yes", "y")
+
+    revision_opt = input("¿Mantener abiertas las ventanas con error para revisión manual? (s/n, por defecto 'n'): ").strip().lower()
+    mantener_ventanas = revision_opt in ("s", "si", "sí", "yes", "y")
+
+    success_count = 0
+    fail_count = 0
+    managers = []
+    correos_eliminados: list[str] = []
+    elim_lock = threading.Lock()
+
+    num_cuentas = len(correos_lista)
+    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios (Fase 1 — eliminar)...{Color.ENDC}")
+    valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
+    if not valid_pe_list:
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige.")
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return
+    GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+
+    batch_size = 10
+    total_cuentas = len(correos_lista)
+
+    def _olas_sin_hermanos_gmail(lista: list[str]) -> list[list[str]]:
+        restantes = list(lista)
+        olas: list[list[str]] = []
+        while restantes:
+            ola: list[str] = []
+            usados_buzon: set[str] = set()
+            pendientes: list[str] = []
+            for c in restantes:
+                buz = _norm_dots_gmail(c)
+                if buz in usados_buzon:
+                    pendientes.append(c)
+                    continue
+                ola.append(c)
+                usados_buzon.add(buz)
+            olas.append(ola)
+            restantes = pendientes
+        return olas
+
+    olas = _olas_sin_hermanos_gmail(correos_lista)
+    if len(olas) > 1:
+        print(f"\n{Color.WARNING}[Opción 15] Hay alias del mismo buzón Gmail (distintos puntos). "
+              f"Se eliminarán en {len(olas)} ola(s) para no cruzar códigos OTP.{Color.ENDC}")
+        for i, ola in enumerate(olas, 1):
+            print(f"  Ola {i}: {ola}")
+
+    print(f"\n{Color.CYAN}{Color.BOLD}=== FASE 1: Eliminar {total_cuentas} cuentas (proxy PE) "
+          f"(máx. {batch_size} ventanas / ola) ==={Color.ENDC}\n")
+
+    idx_global = 0
+    for ola_idx, correos_ola in enumerate(olas, 1):
+        if len(olas) > 1:
+            print(f"\n{Color.CYAN}{Color.BOLD}=== Ola eliminación {ola_idx}/{len(olas)} "
+                  f"({len(correos_ola)} cuenta(s)) ==={Color.ENDC}")
+        for b_start in range(0, len(correos_ola), batch_size):
+            if b_start > 0 or (ola_idx > 1 and b_start == 0):
+                GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+            lote_correos = correos_ola[b_start: b_start + batch_size]
+            num_cuentas_lote = len(lote_correos)
+            barreras_lote = {"inicio": threading.Barrier(num_cuentas_lote)}
+            workers = num_cuentas_lote
+            if len(correos_ola) > batch_size:
+                print(f"\n{Color.CYAN}{Color.BOLD}--- Lote ola {ola_idx} "
+                      f"({b_start + 1} a {b_start + num_cuentas_lote} de {len(correos_ola)}) "
+                      f"---{Color.ENDC}")
+
+            def eliminar_un_correo(idx_rel, correo):
+                if idx_rel > 1:
+                    time.sleep((idx_rel - 1) * 1.5)
+                nonlocal_idx = idx_global + idx_rel
+                contrasena = cuentas_map[correo]
+
+                p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+                if not p_pe:
+                    print(f"  {Color.FAIL}[Proxy PE] [{correo}] Sin proxy disponible; se omite.{Color.ENDC}")
+                    for b in barreras_lote.values():
+                        try:
+                            b.abort()
+                        except Exception:
+                            pass
+                    return correo, False
+                p_pe_server = p_pe.get("server")
+                p_pe_user = p_pe.get("username")
+                p_pe_pass = p_pe.get("password")
+
+                manager = TidalAutoLoginManager(
+                    client_email=correo,
+                    target_pwd=contrasena,
+                    proxy_pe_server=p_pe_server,
+                    proxy_pe_user=p_pe_user,
+                    proxy_pe_pass=p_pe_pass,
+                    headless=headless,
+                    barreras=barreras_lote,
+                    thread_index=nonlocal_idx,
+                    mantener_ventana_si_falla=mantener_ventanas,
+                )
+                managers.append(manager)
+                print(f"\n{Color.CYAN}{Color.BOLD}[Eliminar Automático] Iniciando proceso para: {correo}{Color.ENDC}")
+                try:
+                    exito = manager.run_auto_login(modo="eliminar")
+                finally:
+                    cerrar_sesion_imap_hilo()
+                if exito:
+                    with elim_lock:
+                        if correo not in correos_eliminados:
+                            correos_eliminados.append(correo)
+                return correo, exito
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(eliminar_un_correo, idx_rel, correo): correo
+                    for idx_rel, correo in enumerate(lote_correos, 1)
+                }
+                for future in as_completed(futures):
+                    correo_f = futures[future]
+                    try:
+                        _c, exito = future.result()
+                        if exito:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    except Exception as ex_h:
+                        fail_count += 1
+                        print(f"  {Color.FAIL}[ERROR] Excepción eliminando {correo_f}: {ex_h}{Color.ENDC}")
+            idx_global += len(lote_correos)
+
+    total_login = sum(1 for m in managers if getattr(m, "login_ok", False))
+    total_perfil = sum(1 for m in managers if getattr(m, "correo_registrado_perfil", None))
+    total_eliminadas = sum(1 for m in managers if getattr(m, "eliminacion_ok", False))
+    # Preferir lista explícita (mismo orden de éxito)
+    if not correos_eliminados:
+        correos_eliminados = [
+            m.client_email for m in managers if getattr(m, "eliminacion_ok", False)
+        ]
+
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f"   RESUMEN FASE 1 — ELIMINAR (proxy PE)")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f" Cuentas procesadas: {total_cuentas}")
+    print(f" Inicios de sesión correctos: {total_login}")
+    print(f" Correos de perfil leídos: {total_perfil}")
+    print(f" Cuentas eliminadas: {total_eliminadas}")
+    print(f" Procesos completos: {success_count}")
+    print(f" Procesos incompletos: {fail_count}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
+
+    if fail_count and mantener_ventanas:
+        print(f"{Color.WARNING}Las ventanas de las cuentas incompletas ya se cerraron tras el plazo "
+              f"de revisión manual.{Color.ENDC}")
+
+    if not correos_eliminados:
+        print(f"\n{Color.WARNING}[Opción 15] Ninguna cuenta se eliminó con éxito. "
+              f"Se omite la fase de registro.{Color.ENDC}")
+        print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+        return
+
+    print(f"\n{Color.CYAN}{Color.BOLD}=== FASE 2: Registrar {len(correos_eliminados)} cuenta(s) "
+          f"eliminada(s) (proxy NG + PE pago) ==={Color.ENDC}")
+    for c in correos_eliminados:
+        print(f"  • {c}")
+
+    # Tidal a veces tarda unos segundos en liberar el correo tras el borrado
+    print(f"\n{Color.CYAN}[Opción 15] Esperando 2s antes del registro (liberación del correo en Tidal)...{Color.ENDC}")
+    time.sleep(2.0)
+
+    global valid_ng_list, CACHE_PROXIES_NG
+    valid_ng_list = []
+    cargar_cache_proxies_validos_desde_disco()
+    if CACHE_PROXIES_NG:
+        valid_ng_list = list(CACHE_PROXIES_NG)
+        print(f"\n{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA "
+              f"previamente verificados.{Color.ENDC}")
+    else:
+        proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
+        if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
+            ng_list = proxies_cfg["proxy_ng_list"]
+            print(f"\nSe encontraron {len(ng_list)} proxies para NIGERIA.")
+            valid_ng_list = probar_y_seleccionar_mejor_proxy(
+                ng_list, "NIGERIA", max(len(correos_eliminados) * 4, len(correos_eliminados) + 15)
+            )
+            if valid_ng_list:
+                guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
+        else:
+            print(f"\n{Color.WARNING}[Proxy]{Color.ENDC} No se encontraron proxies de Nigeria.")
+
+    alimentar_pool_proxies_nigeria(valid_ng_list)
+    GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
+    GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+
+    use_proxy_ng = bool(valid_ng_list)
+    if not use_proxy_ng:
+        print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Nigeria válidos.")
+        confirm = input("¿Continuar el registro con tu IP local/VPN? (s/n, por defecto 'n'): ").strip().lower()
+        if confirm not in ("s", "si", "yes", "y"):
+            print("Registro cancelado. Las cuentas ya fueron eliminadas.")
+            print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+            return
+
+    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para el pago del registro...{Color.ENDC}")
+    proxies_pe_reg = asegurar_proxies_peru(cantidad_necesaria=len(correos_eliminados))
+    if not proxies_pe_reg:
+        print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies PE para el pago del registro.")
+        confirm_pe = input("¿Continuar el registro sin proxy PE? (s/n, por defecto 'n'): ").strip().lower()
+        if confirm_pe not in ("s", "si", "sí", "yes", "y"):
+            print("Registro cancelado. Las cuentas ya fueron eliminadas.")
+            print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+            return
+
+    reg_ok = 0
+    reg_fail = 0
+    reg_lock = threading.Lock()
+    workers_reg = min(10, len(correos_eliminados))
+    print(f"\n{Color.CYAN}{Color.BOLD}Registrando {len(correos_eliminados)} cuentas "
+          f"(hasta {workers_reg} hilos, proxy NG)...{Color.ENDC}\n")
+
+    def registrar_tras_borrar(idx, correo):
+        nonlocal reg_ok, reg_fail
+        if idx > 1:
+            time.sleep((idx - 1) * 0.2)
+        p_ng_server = p_ng_user = p_ng_pass = None
+        p_pe_server = p_pe_user = p_pe_pass = None
+        manager = None
+        exito = False
+        try:
+            if use_proxy_ng and valid_ng_list:
+                p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico()
+                if not p_ng:
+                    print(f"  {Color.FAIL}[Proxy NG] [{correo}] Sin proxy de Nigeria libre; se omite.{Color.ENDC}")
+                    with reg_lock:
+                        reg_fail += 1
+                    return correo, False
+                p_ng_server = p_ng.get("server")
+                p_ng_user = p_ng.get("username")
+                p_ng_pass = p_ng.get("password")
+
+            if proxies_pe_reg:
+                p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+                if p_pe:
+                    p_pe_server = p_pe.get("server")
+                    p_pe_user = p_pe.get("username")
+                    p_pe_pass = p_pe.get("password")
+
+            # Misma contraseña anotada (si el registro la pide más adelante / opción 9)
+            pwd_prev = cuentas_map.get(correo) or ""
+            manager = TidalRegisterManager(
+                client_email=correo,
+                client_pwd=pwd_prev,
+                proxy_ng_server=p_ng_server,
+                proxy_ng_user=p_ng_user,
+                proxy_ng_pass=p_ng_pass,
+                proxy_pe_server=p_pe_server,
+                proxy_pe_user=p_pe_user,
+                proxy_pe_pass=p_pe_pass,
+                headless=headless,
+            )
+            print(f"\n{Color.CYAN}{Color.BOLD}[Registro post-eliminación] {correo}{Color.ENDC}")
+            exito = manager.run_registration(cerrar_navegador_al_final=True)
+            try:
+                manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+            except Exception:
+                pass
+            try:
+                manager.limpiar_perfil_temporal()
+            except Exception:
+                pass
+            with reg_lock:
+                if exito:
+                    reg_ok += 1
+                    print(f"  {Color.GREEN}[Registro] [{correo}] Completado tras eliminación.{Color.ENDC}")
+                else:
+                    reg_fail += 1
+            return correo, exito
+        except Exception as e_reg:
+            if manager is not None:
+                try:
+                    manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+                except Exception:
+                    pass
+                try:
+                    manager.limpiar_perfil_temporal()
+                except Exception:
+                    pass
+            with reg_lock:
+                if not exito:
+                    reg_fail += 1
+            print(f"  {Color.FAIL}[ERROR] Registro de {correo}: {e_reg}{Color.ENDC}")
+            return correo, False
+        finally:
+            cerrar_sesion_imap_hilo()
+            if not exito:
+                try:
+                    GLOBAL_NG_PROXY_POOL.liberar_proxy(p_ng_server)
+                except Exception:
+                    pass
+                try:
+                    GLOBAL_PE_PROXY_POOL.liberar_proxy(p_pe_server)
+                except Exception:
+                    pass
+
+    with ThreadPoolExecutor(max_workers=workers_reg) as executor:
+        futures = {
+            executor.submit(registrar_tras_borrar, idx, correo): correo
+            for idx, correo in enumerate(correos_eliminados, 1)
+        }
+        for future in as_completed(futures):
+            correo_f = futures[future]
+            try:
+                future.result()
+            except Exception as ex_h:
+                with reg_lock:
+                    reg_fail += 1
+                print(f"  {Color.FAIL}[ERROR] Excepción registrando {correo_f}: {ex_h}{Color.ENDC}")
+
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f"   RESUMEN FASE 2 — REGISTRAR (proxy NG)")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+    print(f" Cuentas a registrar (eliminadas OK): {len(correos_eliminados)}")
+    print(f" Registros correctos: {Color.GREEN}{reg_ok}{Color.ENDC}")
+    print(f" Registros fallidos: {Color.FAIL}{reg_fail}{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
+
+    print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso eliminar+registrar finalizado. "
+          f"Regresando al menú principal...{Color.ENDC}\n")
 
 
 def registrar_cuentas_tidal(correos):
@@ -13504,9 +14496,10 @@ def menu_principal():
         print(" 12. Verificar contraseñas IMAP registradas en passwords.txt")
         print(" 13. Validar y verificar lista de proxies (Nigeria / Perú)")
         print(" 14. Crear cuentas FAMILIARES AUTOMÁTICO (Registro NG + Checkout + Upgrade Family)")
+        print(" 15. ELIMINAR (proxy PE) + REGISTRAR (proxy NG) cuenta(s) TIDAL")
         print(f"{Color.CYAN}{Color.BOLD}" + "-"*50 + f"{Color.ENDC}")
         
-        opcion = input(f"{Color.BOLD}Selecciona una opción (1-14):{Color.ENDC} ").strip()
+        opcion = input(f"{Color.BOLD}Selecciona una opción (1-15):{Color.ENDC} ").strip()
         
         if opcion in ("1", "2", "3"):
             for correo in correos:
@@ -13711,9 +14704,12 @@ def menu_principal():
 
         elif opcion == "14":
             crear_cuentas_familiares_automatico_opcion14()
+
+        elif opcion == "15":
+            eliminar_cuentas_tidal_automatico_opcion15(correos)
             
         else:
-            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 14.")
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 15.")
 
 
 if __name__ == "__main__":
