@@ -6487,321 +6487,464 @@ class TidalRegisterManager:
                 registro_exitoso = True
                 return True
 
-            print("  [Registro] Rellenando fecha de nacimiento (15/08/1995)...", flush=True)
-            time.sleep(0.8)
-            # Playwright select_option (React sí lo registra; assign+dispatch a veces no)
-            try:
-                selects = self.page.locator("select")
-                n_sel = selects.count()
-                if n_sel >= 3:
-                    try:
-                        selects.nth(0).select_option(value="15", timeout=3000)
-                    except Exception:
-                        try:
-                            selects.nth(0).select_option(label="15", timeout=3000)
-                        except Exception:
-                            selects.nth(0).select_option(index=15, timeout=3000)
-                    time.sleep(0.25)
-                    # Mes: probar value 8/08 e índices típicos
-                    mes_ok = False
-                    for opt in ("8", "08"):
-                        try:
-                            selects.nth(1).select_option(value=opt, timeout=2000)
-                            mes_ok = True
-                            break
-                        except Exception:
-                            pass
-                    if not mes_ok:
-                        for lab in ("August", "Agosto", "Aug", "Ago", "08", "8"):
-                            try:
-                                selects.nth(1).select_option(label=re.compile(lab, re.I), timeout=2000)
-                                mes_ok = True
-                                break
-                            except Exception:
-                                pass
-                    if not mes_ok:
-                        try:
-                            # 0=placeholder → agosto suele ser 8
-                            selects.nth(1).select_option(index=8, timeout=2000)
-                        except Exception:
-                            try:
-                                selects.nth(1).select_option(index=7, timeout=2000)
-                            except Exception:
-                                pass
-                    time.sleep(0.25)
-                    try:
-                        selects.nth(2).select_option(value="1995", timeout=3000)
-                    except Exception:
-                        selects.nth(2).select_option(label="1995", timeout=3000)
-                else:
-                    # Fallback evaluate legado
-                    self.page.evaluate("""() => {
-                        const sels = document.querySelectorAll('select');
-                        if (sels[0]) { sels[0].value='15'; sels[0].dispatchEvent(new Event('change',{bubbles:true})); }
-                        if (sels[1]) {
-                            const opts=[...sels[1].options];
-                            const hit=opts.find(o=>/^(8|08)$/i.test(o.value)||/aug|ago/i.test(o.textContent||''));
-                            if (hit) sels[1].value=hit.value;
-                            else if (opts.length>8) sels[1].selectedIndex = opts.length===13?8:7;
-                            sels[1].dispatchEvent(new Event('change',{bubbles:true}));
+            print("  [Registro] Rellenando fecha de nacimiento (15/08/1995)...")
+            time.sleep(1.0)
+            
+            self.page.evaluate("""
+                () => {
+                    const selects = document.querySelectorAll('select');
+                    if (selects.length >= 3) {
+                        const daySelect = document.querySelector('select[name*="day" i]') || selects[0];
+                        if (daySelect) {
+                            daySelect.value = "15";
+                            daySelect.dispatchEvent(new Event('input', { bubbles: true }));
+                            daySelect.dispatchEvent(new Event('change', { bubbles: true }));
                         }
-                        if (sels[2]) { sels[2].value='1995'; sels[2].dispatchEvent(new Event('change',{bubbles:true})); }
-                    }""")
-            except Exception as e_dob:
-                print(f"  [Registro] [{self.client_email}] [WARN] DOB Playwright: {e_dob}", flush=True)
+                    } else {
+                        const dayInput = document.querySelector('input[name*="day" i]');
+                        if (dayInput) {
+                            dayInput.value = "15";
+                            dayInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            dayInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }
+                }
+            """)
             time.sleep(0.6)
+            
+            self.page.evaluate("""
+                () => {
+                    const selects = document.querySelectorAll('select');
+                    if (selects.length >= 3) {
+                        const monthSelect = document.querySelector('select[name*="month" i]') || selects[1];
+                        if (monthSelect) {
+                            const opts = Array.from(monthSelect.options);
+                            const targets = ["8", "08", "aug", "ago", "august", "agosto"];
+                            let matched = false;
+                            for (const opt of opts) {
+                                const val = (opt.value || '').trim().toLowerCase();
+                                const txt = (opt.textContent || '').trim().toLowerCase();
+                                if (targets.some(t => val === t || txt === t || txt.includes(t))) {
+                                    monthSelect.value = opt.value;
+                                    monthSelect.dispatchEvent(new Event('input', { bubbles: true }));
+                                    monthSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if (!matched && opts.length > 8) {
+                                monthSelect.selectedIndex = opts.length === 13 ? 8 : 7;
+                                monthSelect.dispatchEvent(new Event('input', { bubbles: true }));
+                                monthSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        }
+                    } else {
+                        const monthInput = document.querySelector('input[name*="month" i]');
+                        if (monthInput) {
+                            monthInput.value = "08";
+                            monthInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            monthInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }
+                }
+            """)
+            time.sleep(0.6)
+            
+            self.page.evaluate("""
+                () => {
+                    const selects = document.querySelectorAll('select');
+                    if (selects.length >= 3) {
+                        const yearSelect = document.querySelector('select[name*="year" i]') || selects[2];
+                        if (yearSelect) {
+                            yearSelect.value = "1995";
+                            yearSelect.dispatchEvent(new Event('input', { bubbles: true }));
+                            yearSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    } else {
+                        const yearInput = document.querySelector('input[name*="year" i]');
+                        if (yearInput) {
+                            yearInput.value = "1995";
+                            yearInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            yearInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }
+                }
+            """)
+            time.sleep(0.6)
+            
 
-            # Quitar overlays de cookies que tapan Suscríbete
-            try:
-                aceptar_cookies_con_espera(self.page)
-            except Exception:
-                pass
-            try:
-                self.page.evaluate("""() => {
-                    ['#onetrust-consent-sdk','#onetrust-banner-sdk','.onetrust-pc-dark-filter'].forEach(s => {
-                        document.querySelectorAll(s).forEach(el => el.remove());
-                    });
-                }""")
-            except Exception:
-                pass
 
-            print("  [Registro] Marcando checkbox de términos...", flush=True)
-            try:
-                n_cb = self.page.locator('input[type="checkbox"]').count()
-                for i in range(n_cb):
-                    cb = self.page.locator('input[type="checkbox"]').nth(i)
-                    try:
-                        if not cb.is_visible(timeout=400):
-                            continue
-                        if cb.is_checked():
-                            continue
-                        cb.check(force=True, timeout=2000)
-                    except Exception:
-                        try:
-                            cb.click(force=True, timeout=1500)
-                        except Exception:
-                            pass
-            except Exception as e_cb:
-                print(f"  [Registro] [{self.client_email}] [WARN] Checkbox: {e_cb}", flush=True)
-            # Refuerzo JS solo en términos (sin click en <a>)
-            try:
-                self.page.evaluate("""() => {
-                    document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                        const t = ((cb.closest('label')||cb.parentElement||cb).textContent||'');
-                        if (/términos|terms|privacidad|privacy|acuerdo|agree/i.test(t) && !cb.checked) {
-                            cb.click();
+            print("  [Registro] Marcando checkbox de términos...")
+            self.page.evaluate("""
+                () => {
+                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                    checkboxes.forEach(cb => {
+                        const parentText = cb.parentElement ? cb.parentElement.textContent || '' : '';
+                        if (parentText.includes('Términos') || parentText.includes('Terms') || 
+                            parentText.includes('Privacidad') || parentText.includes('Privacy')) {
+                            if (!cb.checked) {
+                                cb.click();
+                                if (!cb.checked && cb.parentElement) {
+                                    cb.parentElement.click();
+                                }
+                            }
                         }
                     });
-                }""")
-            except Exception:
-                pass
-            time.sleep(0.7)
-
-            print(f"  [Registro] [{self.client_email}] Baseline IMAP...", flush=True)
-            try:
+                }
+            """)
+            time.sleep(1.0)
+            
+            # Serializar Suscríbete + IMAP + envío OTP por buzón Gmail (aliases con puntos).
+            with _lock_registro_mismo_buzon(self.client_email):
                 max_id_previo = obtener_max_email_id(self.client_email)
-            except Exception as e_base:
-                print(f"  [Registro] [{self.client_email}] [WARN] Baseline IMAP: {e_base}", flush=True)
-                max_id_previo = 0
 
-            def _pantalla_otp_o_exito() -> bool:
-                try:
-                    if self._sesion_post_registro_detectada():
-                        return True
-                    if contar_cajas_otp_visibles(self.page) >= 1:
-                        return True
-                    return bool(self.page.evaluate("""() => {
-                        const t = (document.body && document.body.innerText || '').toLowerCase();
-                        const frases = [
-                            'verify your email', 'verifica tu correo', 'verifica tu email',
-                            'verificar tu correo', 'confirm your email', 'finish creating',
-                            '6-digit', '6 dígitos', '6 digitos', 'resend code', 'reenviar',
-                            'we sent', 'te hemos enviado', 'email sent', 'correo enviado'
-                        ];
-                        if (frases.some(f => t.includes(f))) return true;
-                        return document.querySelectorAll(
-                            'input[maxlength="1"], input[autocomplete="one-time-code"]'
-                        ).length >= 4;
-                    }"""))
-                except Exception:
-                    return False
-
-            def _estado_formulario_reg():
-                try:
-                    return self.page.evaluate("""() => {
-                        const cbs = [...document.querySelectorAll('input[type="checkbox"]')].map(c => !!c.checked);
-                        const sels = [...document.querySelectorAll('select')].map(s => s.value);
-                        const btn = [...document.querySelectorAll('button')].find(b =>
-                            /suscr[ií]bete|subscribe|crear cuenta|create account/i.test(b.textContent||'')
-                        );
-                        return {
-                            cbs, sels,
-                            btnDisabled: btn ? !!btn.disabled : null,
-                            btnText: btn ? (btn.textContent||'').trim().slice(0,48) : null,
-                            url: (location.href||'').slice(0,100),
-                        };
-                    }""")
-                except Exception as e:
-                    return {"err": str(e)}
-
-            def _pulsar_suscribete_cuando_habilitado() -> bool:
-                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...", flush=True)
-                print(f"  [Registro] [{self.client_email}] Estado form: {_estado_formulario_reg()}", flush=True)
-                # Esperar a que el botón deje de estar disabled (force=True sobre disabled no sirve)
-                try:
-                    self.page.wait_for_function("""() => {
-                        const btn = [...document.querySelectorAll('button')].find(b =>
-                            /suscr[ií]bete|subscribe|crear cuenta|create account/i.test(b.textContent||'')
-                        );
-                        return !!(btn && !btn.disabled);
-                    }""", timeout=12000)
-                except Exception:
-                    print(f"  [Registro] [{self.client_email}] [WARN] Suscríbete sigue disabled; "
-                          f"se intenta igual. Estado={_estado_formulario_reg()}", flush=True)
-                clicked = False
-                for sel in (
-                    "button:has-text('Suscríbete')",
-                    "button:has-text('Subscribe')",
-                    "button:has-text('Create account')",
-                    "button:has-text('Crear cuenta')",
-                ):
+                def _pantalla_otp_registro() -> bool:
                     try:
-                        loc = self.page.locator(sel).first
-                        if loc.count() == 0:
-                            continue
-                        loc.scroll_into_view_if_needed(timeout=2000)
-                        # Primero clic normal (respeta enabled); luego force
-                        try:
-                            loc.click(timeout=4000)
-                        except Exception:
-                            loc.click(force=True, timeout=4000)
-                        clicked = True
-                        break
-                    except Exception:
-                        continue
-                if not clicked:
-                    try:
-                        loc = self.page.locator("button[type='submit']").first
-                        if loc.count():
-                            loc.click(force=True, timeout=4000)
-                            clicked = True
-                    except Exception:
-                        pass
-                if not clicked:
-                    try:
-                        clicked = bool(self.page.evaluate("""() => {
-                            const btn = [...document.querySelectorAll('button')].find(b =>
-                                /suscr[ií]bete|subscribe|crear cuenta|create account/i.test(b.textContent||'')
-                            ) || document.querySelector('button[type="submit"]');
-                            if (!btn) {
-                                const f = document.querySelector('form');
-                                if (f) { try { f.requestSubmit(); return true; } catch(e) {} }
-                                return false;
-                            }
-                            btn.disabled = false;
-                            btn.removeAttribute('disabled');
-                            btn.click();
-                            return true;
+                        self.page = pagina_vigente(self.page)
+                        if not self.page or self.page.is_closed():
+                            return False
+                        return bool(self.page.evaluate("""() => {
+                            const t = document.body ? document.body.innerText.toLowerCase() : '';
+                            const frases = [
+                                'verify your email', 'verifica tu correo', 'verifica tu email',
+                                'verificar tu correo', 'verificar correo', 'confirma tu correo',
+                                'confirm your email', 'finish creating your account',
+                                'terminar de crear', '6-digit', '6 digit', '6-dígitos',
+                                '6 dígitos', '6 digitos', 'resend code', 'reenviar código',
+                                'reenviar codigo', 'email sent', 'correo enviado',
+                                'check your inbox', 'revisa tu bandeja', 'we sent',
+                                'te hemos enviado', "we've sent", 'código de 6', 'codigo de 6'
+                            ];
+                            if (frases.some(f => t.includes(f))) return true;
+                            const n = document.querySelectorAll(
+                                'input[maxlength="1"], input[autocomplete="one-time-code"]'
+                            ).length;
+                            return n >= 4;
                         }"""))
                     except Exception:
-                        pass
-                print(f"  [Registro] [{self.client_email}] Tras clic: {_estado_formulario_reg()}", flush=True)
-                return clicked
+                        try:
+                            return bool(encontrar_locator_en_frames(
+                                self.page,
+                                ['input[maxlength="1"]', 'input[autocomplete="one-time-code"]']
+                            ))
+                        except Exception:
+                            return False
 
-            # Serializar SOLO el submit entre aliases del mismo Gmail (como cuando funcionaba),
-            # pero con mensajes claros y sin hacer IMAP dentro de este tramo corto.
-            otp_ui_ok = False
-            print(f"  [Registro] [{self.client_email}] Esperando turno Suscríbete del buzón...", flush=True)
-            with _lock_registro_mismo_buzon(self.client_email):
-                print(f"  [Registro] [{self.client_email}] Turno Suscríbete adquirido.", flush=True)
-                for intento_sub in range(1, 5):
-                    _pulsar_suscribete_cuando_habilitado()
-                    for _ in range(10):
-                        time.sleep(0.8)
-                        if _pantalla_otp_o_exito():
-                            otp_ui_ok = True
-                            break
-                    if otp_ui_ok:
-                        print(f"  [Registro] [{self.client_email}] Pantalla OTP OK "
-                              f"(intento {intento_sub}/4).", flush=True)
-                        break
-                    print(f"  [Registro] [{self.client_email}] Sin OTP tras Suscríbete "
-                          f"(intento {intento_sub}/4). Reintento...", flush=True)
-                    # Re-marcar términos / DOB por si React los perdió
+                def _sigue_en_formulario_registro() -> bool:
                     try:
-                        for i in range(self.page.locator('input[type="checkbox"]').count()):
-                            cb = self.page.locator('input[type="checkbox"]').nth(i)
-                            try:
-                                if cb.is_visible(timeout=300) and not cb.is_checked():
-                                    cb.check(force=True, timeout=1500)
-                            except Exception:
-                                pass
+                        return bool(encontrar_locator_en_frames(
+                            self.page,
+                            [
+                                "button:has-text('Suscríbete')", "button:has-text('Subscribe')",
+                                'select[name*="day" i]', 'select[name*="year" i]',
+                                'input[name*="day" i]',
+                            ]
+                        ))
+                    except Exception:
+                        return False
+
+                def _pulsar_suscribete() -> None:
+                    print("  [Registro] Pulsando botón 'Suscríbete'...")
+                    # Reafirmar términos (a veces el clic previo no quedó registrado)
+                    try:
+                        self.page.evaluate("""() => {
+                            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                                const parentText = cb.parentElement ? (cb.parentElement.textContent || '') : '';
+                                if (/términos|terms|privacidad|privacy|acuerdo|agree/i.test(parentText)) {
+                                    if (!cb.checked) {
+                                        cb.click();
+                                        if (!cb.checked && cb.parentElement) cb.parentElement.click();
+                                    }
+                                }
+                            });
+                        }""")
                     except Exception:
                         pass
-
-            if not otp_ui_ok:
-                print(f"  [Registro] [{self.client_email}] [WARN] Sin OTP UI; se sigue con IMAP.", flush=True)
-
-            print(f"  [Registro] [{self.client_email}] Turno IMAP del buzón...", flush=True)
-            with _lock_registro_mismo_buzon(self.client_email):
-                codigo_aceptado = False
-                ultimo_error_codigo = ""
-                codigo_guardado = None  # No perder el OTP si falló el relleno de cajas
-
-                def _esperar_ui_otp_registro(timeout_s: float = 20.0) -> bool:
-                    """Espera cajas OTP reales (maxlength=1 / one-time-code), no cualquier input text."""
-                    fin = time.time() + timeout_s
-                    while time.time() < fin:
+                    btn_sub = esperar_locator_en_frames(
+                        self.page,
+                        [
+                            "button:has-text('Suscríbete')", "button:has-text('Subscribe')",
+                            "button:has-text('Create account')", "button:has-text('Crear cuenta')",
+                            "button[type='submit']",
+                        ],
+                        timeout_s=5.0
+                    )
+                    if btn_sub:
                         try:
-                            self.page = pagina_vigente(self.page)
-                            # Si ya salimos del OTP (cuenta creada), no seguir esperando cajas
-                            if self._sesion_post_registro_detectada():
-                                return False  # caller tratará como éxito vía _sesion_*
-                            n = contar_cajas_otp_visibles(self.page)
-                            if n >= 4:
+                            btn_sub.click(force=True)
+                        except Exception:
+                            try:
+                                btn_sub.evaluate("b => b.click()")
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            self.page.evaluate("""() => {
+                                const btn = document.querySelector('button[type="submit"]') ||
+                                    Array.from(document.querySelectorAll('button')).find(b => {
+                                        const t = (b.textContent || '').toLowerCase();
+                                        return t.includes('suscríbete') || t.includes('suscribete')
+                                            || t.includes('subscribe') || t.includes('crear cuenta')
+                                            || t.includes('create account');
+                                    });
+                                if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); btn.click(); }
+                            }""")
+                        except Exception:
+                            pass
+
+                def _asegurar_otp_tras_suscribirse() -> bool:
+                    """Tras Suscríbete: esperar OTP, recuperar authorize/antirobot o reintentar clic.
+
+                    Antes se abortaba a los ~8s sin OTP aunque el proxy solo fuera lento o el
+                    botón no hubiera registrado el clic → fallos falsos (g.etspooky381.9).
+                    """
+                    _pulsar_suscribete()
+                    time.sleep(2.0)
+
+                    for intento_rec in range(1, 6):
+                        # Espera activa a la pantalla OTP
+                        for _ in range(12):
+                            if _pantalla_otp_registro():
                                 return True
-                            loc = encontrar_locator_en_frames(
-                                self.page,
-                                [
-                                    'input[autocomplete="one-time-code"]',
-                                    'input[name="code"]',
-                                    'input[inputmode="numeric"][maxlength]',
-                                ],
+                            # Si ya llegó el correo, la UI puede ir retrasada: no abortar aún
+                            time.sleep(1.0)
+
+                        if _pantalla_otp_registro():
+                            return True
+
+                        # Diagnóstico de estado actual
+                        try:
+                            url_now = (self.page.url or "")[:120]
+                            txt_snip = self.page.evaluate(
+                                "() => (document.body && document.body.innerText || '').slice(0, 180)"
                             )
-                            if loc and n >= 1:
+                        except Exception:
+                            url_now, txt_snip = "?", ""
+                        print(f"  [Registro] [{self.client_email}] Aún sin OTP tras Suscríbete "
+                              f"(intento recuperación {intento_rec}/5). URL={url_now}")
+                        if txt_snip:
+                            print(f"  [Registro] [{self.client_email}] Texto visible: "
+                                  f"{(txt_snip or '').replace(chr(10), ' ')[:120]!r}")
+
+                        # Cuenta ya existente → no hace falta OTP de registro
+                        try:
+                            if encontrar_locator_en_frames(
+                                self.page,
+                                ['input[type="password"]', 'input[name="password"]']
+                            ) and not _sigue_en_formulario_registro():
+                                print(f"  {Color.WARNING}[Registro] [{self.client_email}] Apareció "
+                                      f"login por contraseña (cuenta ya existente).{Color.ENDC}")
+                                self._registro_cuenta_existente = True
+                                return False
+                        except Exception:
+                            pass
+
+                        # Antibot / Error authorize
+                        try:
+                            if detectar_pantalla_antirobot(self.page):
+                                print(f"  [Registro] [{self.client_email}] Antibot tras Suscríbete; "
+                                      f"intervención/rotación...")
+                                manejar_bloqueos_e_intervencion(self.page, "Registro tras Suscríbete")
+                        except Exception:
+                            pass
+                        try:
+                            if es_pantalla_error_login_tidal(self.page) or url_es_oauth_login_roto(
+                                getattr(self.page, "url", "") or ""
+                            ):
+                                print(f"  [Registro] [{self.client_email}] Authorize/Error tras "
+                                      f"Suscríbete; recuperando flujo...")
+                                if self.use_proxy:
+                                    self.ejecutar_rotacion_proxy_y_recargar()
+                                else:
+                                    self.recuperar_login_tras_error_tidal()
+                                # Tras recuperar estamos en login: hay que rehacer el formulario.
+                                # Señalamos al caller para reiniciar run_registration externo no;
+                                # aquí reintentamos email→fecha→suscribir en este mismo lock.
+                                raise RuntimeError("__REINICIAR_FORMULARIO_REGISTRO__")
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
+
+                        # ¿Correo de sign-up ya en IMAP aunque la UI no cambió?
+                        try:
+                            codigo_previo = obtener_codigo_via_imap(
+                                gmail_user=self.client_email,
+                                required_keywords=[
+                                    "registr", "bienven", "código", "codigo", "code",
+                                    "verific", "sign-up", "signup", "sign up",
+                                ],
+                                query_exclude="cancel",
+                                after_email_id=max_id_previo,
+                                max_age_minutes=20,
+                            )
+                            if codigo_previo and not str(codigo_previo).startswith("http"):
+                                print(f"  [Registro] [{self.client_email}] OTP ya llegó por IMAP "
+                                      f"({codigo_previo}) aunque la UI no mostró Verify. Se continúa.")
+                                # Forzar navegación a una URL de verificación no siempre existe;
+                                # devolver True y dejar que el bucle IMAP/escritura lo use.
+                                # Guardamos el código en atributo temporal.
+                                self._otp_registro_prefetch = codigo_previo
                                 return True
                         except Exception:
                             pass
-                        time.sleep(0.4)
-                    return contar_cajas_otp_visibles(self.page) >= 1
+
+                        # Seguir en el formulario: volver a pulsar Suscríbete
+                        if _sigue_en_formulario_registro():
+                            print(f"  [Registro] [{self.client_email}] Sigue el formulario; "
+                                  f"reintentando Suscríbete...")
+                            _pulsar_suscribete()
+                            time.sleep(2.5)
+                            continue
+
+                        # Página rara: rotar proxy NG y recuperar pricing→account, luego abortar
+                        # este helper con reinicio de formulario.
+                        if self.use_proxy and intento_rec >= 3:
+                            print(f"  [Registro] [{self.client_email}] Rotando proxy NG y "
+                                  f"reiniciando formulario de registro...")
+                            try:
+                                self.ejecutar_rotacion_proxy_y_recargar()
+                            except Exception:
+                                pass
+                            raise RuntimeError("__REINICIAR_FORMULARIO_REGISTRO__")
+
+                        time.sleep(1.5)
+
+                    return _pantalla_otp_registro()
+
+                # Hasta 2 reinicios completos del formulario si authorize/proxy lo tumba
+                self._otp_registro_prefetch = None
+                self._registro_cuenta_existente = False
+                otp_listo = False
+                for _ciclo_form in range(1, 3):
+                    try:
+                        ok_otp = _asegurar_otp_tras_suscribirse()
+                        if ok_otp:
+                            otp_listo = True
+                            break
+                        if getattr(self, "_registro_cuenta_existente", False):
+                            break
+                        # False genérico: seguir al siguiente ciclo o fallar al salir
+                    except RuntimeError as e_rein:
+                        if "__REINICIAR_FORMULARIO_REGISTRO__" not in str(e_rein):
+                            raise
+                        print(f"  [Registro] [{self.client_email}] Reiniciando formulario "
+                              f"(ciclo {_ciclo_form}/2) tras fallo post-Suscríbete...")
+                        # Rehacer email + fecha + términos (mismo patrón que arriba)
+                        email_input = esperar_locator_en_frames(
+                            self.page,
+                            ['input[type="email"]', 'input[name="email"]', '#email'],
+                            timeout_s=20.0
+                        )
+                        if not email_input:
+                            try:
+                                self.recuperar_login_tras_error_tidal()
+                            except Exception:
+                                pass
+                            email_input = esperar_locator_en_frames(
+                                self.page,
+                                ['input[type="email"]', 'input[name="email"]', '#email'],
+                                timeout_s=20.0
+                            )
+                        if not email_input:
+                            continue
+                        try:
+                            email_input.fill("")
+                            email_input.fill(self.client_email)
+                            email_input.press("Enter")
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        if encontrar_locator_en_frames(
+                            self.page, ['input[type="password"]', 'input[name="password"]']
+                        ):
+                            self._registro_cuenta_existente = True
+                            break
+                        # Fecha + términos (JS compacto)
+                        try:
+                            self.page.evaluate("""() => {
+                                const selects = document.querySelectorAll('select');
+                                if (selects.length >= 3) {
+                                    selects[0].value = '15';
+                                    selects[0].dispatchEvent(new Event('change', {bubbles:true}));
+                                    if (selects[1].options.length > 8) {
+                                        selects[1].selectedIndex = selects[1].options.length === 13 ? 8 : 7;
+                                        selects[1].dispatchEvent(new Event('change', {bubbles:true}));
+                                    }
+                                    selects[2].value = '1995';
+                                    selects[2].dispatchEvent(new Event('change', {bubbles:true}));
+                                }
+                                document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                                    const p = cb.parentElement ? (cb.parentElement.textContent||'') : '';
+                                    if (/términos|terms|privacidad|privacy/i.test(p) && !cb.checked) cb.click();
+                                });
+                            }""")
+                        except Exception:
+                            pass
+                        time.sleep(0.8)
+                        max_id_previo = obtener_max_email_id(self.client_email)
+
+                if getattr(self, "_registro_cuenta_existente", False):
+                    print(f"  {Color.WARNING}[Registro] La cuenta {self.client_email} ya está "
+                          f"registrada en TIDAL. Omitiendo...{Color.ENDC}")
+                    registro_exitoso = True
+                    return True
+
+                if not otp_listo and not _pantalla_otp_registro() and not getattr(self, "_otp_registro_prefetch", None):
+                    raise RuntimeError(
+                        f"Tras Suscríbete no apareció la verificación OTP para {self.client_email} "
+                        f"tras varios reintentos/recuperaciones (proxy/authorize)."
+                    )
+
+                codigo_aceptado = False
+                ultimo_error_codigo = ""
+                codigo_guardado = getattr(self, "_otp_registro_prefetch", None)
+                self._otp_registro_prefetch = None
 
                 for ronda in range(1, 5):
-                    # Cuenta ya creada (OTP aceptado aunque el script diga que falló el fill)
                     if self._sesion_post_registro_detectada():
-                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Sesión/cuenta ya activa "
-                              f"(OTP aceptado por Tidal). Continuando...{Color.ENDC}")
+                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Sesión/cuenta ya activa. "
+                              f"Continuando...{Color.ENDC}")
                         codigo_aceptado = True
                         break
 
                     codigo = codigo_guardado
                     if not codigo:
                         print(f"  [Registro] Buscando código de registro vía IMAP (ronda {ronda}/4)...")
-                        for intento in range(1, 8):
-                            print(f"  [Registro] Intento {intento}/7: Buscando correo...")
+                        for intento in range(1, 11):
+                            print(f"  [Registro] Intento {intento}/10: Buscando correo...")
                             codigo = obtener_codigo_via_imap(
                                 gmail_user=self.client_email,
                                 required_keywords=[
-                                    "registr", "bienven", "código", "code",
+                                    "registr", "bienven", "código", "codigo", "code",
                                     "verific", "sign-up", "signup", "sign up",
                                 ],
                                 query_exclude="cancel",
                                 after_email_id=max_id_previo,
+                                max_age_minutes=20,
                             )
                             if codigo:
                                 codigo_guardado = codigo
                                 break
-                            if intento < 7:
-                                # Mientras esperamos el mail, la UI pudo haber avanzado sola
+                            if intento in (4, 7) and _pantalla_otp_registro():
+                                try:
+                                    btn_resend = esperar_locator_en_frames(
+                                        self.page,
+                                        [
+                                            "button:has-text('Resend code')", "button:has-text('Resend')",
+                                            "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
+                                            "a:has-text('Resend')", "a:has-text('Reenviar')",
+                                        ],
+                                        timeout_s=2.0,
+                                    )
+                                    if btn_resend:
+                                        print(f"  [Registro] [{self.client_email}] Pulsando Resend code...")
+                                        btn_resend.click(force=True)
+                                        time.sleep(2.0)
+                                        max_id_previo = obtener_max_email_id(self.client_email)
+                                except Exception:
+                                    pass
+                            if intento < 10:
                                 if self._sesion_post_registro_detectada():
                                     codigo_aceptado = True
                                     break
@@ -6811,17 +6954,17 @@ class TidalRegisterManager:
                             break
                     else:
                         print(f"  [Registro] [{self.client_email}] Reutilizando OTP ya leído "
-                              f"({codigo}) — reintento de relleno {ronda}/4...")
+                              f"({codigo}) — reintento {ronda}/4...")
 
                     if not codigo:
-                        # Última oportunidad: a veces el OTP se escribió pero la lectura falló
-                        # y la cuenta ya quedó creada.
                         if self._confirmar_registro_completado(timeout_s=10.0):
                             print(f"  [Registro] {Color.GREEN}[{self.client_email}] Cuenta ya registrada "
                                   f"pese a no re-leer OTP. Continuando...{Color.ENDC}")
                             codigo_aceptado = True
                             break
-                        ultimo_error_codigo = "No se pudo extraer el código de verificación del correo."
+                        ultimo_error_codigo = (
+                            "No se pudo extraer el código de verificación del correo de manera automática."
+                        )
                         break
 
                     if codigo.startswith("http"):
@@ -6832,20 +6975,18 @@ class TidalRegisterManager:
                         codigo_aceptado = True
                         break
 
-                    ui_otp = _esperar_ui_otp_registro(22.0)
-                    if self._sesion_post_registro_detectada():
-                        print(f"  [Registro] {Color.GREEN}[{self.client_email}] Registro ya completado "
-                              f"(sin cajas OTP). Continuando a confirmación...{Color.ENDC}")
-                        codigo_aceptado = True
-                        break
-                    if not ui_otp:
-                        print(f"  [Registro] {Color.WARNING}[WARN] [{self.client_email}] "
-                              f"Aún no aparecen las cajas OTP. Reintentando...{Color.ENDC}")
-                        ultimo_error_codigo = "No aparecieron las cajas del código OTP de registro."
-                        time.sleep(1.5)
-                        continue
-
+                    esperar_locator_en_frames(
+                        self.page,
+                        [
+                            'input[autocomplete="one-time-code"]',
+                            'input[maxlength="1"]',
+                            'input[name="code"]',
+                            'input[inputmode="numeric"]',
+                        ],
+                        timeout_s=15.0,
+                    )
                     time.sleep(0.5)
+
                     print(f"  [Registro] [{self.client_email}] Escribiendo código OTP ({codigo})...")
                     fill_ok = False
                     for intento_fill in range(1, 4):
@@ -6853,34 +6994,26 @@ class TidalRegisterManager:
                             fill_ok = True
                             break
                         wrote = escribir_codigo_verificacion_inteligente(self.page, codigo)
-                        # React a veces no deja leer el value aunque el OTP ya se envió
                         time.sleep(1.0)
                         if self._sesion_post_registro_detectada():
                             print(f"  [Registro] [{self.client_email}] OTP aceptado por Tidal "
-                                  f"(sesión detectada tras el intento de relleno).")
+                                  f"(sesión detectada tras el relleno).")
                             fill_ok = True
                             break
                         if wrote:
                             fill_ok = True
                             break
                         print(f"  [Registro] {Color.WARNING}[WARN] Relleno OTP falló "
-                              f"(intento {intento_fill}/3). Esperando UI...{Color.ENDC}")
+                              f"(intento {intento_fill}/3)...{Color.ENDC}")
                         time.sleep(1.2)
-                        _esperar_ui_otp_registro(8.0)
-                        if self._sesion_post_registro_detectada():
-                            fill_ok = True
-                            break
 
                     if not fill_ok:
-                        # React a veces acepta el teclado aunque input_value no se lea: confirmar igual
                         try:
                             self.page.keyboard.press("Enter")
                         except Exception:
                             pass
                         time.sleep(1.5)
                         if self._sesion_post_registro_detectada():
-                            print(f"  [Registro] {Color.GREEN}[{self.client_email}] Cuenta activa tras "
-                                  f"confirmar OTP (lectura de cajas falló, pero Tidal aceptó).{Color.ENDC}")
                             codigo_aceptado = True
                             break
                         print(f"  [Registro] {Color.WARNING}[WARN] No se pudo rellenar las cajas OTP; "
@@ -6926,7 +7059,6 @@ class TidalRegisterManager:
                         except Exception:
                             pass
 
-                    # Dar tiempo a Tidal a validar antes de decidir rechazo
                     time.sleep(2.5)
                     if self._sesion_post_registro_detectada():
                         codigo_aceptado = True
@@ -6940,29 +7072,14 @@ class TidalRegisterManager:
                     except Exception:
                         texto_err = ""
 
-                    sigue_en_otp = False
-                    try:
-                        sigue_en_otp = contar_cajas_otp_visibles(self.page) >= 4 or bool(
-                            encontrar_locator_en_frames(
-                                self.page,
-                                [
-                                    'input[maxlength="1"]',
-                                    'input[autocomplete="one-time-code"]',
-                                    'input[name="code"]',
-                                    'input[inputmode="numeric"]',
-                                ]
-                            )
-                        )
-                    except Exception:
-                        pass
-
+                    sigue_en_otp = _pantalla_otp_registro()
                     if _texto_indica_codigo_invalido(texto_err) and sigue_en_otp:
                         print(f"  [Registro] {Color.WARNING}[WARN] [{self.client_email}] Tidal rechazó "
                               f"el código {codigo}. Solicitando uno nuevo...{Color.ENDC}")
                         ultimo_error_codigo = (
                             f"Tidal rechazó el código de verificación para {self.client_email}."
                         )
-                        codigo_guardado = None  # forzar nuevo IMAP tras Resend
+                        codigo_guardado = None
                         try:
                             btn_resend = esperar_locator_en_frames(
                                 self.page,
@@ -6981,7 +7098,6 @@ class TidalRegisterManager:
                         max_id_previo = obtener_max_email_id(self.client_email)
                         continue
 
-                    # Si ya salimos de la pantalla OTP, o no hay error claro → seguir
                     codigo_aceptado = True
                     print("  [Registro] Código enviado. Esperando procesamiento de la cuenta...")
                     break
@@ -6991,14 +7107,14 @@ class TidalRegisterManager:
                           f"quedó creada aunque falló la verificación OTP?")
                     if self._confirmar_registro_completado(timeout_s=15.0):
                         print(f"  [Registro] {Color.GREEN}[{self.client_email}] Sí: sesión activa. "
-                              f"Se da el registro por completado.{Color.ENDC}")
+                              f"Se continúa.{Color.ENDC}")
                         codigo_aceptado = True
                     else:
                         raise RuntimeError(
                             ultimo_error_codigo
                             or f"No se pudo verificar el correo de registro para {self.client_email}."
                         )
-            
+
             print("  [Registro] Esperando redirección automática al perfil o cuenta...")
             # Opción 8: confirmación más corta; no hace falta quemar 60s si la sesión ya está.
             registro_exitoso = self._confirmar_registro_completado(
