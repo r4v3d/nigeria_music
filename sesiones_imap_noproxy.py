@@ -6372,20 +6372,38 @@ class TidalRegisterManager:
                 ):
                     self.recuperar_login_tras_error_tidal()
                 
-            email_input = esperar_locator_en_frames(self.page, ['input[type="email"]', 'input[name="email"]'], timeout_s=25.0)
-            if not email_input:
-                # Si falló, rotamos el proxy una única vez y reintentamos por pricing (nunca authorize)
+            # Campo de correo: reintentos por UI/timing (en sin-proxy no hay rotación de IP;
+            # antes fallaba a la 1.ª con "No se localizó el campo de correo").
+            email_input = None
+            for intento_campo in range(1, 4):
+                email_input = esperar_locator_en_frames(
+                    self.page, ['input[type="email"]', 'input[name="email"]'], timeout_s=25.0
+                )
+                if email_input:
+                    break
+                if intento_campo >= 3:
+                    break
                 if self.use_proxy:
-                    print(f"  [Registro] [{self.client_email}] No se localizó el campo de correo. Rotando proxy y reintentando...")
-                    self.ejecutar_rotacion_proxy_y_recargar()
-                    time.sleep(2.0)
-                    if not _formulario_login_visible(self.page):
-                        try:
-                            self.recuperar_login_tras_error_tidal()
-                        except Exception:
-                            pass
-                    email_input = esperar_locator_en_frames(self.page, ['input[type="email"]', 'input[name="email"]'], timeout_s=25.0)
-                    
+                    print(f"  [Registro] [{self.client_email}] No se localizó el campo de correo "
+                          f"(intento {intento_campo}/3). Rotando proxy y reintentando...")
+                    try:
+                        self.ejecutar_rotacion_proxy_y_recargar()
+                    except Exception as e_rot:
+                        print(f"  [Registro] [{self.client_email}] [WARN] Rotación: {e_rot}")
+                else:
+                    print(f"  [Registro] [{self.client_email}] No se localizó el campo de correo "
+                          f"(intento {intento_campo}/3). Reabriendo vía pricing...")
+                    try:
+                        self.recuperar_login_tras_error_tidal()
+                    except Exception as e_rec:
+                        print(f"  [Registro] [{self.client_email}] [WARN] Recuperación: {e_rec}")
+                time.sleep(random.uniform(1.5, 2.5))
+                if not _formulario_login_visible(self.page):
+                    try:
+                        self.recuperar_login_tras_error_tidal()
+                    except Exception:
+                        pass
+
             if not email_input:
                 raise RuntimeError("No se localizó el campo de correo para iniciar el registro en Tidal.")
             
@@ -14629,6 +14647,341 @@ def registrar_cuentas_tidal(correos):
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso de registro finalizado. Regresando al menú principal...{Color.ENDC}\n")
 
 
+def _asegurar_pwd_para_restablecer(correo: str) -> str:
+    """Devuelve la contraseña de sesiones_imap_cuentas.txt o genera/guarda una de 6 dígitos."""
+    existente = buscar_contrasena_cuenta(correo)
+    if existente:
+        return existente
+    pwd = "".join(str(random.randint(0, 9)) for _ in range(6))
+    if guardar_credencial_cuenta(correo, pwd):
+        print(f"  {Color.CYAN}[Cuentas] Contraseña generada y guardada para {correo}: {pwd}{Color.ENDC}")
+    else:
+        existente = buscar_contrasena_cuenta(correo)
+        if existente:
+            return existente
+        print(f"  {Color.WARNING}[Cuentas] [WARN] No se pudo guardar pwd de {correo}; se usará {pwd} en memoria{Color.ENDC}")
+    return pwd
+
+
+def registrar_y_restablecer_opcion17(correos):
+    """Opción 17: registrar cuenta Tidal (Nigeria / IP real en noproxy) y luego restablecer contraseña.
+
+    Sin TuneMyMusic ni invitaciones familiares. Solo los registros exitosos pasan al reset.
+    """
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   OPCION 17: REGISTRAR + RESTABLECER CONTRASEÑA{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
+
+    if not correos:
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay correos para procesar.")
+        return False
+
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except ImportError:
+        print(f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. Ejecute 'pip install playwright' e instale los navegadores con 'playwright install'.")
+        input(">>> Presiona Enter para volver al menú principal <<<")
+        return False
+
+    print(f"  Correos: {len(correos)}")
+    print(f"  1) Registrar cuenta Tidal")
+    print(f"  2) Restablecer contraseña (solo éxitos de registro)")
+    print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}\n")
+
+    cuentas_map = {}
+    for c in correos:
+        cuentas_map[c] = _asegurar_pwd_para_restablecer(c)
+
+    # ── Fase 1: registro (misma lógica que opción 8) ──
+    print(f"\n{Color.CYAN}{Color.BOLD}── FASE 1/2: REGISTRO TIDAL ──{Color.ENDC}\n")
+
+    global valid_ng_list, CACHE_PROXIES_NG
+    valid_ng_list = []
+
+    if MODO_SIN_PROXY:
+        print(f"{Color.CYAN}[Sin Proxy] Opción 17 registro con IP real.{Color.ENDC}")
+        use_proxy = False
+        proxies_pe = []
+    else:
+        cargar_cache_proxies_validos_desde_disco()
+        if CACHE_PROXIES_NG:
+            valid_ng_list = list(CACHE_PROXIES_NG)
+            print(f"\n{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA previamente verificados.{Color.ENDC}")
+        else:
+            proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
+            if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
+                ng_list = proxies_cfg["proxy_ng_list"]
+                print(f"\nSe encontraron {len(ng_list)} proxies para NIGERIA.")
+                valid_ng_list = probar_y_seleccionar_mejor_proxy(
+                    ng_list, "NIGERIA", max(len(correos) * 4, len(correos) + 15)
+                )
+                if valid_ng_list:
+                    guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
+            else:
+                print(f"\n{Color.WARNING}[Proxy]{Color.ENDC} No se encontraron proxies de Nigeria.")
+
+        alimentar_pool_proxies_nigeria(valid_ng_list)
+        GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
+        GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+
+        use_proxy = bool(valid_ng_list)
+        if not use_proxy:
+            print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Nigeria válidos disponibles.")
+            confirm = input("¿Deseas continuar con tu IP local/VPN actual? (s/n, por defecto 'n'): ").strip().lower()
+            if confirm not in ("s", "si", "yes", "y"):
+                print("Operación cancelada.")
+                return False
+
+        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para el pago del registro...{Color.ENDC}")
+        proxies_pe = asegurar_proxies_peru(cantidad_necesaria=len(correos))
+        if not proxies_pe:
+            print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Perú válidos.")
+            confirm_pe = input("¿Deseas continuar sin proxy de Perú? (s/n, por defecto 'n'): ").strip().lower()
+            if confirm_pe not in ("s", "si", "sí", "yes", "y"):
+                print("Operación cancelada.")
+                return False
+
+    headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
+    headless = headless_opt in ("s", "si", "yes", "y")
+
+    max_intentos_reg = 3
+    max_intentos_reset = 3
+    print(f"\n{Color.CYAN}Opción 17: hasta {max_intentos_reg} intentos de registro y "
+          f"{max_intentos_reset} de reset por cuenta (fallos UI/timing).{Color.ENDC}")
+
+    estado_lock = threading.Lock()
+    correos_registrados = []
+    fail_reg = 0
+
+    def _limpiar_manager_reg(manager, p_ng_server, p_pe_server, liberar_siempre=False):
+        if manager is not None:
+            try:
+                manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+            except Exception:
+                pass
+            try:
+                manager.limpiar_perfil_temporal()
+            except Exception:
+                pass
+            manager.proxy_ng_server = None
+            manager.proxy_pe_server = None
+        if liberar_siempre:
+            try:
+                GLOBAL_NG_PROXY_POOL.liberar_proxy(p_ng_server)
+            except Exception:
+                pass
+            try:
+                GLOBAL_PE_PROXY_POOL.liberar_proxy(p_pe_server)
+            except Exception:
+                pass
+
+    def registrar_un_correo(idx, correo):
+        nonlocal fail_reg
+        ultimo_err = None
+        for intento in range(1, max_intentos_reg + 1):
+            p_ng_server = p_ng_user = p_ng_pass = None
+            p_pe_server = p_pe_user = p_pe_pass = None
+            manager = None
+            try:
+                if use_proxy and valid_ng_list:
+                    p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico()
+                    if not p_ng:
+                        print(f"  {Color.WARNING}[Proxy NG] [{correo}] Sin proxy libre "
+                              f"(intento {intento}/{max_intentos_reg}); se reintenta...{Color.ENDC}")
+                        time.sleep(random.uniform(2.0, 4.0))
+                        continue
+                    p_ng_server = p_ng.get("server")
+                    p_ng_user = p_ng.get("username")
+                    p_ng_pass = p_ng.get("password")
+
+                if proxies_pe:
+                    p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+                    if p_pe:
+                        p_pe_server = p_pe.get("server")
+                        p_pe_user = p_pe.get("username")
+                        p_pe_pass = p_pe.get("password")
+
+                manager = TidalRegisterManager(
+                    client_email=correo,
+                    client_pwd="",
+                    proxy_ng_server=p_ng_server,
+                    proxy_ng_user=p_ng_user,
+                    proxy_ng_pass=p_ng_pass,
+                    proxy_pe_server=p_pe_server,
+                    proxy_pe_user=p_pe_user,
+                    proxy_pe_pass=p_pe_pass,
+                    headless=headless,
+                )
+
+                print(f"\n{Color.CYAN}{Color.BOLD}[Registro] [{correo}] Intento "
+                      f"{intento}/{max_intentos_reg}{Color.ENDC}")
+                exito = manager.run_registration(cerrar_navegador_al_final=True)
+                _limpiar_manager_reg(manager, p_ng_server, p_pe_server)
+                manager = None
+
+                if exito:
+                    with estado_lock:
+                        correos_registrados.append(correo)
+                    print(f"  {Color.GREEN}[Registro] [{correo}] OK "
+                          f"(intento {intento}/{max_intentos_reg}){Color.ENDC}")
+                    return correo, True
+
+                ultimo_err = "run_registration devolvió False"
+                print(f"  {Color.WARNING}[Registro] [{correo}] Falló intento "
+                      f"{intento}/{max_intentos_reg}: {ultimo_err}{Color.ENDC}")
+            except Exception as e_reg:
+                ultimo_err = str(e_reg)
+                print(f"  {Color.WARNING}[Registro] [{correo}] Error intento "
+                      f"{intento}/{max_intentos_reg}: {e_reg}{Color.ENDC}")
+                _limpiar_manager_reg(manager, p_ng_server, p_pe_server, liberar_siempre=True)
+                manager = None
+            finally:
+                cerrar_sesion_imap_hilo()
+
+            if intento < max_intentos_reg:
+                pausa = random.uniform(2.0, 4.5)
+                print(f"  {Color.CYAN}[Registro] [{correo}] Reintentando en {pausa:.1f}s "
+                      f"(fallo recuperable)...{Color.ENDC}")
+                time.sleep(pausa)
+
+        with estado_lock:
+            fail_reg += 1
+        print(f"  {Color.FAIL}[Registro] [{correo}] Agotados {max_intentos_reg} intentos"
+              f"{(': ' + ultimo_err) if ultimo_err else ''}{Color.ENDC}")
+        return correo, False
+
+    workers = min(10, len(correos))
+    print(f"\n{Color.CYAN}Iniciando registro de {len(correos)} cuentas ({workers} hilos)...{Color.ENDC}\n")
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(registrar_un_correo, idx, correo): correo for idx, correo in enumerate(correos, 1)}
+        for future in as_completed(futures):
+            correo = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
+
+    print(f"\n{Color.CYAN}Registro: {len(correos_registrados)}/{len(correos)} OK "
+          f"(fallidas: {fail_reg}){Color.ENDC}")
+    if not correos_registrados:
+        print(f"{Color.FAIL}[Error]{Color.ENDC} Ninguna cuenta registrada; se omite restablecer contraseña.")
+        return False
+
+    print(f"\n{Color.CYAN}Pausa 2s entre registro y restablecer...{Color.ENDC}")
+    time.sleep(2)
+
+    # ── Fase 2: restablecer (como opción 9, sin invitaciones familiares) ──
+    print(f"\n{Color.CYAN}{Color.BOLD}── FASE 2/2: RESTABLECER CONTRASEÑA ──{Color.ENDC}\n")
+    print(f"  Cuentas a restablecer: {len(correos_registrados)}")
+
+    if MODO_SIN_PROXY:
+        print(f"{Color.CYAN}[Sin Proxy] Opción 17 reset con IP real.{Color.ENDC}")
+        valid_pe_list = []
+    else:
+        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para restablecimiento...{Color.ENDC}")
+        valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=len(correos_registrados))
+        if not valid_pe_list:
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos para restablecer.")
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return False
+
+    success_reset = 0
+    fail_reset = 0
+    batch_size = 20
+    total_cuentas = len(correos_registrados)
+
+    for b_start in range(0, total_cuentas, batch_size):
+        lote_correos = correos_registrados[b_start: b_start + batch_size]
+        num_cuentas_lote = len(lote_correos)
+        if total_cuentas > batch_size:
+            print(f"\n{Color.CYAN}{Color.BOLD}--- Lote reset ({b_start + 1} a {b_start + num_cuentas_lote} de {total_cuentas}) ---{Color.ENDC}")
+
+        def restablecer_un_correo(idx_rel, correo):
+            if idx_rel > 1:
+                time.sleep((idx_rel - 1) * 0.15)
+            idx_abs = b_start + idx_rel
+            contrasena = cuentas_map.get(correo) or buscar_contrasena_cuenta(correo)
+            if not contrasena:
+                print(f"  {Color.FAIL}[ERROR] Sin contraseña para {correo}{Color.ENDC}")
+                return correo, False
+
+            ultimo_err = None
+            for intento in range(1, max_intentos_reset + 1):
+                if MODO_SIN_PROXY:
+                    p_pe_server = p_pe_user = p_pe_pass = None
+                else:
+                    p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+                    p_pe_server = p_pe.get("server") if p_pe else None
+                    p_pe_user = p_pe.get("username") if p_pe else None
+                    p_pe_pass = p_pe.get("password") if p_pe else None
+
+                # Sin barreras compartidas: cada reintento es independiente (evita deadlocks).
+                manager = TidalResetPasswordManager(
+                    client_email=correo,
+                    target_pwd=contrasena,
+                    proxy_pe_server=p_pe_server,
+                    proxy_pe_user=p_pe_user,
+                    proxy_pe_pass=p_pe_pass,
+                    headless=headless,
+                    barreras={},
+                    thread_index=idx_abs,
+                )
+                print(f"\n{Color.CYAN}{Color.BOLD}[Reset] [{correo}] Intento "
+                      f"{intento}/{max_intentos_reset}{Color.ENDC}")
+                try:
+                    exito = manager.run_password_reset()
+                except Exception as e_rst:
+                    exito = False
+                    ultimo_err = str(e_rst)
+                    print(f"  {Color.WARNING}[Reset] [{correo}] Error intento "
+                          f"{intento}/{max_intentos_reset}: {e_rst}{Color.ENDC}")
+                finally:
+                    cerrar_sesion_imap_hilo()
+
+                if exito:
+                    print(f"  {Color.GREEN}[Reset] [{correo}] OK "
+                          f"(intento {intento}/{max_intentos_reset}){Color.ENDC}")
+                    return correo, True
+
+                if not ultimo_err:
+                    ultimo_err = "run_password_reset devolvió False"
+                if intento < max_intentos_reset:
+                    pausa = random.uniform(2.0, 4.5)
+                    print(f"  {Color.CYAN}[Reset] [{correo}] Reintentando en {pausa:.1f}s...{Color.ENDC}")
+                    time.sleep(pausa)
+
+            print(f"  {Color.FAIL}[Reset] [{correo}] Agotados {max_intentos_reset} intentos"
+                  f"{(': ' + ultimo_err) if ultimo_err else ''}{Color.ENDC}")
+            return correo, False
+
+        with ThreadPoolExecutor(max_workers=num_cuentas_lote) as executor:
+            futures = {
+                executor.submit(restablecer_un_correo, idx_rel, correo): correo
+                for idx_rel, correo in enumerate(lote_correos, 1)
+            }
+            for future in as_completed(futures):
+                correo = futures[future]
+                try:
+                    _c, exito = future.result()
+                    if exito:
+                        success_reset += 1
+                    else:
+                        fail_reset += 1
+                except Exception as e:
+                    print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
+                    fail_reset += 1
+
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   RESUMEN OPCION 17{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
+    print(f" Registradas:                 {Color.GREEN}{len(correos_registrados)}{Color.ENDC}/{len(correos)}")
+    print(f" Contraseñas restablecidas:   {Color.GREEN}{success_reset}{Color.ENDC}/{len(correos_registrados)}")
+    print(f" Fallos reset:                {Color.FAIL}{fail_reset}{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}\n")
+    print(f"{Color.GREEN}{Color.BOLD}>>> Opción 17 finalizada. Regresando al menú principal...{Color.ENDC}\n")
+    return success_reset > 0
+
 
 def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[str]]:
     """Lee titular_familiar.txt.
@@ -15408,7 +15761,7 @@ def menu_principal():
         print(" 3. Obtener CÓDIGO DE INICIO DE SESIÓN (Login Verification)")
         print(" 4. Buscar y aceptar ENLACE DE INVITACIÓN (auto-login + cerrar Chrome)")
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
-        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en 8–16)")
+        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en 8–17)")
         print(" 7. Salir")
         print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
@@ -15419,9 +15772,10 @@ def menu_principal():
         print(" 14. Crear cuentas FAMILIARES AUTOMÁTICO (Registro NG + Checkout + Upgrade Family)")
         print(" 15. ELIMINAR CUENTA TIDAL AUTOMÁTICO")
         print(" 16. Verificar CSV en descargas/ (correos activos del menú)")
+        print(" 17. Registrar (Nigeria) + restablecer contraseña")
         print(f"{Color.CYAN}{Color.BOLD}" + "-"*50 + f"{Color.ENDC}")
         
-        opcion = input(f"{Color.BOLD}Selecciona una opción (1-16):{Color.ENDC} ").strip()
+        opcion = input(f"{Color.BOLD}Selecciona una opción (1-17):{Color.ENDC} ").strip()
         
         if opcion in ("1", "2", "3"):
             for correo in correos:
@@ -15639,9 +15993,12 @@ def menu_principal():
 
         elif opcion == "16":
             verificar_csvs_descargas_opcion16(correos)
+
+        elif opcion == "17":
+            registrar_y_restablecer_opcion17(correos)
             
         else:
-            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 16.")
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 17.")
 
 
 if __name__ == "__main__":
