@@ -6575,52 +6575,131 @@ class TidalRegisterManager:
 
 
             print("  [Registro] Marcando checkbox de términos...")
-            self.page.evaluate("""
-                () => {
-                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                    checkboxes.forEach(cb => {
-                        const parentText = cb.parentElement ? cb.parentElement.textContent || '' : '';
-                        if (parentText.includes('Términos') || parentText.includes('Terms') || 
-                            parentText.includes('Privacidad') || parentText.includes('Privacy')) {
-                            if (!cb.checked) {
-                                cb.click();
-                                if (!cb.checked && cb.parentElement) {
-                                    cb.parentElement.click();
-                                }
-                            }
-                        }
-                    });
-                }
-            """)
-            time.sleep(1.0)
-            
-            # Con varios alias con puntos del mismo Gmail, serializar Suscríbete + lectura +
-            # envío del código evita que un hilo robe el correo del otro o pulse Continuar vacío.
-            with _lock_registro_mismo_buzon(self.client_email):
-                max_id_previo = obtener_max_email_id(self.client_email)
 
-                print("  [Registro] Pulsando botón 'Suscríbete'...")
+            def _marcar_terminos_y_habilitar_suscribir():
+                """Fuerza términos + habilita Suscríbete (React a veces deja el botón disabled)."""
+                try:
+                    self.page.evaluate("""() => {
+                        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                            const wrap = cb.closest('label') || cb.parentElement || cb;
+                            try {
+                                cb.checked = true;
+                                cb.dispatchEvent(new Event('input', { bubbles: true }));
+                                cb.dispatchEvent(new Event('change', { bubbles: true }));
+                                if (typeof cb.click === 'function') cb.click();
+                            } catch (e) {}
+                            try {
+                                if (wrap && wrap !== cb) wrap.click();
+                            } catch (e) {}
+                        });
+                        Array.from(document.querySelectorAll('button')).forEach(b => {
+                            const t = (b.textContent || '').toLowerCase();
+                            if (t.includes('suscríbete') || t.includes('suscribete') || t.includes('subscribe')
+                                || t.includes('crear cuenta') || t.includes('create account')
+                                || (b.getAttribute('type') || '') === 'submit') {
+                                b.disabled = false;
+                                b.removeAttribute('disabled');
+                                b.setAttribute('aria-disabled', 'false');
+                            }
+                        });
+                    }""")
+                except Exception:
+                    pass
+
+            def _pulsar_suscribete():
+                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...")
+                _marcar_terminos_y_habilitar_suscribir()
+                time.sleep(0.35)
                 btn_sub = esperar_locator_en_frames(
                     self.page,
-                    ["button:has-text('Suscríbete')", "button:has-text('Subscribe')", "button[type='submit']"],
-                    timeout_s=5.0
+                    [
+                        "button:has-text('Suscríbete')", "button:has-text('Subscribe')",
+                        "button:has-text('Create account')", "button:has-text('Crear cuenta')",
+                        "button[type='submit']",
+                    ],
+                    timeout_s=4.0,
                 )
                 if btn_sub:
                     try:
-                        btn_sub.click(force=True)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        self.page.evaluate("""() => {
-                            const btn = document.querySelector('button[type="submit"]') || 
-                                        Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').includes('Suscríbete') || (b.textContent || '').includes('Subscribe'));
-                            if (btn) btn.click();
+                        btn_sub.evaluate("""b => {
+                            b.disabled = false;
+                            b.removeAttribute('disabled');
+                            b.click();
                         }""")
                     except Exception:
-                        pass
-                time.sleep(2.5)
+                        try:
+                            btn_sub.click(force=True)
+                        except Exception:
+                            pass
+                try:
+                    self.page.evaluate("""() => {
+                        const btn = document.querySelector('button[type="submit"]') ||
+                            Array.from(document.querySelectorAll('button')).find(b => {
+                                const t = (b.textContent || '').toLowerCase();
+                                return t.includes('suscríbete') || t.includes('suscribete')
+                                    || t.includes('subscribe') || t.includes('crear cuenta')
+                                    || t.includes('create account');
+                            });
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.removeAttribute('disabled');
+                            btn.click();
+                        }
+                    }""")
+                except Exception:
+                    pass
 
+            _marcar_terminos_y_habilitar_suscribir()
+            time.sleep(0.6)
+
+            # Baseline IMAP ANTES del clic y FUERA del lock largo: si se hacía dentro del
+            # lock, el resto de aliases del mismo Gmail se quedaban en "Marcando checkbox..."
+            # sin pulsar Suscríbete (opción 17 / varios puntos).
+            print(f"  [Registro] [{self.client_email}] Leyendo baseline IMAP antes de Suscríbete...")
+            try:
+                max_id_previo = obtener_max_email_id(self.client_email)
+            except Exception as e_base:
+                print(f"  [Registro] [{self.client_email}] [WARN] Baseline IMAP: {e_base}")
+                max_id_previo = 0
+
+            # Clic Suscríbete YA (no esperar el turno IMAP de otros aliases)
+            otp_ui_ok = False
+            for intento_sub in range(1, 4):
+                _pulsar_suscribete()
+                time.sleep(2.0)
+                try:
+                    if self._sesion_post_registro_detectada():
+                        otp_ui_ok = True
+                        break
+                    if contar_cajas_otp_visibles(self.page) >= 1:
+                        otp_ui_ok = True
+                        break
+                    if encontrar_locator_en_frames(
+                        self.page,
+                        [
+                            'input[autocomplete="one-time-code"]',
+                            'input[maxlength="1"]',
+                            'input[name="code"]',
+                        ],
+                    ):
+                        otp_ui_ok = True
+                        break
+                except Exception:
+                    pass
+                if intento_sub < 3:
+                    print(f"  [Registro] [{self.client_email}] Aún en formulario tras Suscríbete "
+                          f"(intento {intento_sub}/3); re-marcando términos y reintentando...")
+                    _marcar_terminos_y_habilitar_suscribir()
+                    time.sleep(0.8)
+
+            if not otp_ui_ok:
+                print(f"  [Registro] [{self.client_email}] [WARN] No se vio OTP aún; "
+                      f"se continúa buscando el código por IMAP de todos modos.")
+
+            # Solo serializar la LECTURA IMAP entre aliases del mismo buzón (no el clic UI)
+            print(f"  [Registro] [{self.client_email}] Turno IMAP del buzón "
+                  f"(si hay otros aliases, esperan aquí — Suscríbete ya se pulsó)...")
+            with _lock_registro_mismo_buzon(self.client_email):
                 codigo_aceptado = False
                 ultimo_error_codigo = ""
                 codigo_guardado = None  # No perder el OTP si falló el relleno de cajas
