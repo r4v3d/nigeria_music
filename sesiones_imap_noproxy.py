@@ -6487,128 +6487,117 @@ class TidalRegisterManager:
                 registro_exitoso = True
                 return True
 
-            print("  [Registro] Rellenando fecha de nacimiento (15/08/1995)...")
-            time.sleep(1.0)
-            
-            self.page.evaluate("""
-                () => {
-                    const selects = document.querySelectorAll('select');
-                    if (selects.length >= 3) {
-                        const daySelect = document.querySelector('select[name*="day" i]') || selects[0];
-                        if (daySelect) {
-                            daySelect.value = "15";
-                            daySelect.dispatchEvent(new Event('input', { bubbles: true }));
-                            daySelect.dispatchEvent(new Event('change', { bubbles: true }));
+            print("  [Registro] Rellenando fecha de nacimiento (15/08/1995)...", flush=True)
+            time.sleep(0.8)
+            # Playwright select_option (React sí lo registra; assign+dispatch a veces no)
+            try:
+                selects = self.page.locator("select")
+                n_sel = selects.count()
+                if n_sel >= 3:
+                    try:
+                        selects.nth(0).select_option(value="15", timeout=3000)
+                    except Exception:
+                        try:
+                            selects.nth(0).select_option(label="15", timeout=3000)
+                        except Exception:
+                            selects.nth(0).select_option(index=15, timeout=3000)
+                    time.sleep(0.25)
+                    # Mes: probar value 8/08 e índices típicos
+                    mes_ok = False
+                    for opt in ("8", "08"):
+                        try:
+                            selects.nth(1).select_option(value=opt, timeout=2000)
+                            mes_ok = True
+                            break
+                        except Exception:
+                            pass
+                    if not mes_ok:
+                        for lab in ("August", "Agosto", "Aug", "Ago", "08", "8"):
+                            try:
+                                selects.nth(1).select_option(label=re.compile(lab, re.I), timeout=2000)
+                                mes_ok = True
+                                break
+                            except Exception:
+                                pass
+                    if not mes_ok:
+                        try:
+                            # 0=placeholder → agosto suele ser 8
+                            selects.nth(1).select_option(index=8, timeout=2000)
+                        except Exception:
+                            try:
+                                selects.nth(1).select_option(index=7, timeout=2000)
+                            except Exception:
+                                pass
+                    time.sleep(0.25)
+                    try:
+                        selects.nth(2).select_option(value="1995", timeout=3000)
+                    except Exception:
+                        selects.nth(2).select_option(label="1995", timeout=3000)
+                else:
+                    # Fallback evaluate legado
+                    self.page.evaluate("""() => {
+                        const sels = document.querySelectorAll('select');
+                        if (sels[0]) { sels[0].value='15'; sels[0].dispatchEvent(new Event('change',{bubbles:true})); }
+                        if (sels[1]) {
+                            const opts=[...sels[1].options];
+                            const hit=opts.find(o=>/^(8|08)$/i.test(o.value)||/aug|ago/i.test(o.textContent||''));
+                            if (hit) sels[1].value=hit.value;
+                            else if (opts.length>8) sels[1].selectedIndex = opts.length===13?8:7;
+                            sels[1].dispatchEvent(new Event('change',{bubbles:true}));
                         }
-                    } else {
-                        const dayInput = document.querySelector('input[name*="day" i]');
-                        if (dayInput) {
-                            dayInput.value = "15";
-                            dayInput.dispatchEvent(new Event('input', { bubbles: true }));
-                            dayInput.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    }
-                }
-            """)
+                        if (sels[2]) { sels[2].value='1995'; sels[2].dispatchEvent(new Event('change',{bubbles:true})); }
+                    }""")
+            except Exception as e_dob:
+                print(f"  [Registro] [{self.client_email}] [WARN] DOB Playwright: {e_dob}", flush=True)
             time.sleep(0.6)
-            
-            self.page.evaluate("""
-                () => {
-                    const selects = document.querySelectorAll('select');
-                    if (selects.length >= 3) {
-                        const monthSelect = document.querySelector('select[name*="month" i]') || selects[1];
-                        if (monthSelect) {
-                            const opts = Array.from(monthSelect.options);
-                            const targets = ["8", "08", "aug", "ago", "august", "agosto"];
-                            let matched = false;
-                            for (const opt of opts) {
-                                const val = (opt.value || '').trim().toLowerCase();
-                                const txt = (opt.textContent || '').trim().toLowerCase();
-                                if (targets.some(t => val === t || txt === t || txt.includes(t))) {
-                                    monthSelect.value = opt.value;
-                                    monthSelect.dispatchEvent(new Event('input', { bubbles: true }));
-                                    monthSelect.dispatchEvent(new Event('change', { bubbles: true }));
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                            if (!matched && opts.length > 8) {
-                                monthSelect.selectedIndex = opts.length === 13 ? 8 : 7;
-                                monthSelect.dispatchEvent(new Event('input', { bubbles: true }));
-                                monthSelect.dispatchEvent(new Event('change', { bubbles: true }));
-                            }
-                        }
-                    } else {
-                        const monthInput = document.querySelector('input[name*="month" i]');
-                        if (monthInput) {
-                            monthInput.value = "08";
-                            monthInput.dispatchEvent(new Event('input', { bubbles: true }));
-                            monthInput.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    }
-                }
-            """)
-            time.sleep(0.6)
-            
-            self.page.evaluate("""
-                () => {
-                    const selects = document.querySelectorAll('select');
-                    if (selects.length >= 3) {
-                        const yearSelect = document.querySelector('select[name*="year" i]') || selects[2];
-                        if (yearSelect) {
-                            yearSelect.value = "1995";
-                            yearSelect.dispatchEvent(new Event('input', { bubbles: true }));
-                            yearSelect.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    } else {
-                        const yearInput = document.querySelector('input[name*="year" i]');
-                        if (yearInput) {
-                            yearInput.value = "1995";
-                            yearInput.dispatchEvent(new Event('input', { bubbles: true }));
-                            yearInput.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    }
-                }
-            """)
-            time.sleep(0.6)
-            
 
-
-            # Checkbox + Suscríbete: restaurar interacción Playwright real (el clic solo-JS
-            # reportaba "enviado" pero React no avanzaba al OTP). El lock del buzón solo
-            # serializa IMAP más abajo, no el clic UI.
-            print("  [Registro] Marcando checkbox de términos...", flush=True)
+            # Quitar overlays de cookies que tapan Suscríbete
+            try:
+                aceptar_cookies_con_espera(self.page)
+            except Exception:
+                pass
             try:
                 self.page.evaluate("""() => {
-                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                    checkboxes.forEach(cb => {
-                        const parentText = cb.parentElement ? (cb.parentElement.textContent || '') : '';
-                        if (/Términos|Terms|Privacidad|Privacy|acuerdo|Agree/i.test(parentText)) {
-                            if (!cb.checked) {
-                                cb.click();
-                                if (!cb.checked) {
-                                    // Evitar label.click() si el label tiene <a href=/terms>
-                                    try { cb.focus(); } catch (e) {}
-                                }
-                            }
+                    ['#onetrust-consent-sdk','#onetrust-banner-sdk','.onetrust-pc-dark-filter'].forEach(s => {
+                        document.querySelectorAll(s).forEach(el => el.remove());
+                    });
+                }""")
+            except Exception:
+                pass
+
+            print("  [Registro] Marcando checkbox de términos...", flush=True)
+            try:
+                n_cb = self.page.locator('input[type="checkbox"]').count()
+                for i in range(n_cb):
+                    cb = self.page.locator('input[type="checkbox"]').nth(i)
+                    try:
+                        if not cb.is_visible(timeout=400):
+                            continue
+                        if cb.is_checked():
+                            continue
+                        cb.check(force=True, timeout=2000)
+                    except Exception:
+                        try:
+                            cb.click(force=True, timeout=1500)
+                        except Exception:
+                            pass
+            except Exception as e_cb:
+                print(f"  [Registro] [{self.client_email}] [WARN] Checkbox: {e_cb}", flush=True)
+            # Refuerzo JS solo en términos (sin click en <a>)
+            try:
+                self.page.evaluate("""() => {
+                    document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                        const t = ((cb.closest('label')||cb.parentElement||cb).textContent||'');
+                        if (/términos|terms|privacidad|privacy|acuerdo|agree/i.test(t) && !cb.checked) {
+                            cb.click();
                         }
                     });
                 }""")
-            except Exception as e_chk:
-                print(f"  [Registro] [{self.client_email}] [WARN] Checkbox: {e_chk}", flush=True)
-            # Playwright check() es más fiable con controles custom/React
-            try:
-                for loc in self.page.locator('input[type="checkbox"]').all():
-                    try:
-                        if loc.is_visible(timeout=500) and not loc.is_checked():
-                            loc.check(force=True, timeout=1500)
-                    except Exception:
-                        pass
             except Exception:
                 pass
-            time.sleep(0.8)
+            time.sleep(0.7)
 
-            print(f"  [Registro] [{self.client_email}] Baseline IMAP antes de Suscríbete...", flush=True)
+            print(f"  [Registro] [{self.client_email}] Baseline IMAP...", flush=True)
             try:
                 max_id_previo = obtener_max_email_id(self.client_email)
             except Exception as e_base:
@@ -6625,8 +6614,9 @@ class TidalRegisterManager:
                         const t = (document.body && document.body.innerText || '').toLowerCase();
                         const frases = [
                             'verify your email', 'verifica tu correo', 'verifica tu email',
-                            'verificar tu correo', 'confirm your email', '6-digit', '6 dígitos',
-                            'resend code', 'reenviar', 'we sent', 'te hemos enviado'
+                            'verificar tu correo', 'confirm your email', 'finish creating',
+                            '6-digit', '6 dígitos', '6 digitos', 'resend code', 'reenviar',
+                            'we sent', 'te hemos enviado', 'email sent', 'correo enviado'
                         ];
                         if (frases.some(f => t.includes(f))) return true;
                         return document.querySelectorAll(
@@ -6636,58 +6626,76 @@ class TidalRegisterManager:
                 except Exception:
                     return False
 
-            def _pulsar_suscribete_real() -> bool:
-                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...", flush=True)
-                # Reafirmar términos (solo si no están marcados)
+            def _estado_formulario_reg():
                 try:
-                    self.page.evaluate("""() => {
-                        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                            const parentText = cb.parentElement ? (cb.parentElement.textContent || '') : '';
-                            if (/términos|terms|privacidad|privacy|acuerdo|agree/i.test(parentText) && !cb.checked) {
-                                cb.click();
-                            }
-                        });
+                    return self.page.evaluate("""() => {
+                        const cbs = [...document.querySelectorAll('input[type="checkbox"]')].map(c => !!c.checked);
+                        const sels = [...document.querySelectorAll('select')].map(s => s.value);
+                        const btn = [...document.querySelectorAll('button')].find(b =>
+                            /suscr[ií]bete|subscribe|crear cuenta|create account/i.test(b.textContent||'')
+                        );
+                        return {
+                            cbs, sels,
+                            btnDisabled: btn ? !!btn.disabled : null,
+                            btnText: btn ? (btn.textContent||'').trim().slice(0,48) : null,
+                            url: (location.href||'').slice(0,100),
+                        };
                     }""")
+                except Exception as e:
+                    return {"err": str(e)}
+
+            def _pulsar_suscribete_cuando_habilitado() -> bool:
+                print(f"  [Registro] Pulsando botón 'Suscríbete' ({self.client_email})...", flush=True)
+                print(f"  [Registro] [{self.client_email}] Estado form: {_estado_formulario_reg()}", flush=True)
+                # Esperar a que el botón deje de estar disabled (force=True sobre disabled no sirve)
+                try:
+                    self.page.wait_for_function("""() => {
+                        const btn = [...document.querySelectorAll('button')].find(b =>
+                            /suscr[ií]bete|subscribe|crear cuenta|create account/i.test(b.textContent||'')
+                        );
+                        return !!(btn && !btn.disabled);
+                    }""", timeout=12000)
                 except Exception:
-                    pass
-                time.sleep(0.25)
+                    print(f"  [Registro] [{self.client_email}] [WARN] Suscríbete sigue disabled; "
+                          f"se intenta igual. Estado={_estado_formulario_reg()}", flush=True)
                 clicked = False
-                # Clic Playwright real (como antes, cuando funcionaba)
                 for sel in (
                     "button:has-text('Suscríbete')",
                     "button:has-text('Subscribe')",
                     "button:has-text('Create account')",
                     "button:has-text('Crear cuenta')",
-                    "button[type='submit']",
                 ):
                     try:
                         loc = self.page.locator(sel).first
                         if loc.count() == 0:
                             continue
                         loc.scroll_into_view_if_needed(timeout=2000)
-                        loc.click(force=True, timeout=4000)
+                        # Primero clic normal (respeta enabled); luego force
+                        try:
+                            loc.click(timeout=4000)
+                        except Exception:
+                            loc.click(force=True, timeout=4000)
                         clicked = True
                         break
                     except Exception:
-                        try:
-                            loc = self.page.locator(sel).first
-                            loc.evaluate("b => { b.disabled=false; b.removeAttribute('disabled'); b.click(); }")
+                        continue
+                if not clicked:
+                    try:
+                        loc = self.page.locator("button[type='submit']").first
+                        if loc.count():
+                            loc.click(force=True, timeout=4000)
                             clicked = True
-                            break
-                        except Exception:
-                            continue
+                    except Exception:
+                        pass
                 if not clicked:
                     try:
                         clicked = bool(self.page.evaluate("""() => {
-                            const btn = Array.from(document.querySelectorAll('button')).find(b => {
-                                const t = (b.textContent || '').toLowerCase();
-                                return t.includes('suscríbete') || t.includes('suscribete')
-                                    || t.includes('subscribe') || t.includes('crear cuenta')
-                                    || t.includes('create account');
-                            }) || document.querySelector('button[type="submit"]');
+                            const btn = [...document.querySelectorAll('button')].find(b =>
+                                /suscr[ií]bete|subscribe|crear cuenta|create account/i.test(b.textContent||'')
+                            ) || document.querySelector('button[type="submit"]');
                             if (!btn) {
-                                const form = document.querySelector('form');
-                                if (form) { try { form.requestSubmit(); return true; } catch(e) {} }
+                                const f = document.querySelector('form');
+                                if (f) { try { f.requestSubmit(); return true; } catch(e) {} }
                                 return false;
                             }
                             btn.disabled = false;
@@ -6695,47 +6703,44 @@ class TidalRegisterManager:
                             btn.click();
                             return true;
                         }"""))
-                    except Exception as e_js:
-                        print(f"  [Registro] [{self.client_email}] [WARN] Fallback JS: {e_js}", flush=True)
-                # Diagnóstico si el botón sigue disabled / checkbox off
-                try:
-                    info = self.page.evaluate("""() => {
-                        const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]')).map(c => !!c.checked);
-                        const btn = Array.from(document.querySelectorAll('button')).find(b => {
-                            const t = (b.textContent || '').toLowerCase();
-                            return t.includes('suscríb') || t.includes('subscribe');
-                        });
-                        return {
-                            checkboxes: cbs,
-                            btnDisabled: btn ? !!btn.disabled : null,
-                            btnText: btn ? (btn.textContent || '').trim().slice(0, 40) : null,
-                            url: location.href.slice(0, 120),
-                        };
-                    }""")
-                    print(f"  [Registro] [{self.client_email}] Post-clic: {info}", flush=True)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                print(f"  [Registro] [{self.client_email}] Tras clic: {_estado_formulario_reg()}", flush=True)
                 return clicked
 
+            # Serializar SOLO el submit entre aliases del mismo Gmail (como cuando funcionaba),
+            # pero con mensajes claros y sin hacer IMAP dentro de este tramo corto.
             otp_ui_ok = False
-            for intento_sub in range(1, 5):
-                _pulsar_suscribete_real()
-                # Esperar a que Tidal procese el submit
-                for _ in range(8):
-                    time.sleep(0.75)
-                    if _pantalla_otp_o_exito():
-                        otp_ui_ok = True
+            print(f"  [Registro] [{self.client_email}] Esperando turno Suscríbete del buzón...", flush=True)
+            with _lock_registro_mismo_buzon(self.client_email):
+                print(f"  [Registro] [{self.client_email}] Turno Suscríbete adquirido.", flush=True)
+                for intento_sub in range(1, 5):
+                    _pulsar_suscribete_cuando_habilitado()
+                    for _ in range(10):
+                        time.sleep(0.8)
+                        if _pantalla_otp_o_exito():
+                            otp_ui_ok = True
+                            break
+                    if otp_ui_ok:
+                        print(f"  [Registro] [{self.client_email}] Pantalla OTP OK "
+                              f"(intento {intento_sub}/4).", flush=True)
                         break
-                if otp_ui_ok:
-                    print(f"  [Registro] [{self.client_email}] OTP/éxito tras Suscríbete "
-                          f"(intento {intento_sub}/4).", flush=True)
-                    break
-                print(f"  [Registro] [{self.client_email}] Aún en formulario tras Suscríbete "
-                      f"(intento {intento_sub}/4); reintentando...", flush=True)
+                    print(f"  [Registro] [{self.client_email}] Sin OTP tras Suscríbete "
+                          f"(intento {intento_sub}/4). Reintento...", flush=True)
+                    # Re-marcar términos / DOB por si React los perdió
+                    try:
+                        for i in range(self.page.locator('input[type="checkbox"]').count()):
+                            cb = self.page.locator('input[type="checkbox"]').nth(i)
+                            try:
+                                if cb.is_visible(timeout=300) and not cb.is_checked():
+                                    cb.check(force=True, timeout=1500)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
             if not otp_ui_ok:
-                print(f"  [Registro] [{self.client_email}] [WARN] Sin pantalla OTP tras clics; "
-                      f"se continúa con IMAP por si el mail sí salió.", flush=True)
+                print(f"  [Registro] [{self.client_email}] [WARN] Sin OTP UI; se sigue con IMAP.", flush=True)
 
             print(f"  [Registro] [{self.client_email}] Turno IMAP del buzón...", flush=True)
             with _lock_registro_mismo_buzon(self.client_email):
