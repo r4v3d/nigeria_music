@@ -627,6 +627,42 @@ def clean_email(email_str: str) -> str:
     email_str = re.sub(r'[\s.,]+$', '', email_str)
     return email_str
 
+def _parse_linea_cuenta_sesiones(line: str) -> tuple[str, str] | None:
+    """Parsea una línea de sesiones_imap_cuentas.txt → (correo, contraseña).
+
+    Acepta tab, espacios, coma o '=' como separador. El correo es el primer campo;
+    la contraseña es el resto (así L@abuela123 u otras claves con @/espacios no se parten mal).
+    No interpreta indentación ni titulares/miembros: cada línea es una credencial plana.
+    """
+    line = (line or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    if "\t" in line:
+        parts = [p.strip() for p in line.split("\t") if p.strip()]
+    else:
+        # Espacios / coma / = (evitar partir la clave si solo hay espacios normales)
+        line_normalized = line.replace(",", " ").replace("=", " ")
+        parts = line_normalized.split()
+    if len(parts) < 2:
+        return None
+    correo = parts[0].strip().strip('"').strip("'")
+    if "\t" in line:
+        # Tras el correo: unir columnas restantes (por si hubiera más tabs)
+        pwd = "\t".join(parts[1:]).strip().strip('"').strip("'")
+        # Si la clave no debía llevar tabs internos, quedarse con el 2.º campo no vacío
+        if "\t" in pwd:
+            pwd = parts[1].strip().strip('"').strip("'")
+    else:
+        pwd = " ".join(parts[1:]).strip().strip('"').strip("'")
+    if not correo or "@" not in correo or not pwd:
+        return None
+    # El correo no debe arrastrar basura; la pwd sí puede tener @
+    correo = re.split(r'[\s,;]+', correo, maxsplit=1)[0].strip()
+    if "@" not in correo:
+        return None
+    return correo, pwd
+
+
 def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
     """Busca la contraseña Tidal EXACTA en sesiones_imap_cuentas.txt (o passwords.txt).
 
@@ -643,26 +679,10 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
     if path_cuentas.exists():
         try:
             for line in path_cuentas.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
+                parsed = _parse_linea_cuenta_sesiones(line)
+                if not parsed:
                     continue
-                # Separadores: tab, espacios, coma, =
-                if "\t" in line:
-                    parts = [p for p in line.split("\t") if p.strip()]
-                else:
-                    line_normalized = line.replace(",", " ").replace("=", " ")
-                    parts = line_normalized.split()
-                if len(parts) < 2:
-                    continue
-                c = parts[0].strip().strip('"').strip("'")
-                # Contraseña = resto de la línea (por si tiene espacios)
-                if "\t" in line and len(parts) >= 2:
-                    p = parts[1].strip().strip('"').strip("'")
-                else:
-                    # Tras el correo: unir el resto por si la clave tuviera espacios
-                    p = " ".join(parts[1:]).strip().strip('"').strip("'")
-                if not c or "@" not in c or not p:
-                    continue
+                c, p = parsed
                 if correos_iguales_exacto(c, correo_solicitado):
                     return p
         except Exception:
@@ -695,16 +715,11 @@ def cargar_mapa_cuentas_sesiones() -> dict[str, str]:
         return cuentas_map
     try:
         for line in path_cuentas.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
+            parsed = _parse_linea_cuenta_sesiones(line)
+            if not parsed:
                 continue
-            line_normalized = line.replace(",", " ").replace("=", " ")
-            parts = line_normalized.split()
-            if len(parts) >= 2:
-                correo = parts[0].strip().strip('"').strip("'")
-                pwd = parts[1].strip().strip('"').strip("'")
-                if correo and "@" in correo and pwd:
-                    cuentas_map[correo] = pwd
+            correo, pwd = parsed
+            cuentas_map[correo] = pwd
     except Exception:
         pass
     return cuentas_map
@@ -801,11 +816,8 @@ def guardar_credencial_cuenta(correo: str, pwd: str) -> bool:
             if path_cuentas.exists():
                 existentes = path_cuentas.read_text(encoding="utf-8").splitlines()
             for line in existentes:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.replace(",", " ").replace("=", " ").split()
-                if parts and correos_iguales_exacto(parts[0].strip().strip('"').strip("'"), correo):
+                parsed = _parse_linea_cuenta_sesiones(line)
+                if parsed and correos_iguales_exacto(parsed[0], correo):
                     return False
             with open(path_cuentas, "a", encoding="utf-8") as f:
                 if existentes and existentes[-1].strip():
@@ -14986,12 +14998,18 @@ def registrar_y_restablecer_opcion17(correos):
 def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[str]]:
     """Lee titular_familiar.txt.
 
-    Formato preferido (bloques, define titular ↔ miembros a invitar):
+    Formato por bloques (con metadatos; el script lo escribe al guardar):
         TITULAR
         correo@..., 0, disponible, []
         MIEMBROS:
         miembro1@...
         miembro2@...
+
+    Formato compacto (pegado masivo):
+        titular@gmail.com
+          miembro1@gmail.com
+          miembro2@gmail.com
+        (línea sin indentar = titular; indentada = miembro; línea en blanco opcional)
 
     Formato antiguo (compatibilidad): líneas titular,... y una sola sección MIEMBROS:
     global al final (se reparte por cupos en orden).
@@ -15008,13 +15026,36 @@ def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[
 
     lines = path.read_text(encoding="utf-8").splitlines()
 
+    def _email_limpio(raw: str) -> str:
+        """Extrae el correo: ignora tabs/espacios y columnas extra (p. ej. email\\tpwd)."""
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        # Formato compacto pegado desde Excel/bloc: correo<TAB>contraseña
+        primer = re.split(r'[\s,;]+', s, maxsplit=1)[0].strip()
+        return re.sub(r'^[\s\.]+|[\s\.]+$', '', primer)
+
+    def _titular_nuevo(correo: str, usados: int = 0, estado: str = "disponible",
+                       miembros: list | None = None) -> dict:
+        miembros = list(miembros or [])
+        usados = max(usados, len(miembros))
+        if usados >= 5 or "lleno" in (estado or "").lower():
+            estado = "lleno"
+        return {
+            "correo": correo,
+            "usados": usados,
+            "estado": estado,
+            "miembros": miembros,
+            "miembros_invitar": [],
+        }
+
     def _parse_linea_titular(line_clean: str) -> dict | None:
         if "," not in line_clean or "@" not in line_clean:
             return None
         parts = [p.strip() for p in line_clean.split(",")]
         if not parts or "@" not in parts[0]:
             return None
-        correo_t = re.sub(r'^[\s\.]+|[\s\.]+$', '', parts[0])
+        correo_t = _email_limpio(parts[0])
         if "@" not in correo_t:
             return None
         usados = 0
@@ -15042,21 +15083,21 @@ def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[
                         miembros_detalles = []
                 except Exception:
                     miembros_detalles = []
-        usados = max(usados, len(miembros_detalles))
-        if usados >= 5 or "lleno" in estado:
-            estado = "lleno"
-        return {
-            "correo": correo_t,
-            "usados": usados,
-            "estado": estado,
-            "miembros": list(miembros_detalles),
-            "miembros_invitar": [],
-        }
+        return _titular_nuevo(correo_t, usados=usados, estado=estado, miembros=miembros_detalles)
+
+    lineas_utiles = [ln for ln in lines if ln.strip() and not ln.strip().startswith("#")]
 
     # Detectar formato por bloques (línea TITULAR)
     tiene_bloques = any(
         ln.strip().upper() == "TITULAR" or ln.strip().upper().startswith("TITULAR")
-        for ln in lines if ln.strip() and not ln.strip().startswith("#")
+        for ln in lineas_utiles
+    )
+
+    # Formato compacto: miembros indentados (espacios/tab) sin keyword TITULAR
+    tiene_compacto = (not tiene_bloques) and any(
+        (ln.startswith(" ") or ln.startswith("\t")) and "@" in ln
+        for ln in lines
+        if ln.strip() and not ln.strip().startswith("#")
     )
 
     if tiene_bloques:
@@ -15079,7 +15120,7 @@ def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[
             if en_miembros:
                 if "@" in line_clean and "," not in line_clean:
                     # línea solo-email del bloque MIEMBROS
-                    correo_m = re.sub(r'^[\s\.]+|[\s\.]+$', '', line_clean)
+                    correo_m = _email_limpio(line_clean)
                     if correo_m and "@" in correo_m and actual is not None:
                         if correo_m not in actual["miembros_invitar"]:
                             actual["miembros_invitar"].append(correo_m)
@@ -15102,6 +15143,41 @@ def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[
             titulares.append(actual)
         return titulares, miembros_planos
 
+    if tiene_compacto:
+        actual = None
+        for line in lines:
+            raw = line.rstrip("\r\n")
+            line_clean = raw.strip()
+            if not line_clean or line_clean.startswith("#"):
+                continue
+            upper = line_clean.upper()
+            if upper == "TITULAR" or upper.startswith("TITULAR") or upper.startswith("MIEMBROS"):
+                continue
+            indented = bool(raw) and raw[0] in " \t"
+            if indented:
+                if "@" not in line_clean or actual is None:
+                    continue
+                correo_m = _email_limpio(line_clean)
+                if correo_m and "@" in correo_m:
+                    if correo_m not in actual["miembros_invitar"]:
+                        actual["miembros_invitar"].append(correo_m)
+                    miembros_planos.append(correo_m)
+                continue
+            # Sin indentar: nuevo titular (email solo o línea con metadatos)
+            if actual:
+                titulares.append(actual)
+            parsed = _parse_linea_titular(line_clean)
+            if parsed:
+                actual = parsed
+            elif "@" in line_clean and "," not in line_clean:
+                correo_t = _email_limpio(line_clean)
+                actual = _titular_nuevo(correo_t) if correo_t and "@" in correo_t else None
+            else:
+                actual = None
+        if actual:
+            titulares.append(actual)
+        return titulares, miembros_planos
+
     # --- Formato antiguo ---
     in_miembros_section = False
     for line in lines:
@@ -15113,7 +15189,7 @@ def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[
             continue
         if in_miembros_section:
             if "@" in line_clean:
-                correo_m = re.sub(r'^[\s\.]+|[\s\.]+$', '', line_clean)
+                correo_m = _email_limpio(line_clean)
                 if correo_m:
                     miembros_planos.append(correo_m)
         else:
