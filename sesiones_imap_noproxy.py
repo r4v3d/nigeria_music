@@ -9381,6 +9381,73 @@ def _recargar_pagina_familia(page) -> bool:
         return False
 
 
+
+def _rellenar_email_invitar_react(input_loc, email_objetivo: str) -> bool:
+    """Rellena el input de invitar de forma compatible con React (native value setter)."""
+    email_objetivo = (email_objetivo or "").strip()
+    if not email_objetivo:
+        return False
+    try:
+        input_loc.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        input_loc.click(timeout=2000)
+    except Exception:
+        try:
+            input_loc.focus()
+        except Exception:
+            pass
+    # 1) Playwright fill + eventos
+    try:
+        input_loc.fill("")
+        input_loc.fill(email_objetivo)
+        try:
+            input_loc.dispatch_event("input")
+            input_loc.dispatch_event("change")
+        except Exception:
+            pass
+        try:
+            val = (input_loc.input_value(timeout=800) or "").strip()
+            if val.lower() == email_objetivo.lower():
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # 2) Setter nativo (React controlled inputs)
+    try:
+        ok = bool(input_loc.evaluate(
+            """(el, value) => {
+                try {
+                    const proto = window.HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(el, value);
+                    else el.value = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                    return (el.value || '').trim().toLowerCase() === String(value).trim().toLowerCase();
+                } catch (e) { return false; }
+            }""",
+            email_objetivo,
+        ))
+        if ok:
+            return True
+    except Exception:
+        pass
+    # 3) Tecleo humano
+    try:
+        if rellenar_campo_humanizado(input_loc, email_objetivo):
+            return True
+    except Exception:
+        pass
+    try:
+        val = (input_loc.input_value(timeout=500) or "").strip()
+        return val.lower() == email_objetivo.lower()
+    except Exception:
+        return False
+
 def _familia_ui_lista_para_invitar(page) -> bool:
     """True si hay botón/campo de invitar en /family (no basta 'member' genérico en el body)."""
     try:
@@ -9685,19 +9752,9 @@ def invitar_miembro_plan_familiar_tid(
 
     # 2) Rellenar el correo
     print(f"    [Invitar] Escribiendo correo: {email_objetivo}")
-    try:
-        input_loc.focus()
-        input_loc.fill("")
-        input_loc.fill(email_objetivo)
-        try:
-            input_loc.dispatch_event("input")
-            input_loc.dispatch_event("change")
-        except Exception:
-            pass
-    except Exception:
-        if not rellenar_campo_humanizado(input_loc, email_objetivo):
-            print("    [Invitar] Error al escribir el correo.")
-            return "fallo"
+    if not _rellenar_email_invitar_react(input_loc, email_objetivo):
+        print("    [Invitar] Error al escribir el correo.")
+        return "fallo"
 
     time.sleep(pausa_s + 0.2)
 
