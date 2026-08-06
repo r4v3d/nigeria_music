@@ -2446,6 +2446,121 @@ def _lock_registro_mismo_buzon(gmail_user: str) -> threading.Lock:
         return lock
 
 
+KEYWORDS_LOGIN_ACCESO = [
+    "sign-in code", "signin code", "login code", "código de acceso", "codigo de acceso",
+    "código de inicio", "codigo de inicio", "access code", "verification code",
+    "código", "codigo", "code", "inici",
+]
+
+
+def reclamar_otp_login_para_alias(
+    alias: str,
+    after_email_id: int = 0,
+    max_age_minutes: int = 20,
+    silencioso: bool = True,
+) -> str | None:
+    """OTP de inicio de sesión para UN alias exacto (opción 18 / hermanos Gmail).
+
+    Candado por buzón + exigir_destinatario_exacto: varios alias.con.puntos del mismo
+    Gmail no se roban el código entre sí.
+    """
+    alias = (alias or "").strip().lower()
+    if not alias or "@" not in alias:
+        return None
+    with _lock_registro_mismo_buzon(alias):
+        return obtener_codigo_via_imap(
+            gmail_user=alias,
+            required_keywords=KEYWORDS_LOGIN_ACCESO,
+            query_exclude="cancel",
+            after_email_id=after_email_id,
+            max_age_minutes=max_age_minutes,
+            preferir_otp_len=6,
+            exigir_destinatario_exacto=True,
+        )
+
+
+def buscar_contrasena_tidal_exacta(correo_solicitado: str) -> str | None:
+    """Contraseña Tidal SOLO desde sesiones_imap_cuentas.txt (match exacto con puntos).
+
+    No usa passwords.txt (ahí está la App Password IMAP, no la clave de Tidal).
+    """
+    if not correo_solicitado:
+        return None
+    correo_solicitado = (correo_solicitado or "").strip()
+    path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+    if not path_cuentas.exists():
+        return None
+    try:
+        for line in path_cuentas.read_text(encoding="utf-8").splitlines():
+            parsed = _parse_linea_cuenta_sesiones(line)
+            if not parsed:
+                continue
+            c, p = parsed
+            if correos_iguales_exacto(c, correo_solicitado) and (p or "").strip():
+                return p.strip()
+    except Exception:
+        pass
+    return None
+
+
+def preparar_cuentas_login_opcion18(correos_activos: list[str]) -> dict[str, str] | None:
+    """Menú → {alias_exacto: pwd_tidal_o_vacio}. Sin pwd → login por código IMAP.
+
+    Requiere App Password IMAP en passwords.txt (mismo buzón para hermanos con puntos).
+    """
+    if not correos_activos:
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay correos activos en el menú.")
+        return None
+
+    resultado: dict[str, str] = {}
+    sin_imap: list[str] = []
+    con_pwd = 0
+    sin_pwd = 0
+
+    for c in correos_activos:
+        c = (c or "").strip()
+        if not c or "@" not in c:
+            continue
+        user_imap, app_pwd = obtener_credenciales_imap_reales(c)
+        if not user_imap or not app_pwd:
+            sin_imap.append(c)
+            continue
+        pwd = buscar_contrasena_tidal_exacta(c) or ""
+        resultado[c] = pwd
+        if pwd:
+            con_pwd += 1
+        else:
+            sin_pwd += 1
+
+    if sin_imap:
+        print(f"\n{Color.WARNING}[Opción 18] Sin IMAP en passwords.txt (se omiten):{Color.ENDC}")
+        for c in sin_imap:
+            print(f"  {Color.FAIL}✗{Color.ENDC} {c}")
+
+    if not resultado:
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} Ningún correo del menú tiene App Password IMAP "
+              f"en passwords.txt. Sin eso no se puede leer el código de acceso.")
+        return None
+
+    # Aviso de hermanos del mismo buzón (crítico para OTP exacto)
+    por_buzon: dict[str, list[str]] = {}
+    for c in resultado:
+        por_buzon.setdefault(_norm_dots_gmail(c), []).append(c)
+    for buzon, aliases in por_buzon.items():
+        if len(aliases) > 1:
+            print(f"  {Color.CYAN}[Opción 18]{Color.ENDC} Buzón {buzon}: {len(aliases)} alias "
+                  f"con puntos → OTP con match EXACTO (no se mezclan códigos).")
+
+    print(f"\n{Color.CYAN}[Opción 18]{Color.ENDC} A procesar: {len(resultado)} | "
+          f"con contraseña Tidal: {con_pwd} | por código IMAP: {sin_pwd}")
+    for c, pwd in resultado.items():
+        if pwd:
+            print(f"  {Color.GREEN}✓{Color.ENDC} {c} (contraseña)")
+        else:
+            print(f"  {Color.CYAN}○{Color.ENDC} {c} (código de acceso)")
+    return resultado
+
+
 def _norm_dots_gmail(correo: str) -> str:
     correo = (correo or "").strip().lower()
     if "@" not in correo:
@@ -4382,31 +4497,38 @@ def hacer_click_por_textos(page, textos: list) -> bool:
     return False
 
 def contar_cajas_otp_visibles(page) -> int:
-    """Cuenta inputs OTP visibles (maxlength=1 / one-time-code) en la página actual."""
+    """Cuenta inputs OTP visibles (maxlength=1 / one-time-code) en página + iframes."""
     try:
         page = pagina_vigente(page)
-        n = page.evaluate("""() => {
-            const esOtp = (el) => {
-                const max = (el.getAttribute('maxlength') || '').trim();
-                const ac = (el.autocomplete || '').toLowerCase();
-                const mode = (el.inputMode || '').toLowerCase();
-                const name = (el.name || '').toLowerCase();
-                const st = window.getComputedStyle(el);
-                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
-                    return false;
-                const r = el.getBoundingClientRect();
-                if (r.width < 8 || r.height < 8) return false;
-                // Cajas de un dígito, one-time-code, o caja única maxlength 4-8 (login)
-                const mn = Number(max);
-                return max === '1' || ac === 'one-time-code'
-                    || (mode === 'numeric' && max === '1')
-                    || ((name.includes('code') || name.includes('otp')) && max === '1')
-                    || (ac === 'one-time-code')
-                    || (mn >= 4 && mn <= 8);
-            };
-            return Array.from(document.querySelectorAll('input')).filter(esOtp).length;
-        }""")
-        return int(n or 0)
+        total = 0
+        for frame in page.frames:
+            try:
+                n = frame.evaluate("""() => {
+                    const esOtp = (el) => {
+                        const max = (el.getAttribute('maxlength') || '').trim();
+                        const ac = (el.autocomplete || '').toLowerCase();
+                        const mode = (el.inputMode || '').toLowerCase();
+                        const name = (el.name || '').toLowerCase();
+                        const ph = (el.placeholder || '').toLowerCase();
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
+                            return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 8 || r.height < 8) return false;
+                        const mn = Number(max);
+                        return max === '1' || ac === 'one-time-code'
+                            || (mode === 'numeric' && (max === '1' || (mn >= 4 && mn <= 8)))
+                            || ((name.includes('code') || name.includes('otp')
+                                 || ph.includes('code') || ph.includes('código') || ph.includes('codigo'))
+                                && (max === '1' || (mn >= 4 && mn <= 8)))
+                            || (mn >= 4 && mn <= 8);
+                    };
+                    return Array.from(document.querySelectorAll('input')).filter(esOtp).length;
+                }""")
+                total += int(n or 0)
+            except Exception:
+                continue
+        return total
     except Exception:
         return 0
 
@@ -4808,9 +4930,26 @@ def _escribir_codigo_otp_intento(page, codigo: str) -> bool:
                             pass
 
             def _exito_completo(objetivos, esperado: str) -> bool:
-                if leer_cajas(objetivos) == esperado:
+                leido = ""
+                try:
+                    leido = leer_cajas(objetivos)
+                except Exception:
+                    leido = ""
+                if leido == esperado:
                     return True
-                return leer_otp_cajas_visibles(page) == esperado
+                try:
+                    if leer_otp_cajas_visibles(page) == esperado:
+                        return True
+                except Exception:
+                    pass
+                # React a veces no expone .value aunque el OTP ya está en pantalla
+                if leido and esperado and leido.replace(" ", "") == esperado:
+                    return True
+                # Si se llenó al menos la longitud esperada con dígitos, aceptar
+                solo_dig = re.sub(r"\D", "", leido or "")
+                if solo_dig == esperado:
+                    return True
+                return False
 
             # Varias cajas OTP
             if len(code_inputs) >= 4:
@@ -11755,9 +11894,10 @@ PATRON_MODO_CONTRASENA = r"(?:inicia|iniciar|usar|use|sign\s*in|log\s*in|entrar)
 
 class TidalAutoLoginManager:
     def __init__(self, client_email, target_pwd, proxy_pe_server=None, proxy_pe_user=None, proxy_pe_pass=None, headless=False, barreras=None, thread_index=1,
-                 mantener_ventana_si_falla=False):
+                 mantener_ventana_si_falla=False, preferir_codigo=False):
         self.client_email = client_email
-        self.target_pwd = target_pwd
+        self.target_pwd = (target_pwd or "").strip()
+        self.preferir_codigo = bool(preferir_codigo) or not self.target_pwd
         self.proxy_pe_server = proxy_pe_server
         self.proxy_pe_user = proxy_pe_user
         self.proxy_pe_pass = proxy_pe_pass
@@ -12033,59 +12173,310 @@ class TidalAutoLoginManager:
                 const txt = document.body ? document.body.innerText.toLowerCase() : '';
                 const frases = ['revisa tu correo', 'check your email', 'te hemos enviado un código',
                                 'te hemos enviado un codigo', "we've sent", 'we have sent',
-                                'reenviar código', 'reenviar codigo', 'resend code'];
+                                'reenviar código', 'reenviar codigo', 'resend code',
+                                'verify your email', 'verifica tu correo', 'verifica tu email',
+                                'código de acceso', 'codigo de acceso', 'access code',
+                                'sign-in code', 'signin code', '6-digit', '6 digit',
+                                'finish creating your account', 'terminar de crear'];
                 if (frases.some(f => txt.includes(f))) return true;
-                return document.querySelectorAll('input[maxlength="1"], input[autocomplete="one-time-code"]').length >= 4;
+                return document.querySelectorAll(
+                    'input[maxlength="1"], input[autocomplete="one-time-code"]'
+                ).length >= 4;
             }"""))
         except Exception:
             return False
 
+    def asegurar_pantalla_otp_login(self, timeout_s: float = 35.0) -> bool:
+        """Garantiza cajas OTP visibles antes de escribir el código (opción 18)."""
+        self.page = pagina_vigente(self.page)
+        limite = time.time() + max(5.0, float(timeout_s))
+        intento = 0
+        while time.time() < limite:
+            intento += 1
+            self.page = pagina_vigente(self.page)
+            try:
+                manejar_bloqueos_e_intervencion(self.page, "Login OTP UI")
+            except Exception:
+                pass
+
+            n_cajas = 0
+            try:
+                n_cajas = contar_cajas_otp_visibles(self.page)
+            except Exception:
+                n_cajas = 0
+            if n_cajas >= 1 or self.hay_campo_codigo():
+                print(f"  [Login] [{self.client_email}] Pantalla OTP lista "
+                      f"(cajas≈{n_cajas}, intento UI {intento}).")
+                return True
+
+            # Si hay password, forzar modo código
+            pwd = encontrar_locator_en_frames(
+                self.page, ['input[type="password"]', 'input[name="password"]']
+            )
+            if pwd:
+                self.cambiar_a_login_por_codigo()
+            elif self.hay_pantalla_codigo_login():
+                # Texto de OTP pero cajas aún no pintadas
+                time.sleep(0.6)
+            else:
+                # Último recurso: pulsar enlaces de modo código otra vez
+                try:
+                    self.cambiar_a_login_por_codigo()
+                except Exception:
+                    pass
+            time.sleep(0.8)
+
+        try:
+            url = (self.page.url or "")[:100]
+        except Exception:
+            url = "?"
+        print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Sin cajas OTP visibles "
+              f"tras {timeout_s:.0f}s (URL: {url}).{Color.ENDC}")
+        return False
+
     def iniciar_sesion_con_codigo_email(self, base_email_id: int = 0) -> bool:
-        """Último recurso cuando Tidal no ofrece la opción de contraseña: usar el código de acceso."""
-        print(f"  [Login] [{self.client_email}] Recuperando el código de acceso desde el buzón...")
+        """Login con OTP del correo: match EXACTO del alias (hermanos Gmail no se cruzan).
+
+        Importante: Tidal/React a veces NO expone input.value tras escribir el OTP.
+        Si el código se tecleó pero la lectura falla, igual se pulsa Continuar y se
+        valida por establecimiento de sesión (no cerrar por falso 'no se pudo escribir').
+        """
+        print(f"  [Login] [{self.client_email}] Recuperando código de acceso (alias exacto)...")
+
+        # Si ya hay sesión (código auto-consumido / magic), no forzar escritura.
+        if self.es_sesion_activa() or self.confirmar_sesion_en_perfil(8.0):
+            print(f"  [Login] [{self.client_email}] Sesión ya activa; se omite OTP.")
+            return True
+
+        self.asegurar_pantalla_otp_login(20.0)
+
         codigo = None
-        for intento in range(1, 13):  # 12 intentos * 10s = 2 minutos
-            codigo = obtener_codigo_via_imap(
-                gmail_user=self.client_email,
-                required_keywords=["código", "code", "inici"],
-                query_exclude="cancel",
-                after_email_id=base_email_id
+        for intento in range(1, 13):
+            if self.es_sesion_activa():
+                print(f"  [Login] [{self.client_email}] Sesión activa durante espera IMAP.")
+                return True
+            if intento in (1, 3, 6, 9):
+                self.asegurar_pantalla_otp_login(8.0)
+            codigo = reclamar_otp_login_para_alias(
+                self.client_email,
+                after_email_id=base_email_id,
+                max_age_minutes=20,
+                silencioso=(intento > 1),
             )
             if codigo:
                 break
+            if intento in (4, 8):
+                try:
+                    self.forzar_reenvio_codigo()
+                except Exception:
+                    pass
             if intento < 12:
-                print(f"  [Login] [{self.client_email}] Intento {intento}/12: el código de acceso aún no ha llegado...")
+                print(f"  [Login] [{self.client_email}] Intento {intento}/12: el código aún no ha llegado "
+                      f"(o no menciona el alias exacto)...")
                 time.sleep(10.0)
 
         if not codigo:
-            print(f"  [Login] {Color.FAIL}[ERROR] [{self.client_email}] No llegó el código de acceso al buzón.{Color.ENDC}")
+            if self.es_sesion_activa() or self.confirmar_sesion_en_perfil(10.0):
+                print(f"  [Login] [{self.client_email}] Sin OTP IMAP pero sesión ya consolidada.")
+                return True
+            print(f"  [Login] {Color.FAIL}[ERROR] [{self.client_email}] No llegó el código de acceso "
+                  f"atribuible a este alias.{Color.ENDC}")
             return False
 
         print(f"  [Login] [{self.client_email}] {Color.GREEN}Código de acceso obtenido: {codigo}{Color.ENDC}")
-        if not escribir_codigo_verificacion_inteligente(self.page, codigo):
-            print(f"  [Login] {Color.FAIL}[ERROR] [{self.client_email}] No se pudo escribir el código en la pantalla.{Color.ENDC}")
-            return False
 
-        time.sleep(1.5)
+        if self.es_sesion_activa():
+            print(f"  [Login] [{self.client_email}] Sesión activa al obtener OTP; no se reescribe.")
+            return True
+
+        self.page = pagina_vigente(self.page)
+        self.asegurar_pantalla_otp_login(25.0)
+
+        # 1) Escritor tolerante del login titular (acepta 1 caja / JS / avance de URL)
+        escrito_ok = False
+        try:
+            escrito_ok = bool(escribir_otp_login_titular(self.page, codigo))
+        except Exception as e_w:
+            print(f"  [Login] [{self.client_email}] [WARN] escribir_otp_login_titular: {e_w}")
+
+        # 2) Fallback al escritor genérico
+        if not escrito_ok:
+            try:
+                escrito_ok = bool(escribir_codigo_verificacion_inteligente(self.page, codigo))
+            except Exception:
+                escrito_ok = False
+
+        # 3) Aunque la lectura del DOM falle, el código pudo haberse tecleado (React).
+        #    Pulsar Continuar / Inicia sesión y validar por sesión.
+        if not escrito_ok:
+            print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Lectura OTP no confirmada "
+                  f"(React a veces oculta el value). Se pulsa Continuar y se valida la sesión..."
+                  f"{Color.ENDC}")
+            # Forzar tecleo una vez más sin exigir readback
+            try:
+                self._teclear_otp_sin_verificar(codigo)
+            except Exception:
+                pass
+
+        time.sleep(0.8)
         btn_entrar = esperar_locator_en_frames(
             self.page,
             ["button[type='submit']", "button:has-text('Inicia Sesión')", "button:has-text('Inicia sesión')",
              "button:has-text('Iniciar sesión')", "button:has-text('Log in')",
-             "button:has-text('Continuar')", "button:has-text('Continue')"],
+             "button:has-text('Continuar')", "button:has-text('Continue')",
+             "button:has-text('Verificar')", "button:has-text('Verify')"],
             timeout_s=8.0
         )
         if btn_entrar:
             try:
-                btn_entrar.click(timeout=3000, force=True)
+                if btn_entrar.is_disabled():
+                    btn_entrar.evaluate("""el => {
+                        el.removeAttribute('disabled');
+                        el.disabled = false;
+                        el.click();
+                    }""")
+                else:
+                    btn_entrar.click(timeout=3000, force=True)
+            except Exception:
+                try:
+                    btn_entrar.evaluate("el => el.click()")
+                except Exception:
+                    pass
+        else:
+            try:
+                self.page.keyboard.press("Enter")
             except Exception:
                 pass
 
-        if self.esperar_establecimiento_sesion(40.0):
+        if self.esperar_establecimiento_sesion(45.0):
             print(f"  [Login] {Color.GREEN}[OK] [{self.client_email}] Sesión iniciada con el código del correo.{Color.ENDC}")
             return True
 
-        print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] El código se ingresó pero la sesión no avanzó.{Color.ENDC}")
+        # Última oportunidad: a veces el OTP auto-avanza sin botón
+        if self.es_sesion_activa() or self.confirmar_sesion_en_perfil(12.0):
+            print(f"  [Login] {Color.GREEN}[OK] [{self.client_email}] Sesión confirmada tras OTP.{Color.ENDC}")
+            return True
+
+        print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] El código se intentó ingresar "
+              f"pero la sesión no avanzó.{Color.ENDC}")
         return False
+
+    def _teclear_otp_sin_verificar(self, codigo: str) -> None:
+        """Teclea el OTP en la UI sin exigir que input.value coincida (React)."""
+        codigo = re.sub(r"\D", "", str(codigo or ""))
+        if not codigo:
+            return
+        self.page = pagina_vigente(self.page)
+        caja = esperar_locator_en_frames(
+            self.page,
+            [
+                'input[autocomplete="one-time-code"]',
+                'input[maxlength="1"]',
+                'input[maxlength="6"]',
+                'input[maxlength="5"]',
+                'input[inputmode="numeric"]',
+                'input[name*="code" i]',
+                'input[type="tel"]',
+                'input[type="text"]',
+            ],
+            timeout_s=4.0,
+        )
+        if not caja:
+            return
+        try:
+            caja.click(timeout=800)
+        except Exception:
+            pass
+        # Si hay varias cajas de 1 dígito, keyboard.type en la primera suele repartirlas
+        n = 0
+        try:
+            n = contar_cajas_otp_visibles(self.page)
+        except Exception:
+            n = 0
+        try:
+            if n >= 4:
+                self.page.keyboard.type(codigo, delay=70)
+            else:
+                try:
+                    caja.fill("")
+                except Exception:
+                    pass
+                caja.type(codigo, delay=70)
+        except Exception:
+            try:
+                self.page.keyboard.type(codigo, delay=70)
+            except Exception:
+                pass
+        time.sleep(0.4)
+
+    def cambiar_a_login_por_codigo(self) -> bool:
+        """Si hay campo password, intenta pasar a 'iniciar sesión sin contraseña / con código'."""
+        pwd_input = encontrar_locator_en_frames(
+            self.page, ['input[type="password"]', 'input[name="password"]']
+        )
+        if not pwd_input:
+            return True
+        print(f"  [Login] [{self.client_email}] Pantalla de contraseña → cambiando a código de acceso...")
+        try:
+            if _invite_eval_modo_contrasena(self.page, "existe"):
+                # El helper de invitaciones detecta el link "con contraseña"; aquí queremos el inverso.
+                pass
+        except Exception:
+            pass
+
+        btn_code_mode = esperar_locator_en_frames(
+            self.page,
+            [
+                "a:has-text('sin contraseña')", "button:has-text('sin contraseña')",
+                "a:has-text('without password')", "button:has-text('without password')",
+                "a:has-text('con un código')", "button:has-text('con un código')",
+                "a:has-text('with a code')", "button:has-text('with a code')",
+                "a:has-text('código')", "button:has-text('código')",
+                "a:has-text('code')", "button:has-text('code')",
+                "text='Inicia sesión sin contraseña'", "text='Sign in without password'",
+                "text='Inicia sesión con un código'", "text='Sign in with a code'",
+            ],
+            timeout_s=6.0
+        )
+        if btn_code_mode:
+            try:
+                btn_code_mode.click()
+            except Exception:
+                try:
+                    btn_code_mode.evaluate("el => el.click()")
+                except Exception:
+                    pass
+            time.sleep(2.5)
+            self.page = pagina_vigente(self.page)
+
+        # Fallback JS: buscar texto visible de modo código
+        if encontrar_locator_en_frames(self.page, ['input[type="password"]', 'input[name="password"]']):
+            try:
+                clicked = self.page.evaluate(r"""() => {
+                    const re = /sin\s+contrase[ñn]a|without\s+password|con\s+un\s+c[oó]digo|with\s+a\s+code|usar\s+c[oó]digo|use\s+(a\s+)?code/i;
+                    const els = Array.from(document.querySelectorAll('a, button, span, div, p, [role="button"]'));
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim();
+                        if (!t || t.length > 80) continue;
+                        if (!re.test(t)) continue;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') continue;
+                        const clickable = el.closest('a, button, [role="button"]') || el;
+                        clickable.click();
+                        return t.slice(0, 60);
+                    }
+                    return null;
+                }""")
+                if clicked:
+                    print(f"  [Login] [{self.client_email}] Pulsado modo código: {clicked}")
+                    time.sleep(2.0)
+                    self.page = pagina_vigente(self.page)
+            except Exception:
+                pass
+
+        return not bool(encontrar_locator_en_frames(
+            self.page, ['input[type="password"]', 'input[name="password"]']
+        ))
 
     def hay_campo_codigo(self):
         return encontrar_locator_en_frames(
@@ -13015,8 +13406,20 @@ class TidalAutoLoginManager:
             time.sleep(2.0)
 
             pwd_input = esperar_locator_en_frames(self.page, ['input[type="password"]', 'input[name="password"]'], timeout_s=6.0)
+            if self.preferir_codigo:
+                if pwd_input:
+                    self.cambiar_a_login_por_codigo()
+                if self.hay_pantalla_codigo_login() or not encontrar_locator_en_frames(
+                    self.page, ['input[type="password"]', 'input[name="password"]']
+                ):
+                    return self.iniciar_sesion_con_codigo_email(
+                        obtener_max_email_id(self.client_email, "tidal")
+                    )
+
             if not pwd_input and (self.hay_pantalla_codigo_login() or self.hay_control_modo_contrasena()):
                 for _ in range(3):
+                    if self.preferir_codigo:
+                        break
                     if self.hay_control_modo_contrasena():
                         self.clic_modo_contrasena()
                     pwd_input = esperar_locator_en_frames(self.page, ['input[type="password"]', 'input[name="password"]'], timeout_s=6.0)
@@ -13025,10 +13428,15 @@ class TidalAutoLoginManager:
 
             if not pwd_input:
                 pwd_input = esperar_locator_en_frames(self.page, ['input[type="password"]', 'input[name="password"]'], timeout_s=10.0)
-            if not pwd_input:
-                if self.hay_pantalla_codigo_login():
+            if not pwd_input or self.preferir_codigo:
+                if self.hay_pantalla_codigo_login() or self.preferir_codigo:
+                    if self.preferir_codigo and pwd_input:
+                        self.cambiar_a_login_por_codigo()
                     return self.iniciar_sesion_con_codigo_email(obtener_max_email_id(self.client_email, "tidal"))
                 return False
+
+            if not self.target_pwd:
+                return self.iniciar_sesion_con_codigo_email(obtener_max_email_id(self.client_email, "tidal"))
 
             try:
                 pwd_input.fill("")
@@ -13162,7 +13570,10 @@ class TidalAutoLoginManager:
         )
 
     def run_auto_login(self, modo: str = "tmm") -> bool:
-        """modo='tmm' → opción 10 (login + TuneMyMusic). modo='eliminar' → opción 15 (login + borrar)."""
+        """modo='tmm' → opción 10 (login + TuneMyMusic).
+        modo='eliminar' → opción 15 (login + borrar).
+        modo='login' → opción 18 (solo login; cierra Chrome al éxito).
+        """
         try:
             self.asegurar_navegador_abierto()
             
@@ -13548,8 +13959,31 @@ class TidalAutoLoginManager:
                 pwd_input = encontrar_locator_en_frames(self.page, ['input[type="password"]', 'input[name="password"]'])
                 login_por_codigo = False
 
+                # Opción 18 / sin pwd: forzar login por código (no cambiar a modo contraseña).
+                if self.preferir_codigo:
+                    print(f"  [Login] [{self.client_email}] Sin contraseña Tidal → login por código "
+                          f"(alias exacto: {self.client_email}).")
+                    if pwd_input:
+                        self.cambiar_a_login_por_codigo()
+                    if not base_login_id:
+                        base_login_id = obtener_max_email_id(self.client_email, "tidal")
+                    # Esperar UI OTP real (cajas), no solo texto de la página
+                    if not self.asegurar_pantalla_otp_login(40.0):
+                        print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] "
+                              f"UI OTP no confirmada; se intentará igual tras leer IMAP.{Color.ENDC}")
+                    login_por_codigo = self.iniciar_sesion_con_codigo_email(base_login_id)
+                    if not login_por_codigo:
+                        self.abortar_barreras()
+                        return self.finalizar_sin_exito(
+                            f"No se pudo iniciar sesión por código para {self.client_email}."
+                        )
+                    # Saltar el bucle de contraseña
+                    login_exitoso = True
+                else:
+                    login_exitoso = False
+
                 # Tidal manda a la pantalla del código: hay que cambiar a modo contraseña
-                if not pwd_input and (pantalla_codigo or self.hay_pantalla_codigo_login() or self.hay_control_modo_contrasena()):
+                if not login_por_codigo and not pwd_input and (pantalla_codigo or self.hay_pantalla_codigo_login() or self.hay_control_modo_contrasena()):
                     for intento_modo in range(1, 4):
                         if not self.hay_control_modo_contrasena():
                             print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] La pantalla del código no ofrece la opción de contraseña.{Color.ENDC}")
@@ -13568,7 +14002,7 @@ class TidalAutoLoginManager:
                         login_por_codigo = self.iniciar_sesion_con_codigo_email(base_login_id)
 
                 # Si no se encuentra el campo de contraseña, verificar si la pantalla sigue pidiendo correo
-                if not pwd_input and not login_por_codigo:
+                if not pwd_input and not login_por_codigo and not self.preferir_codigo:
                     email_back = encontrar_locator_en_frames(self.page, email_selectors)
                     if email_back:
                         print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Re-intentando envío de correo (desfase detectado)...{Color.ENDC}")
@@ -13586,9 +14020,10 @@ class TidalAutoLoginManager:
                                 self.page, ['input[type="password"]', 'input[name="password"]'], timeout_s=8.0
                             )
                 
-                login_exitoso = login_por_codigo
+                if not self.preferir_codigo:
+                    login_exitoso = login_por_codigo
                 for intento_pwd in range(1, 5):
-                    if login_exitoso:
+                    if login_exitoso or self.preferir_codigo:
                         break
                     # Solo confirmar en /profile si YA salimos del flujo de login (no navegar
                     # ahí mientras aún estamos en la pantalla de contraseña).
@@ -13774,6 +14209,13 @@ class TidalAutoLoginManager:
 
             if modo == "eliminar":
                 return self._flujo_eliminar_cuenta_opcion15()
+
+            if modo == "login":
+                # Opción 18: solo consolidar sesión y cerrar (sin TuneMyMusic ni perfil).
+                print(f"  [Login] [{self.client_email}] Opción 18: login único completado "
+                      f"(sin TuneMyMusic). Cerrando Chrome...")
+                self.cerrar_recursos()
+                return True
 
             # Opción 10: sin cambio de correo en el perfil — solo login y exportación CSV en TMM.
             print(f"  [Login] [{self.client_email}] Se omite la edición de correo del perfil; "
@@ -14413,11 +14855,26 @@ class TidalAutoLoginManager:
             threading.Thread(target=_rm_async, args=(Path(prof_dir),), daemon=True).start()
 
 
-def iniciar_sesion_automatico_tidal(correos):
+def iniciar_sesion_automatico_tidal(correos, modo: str = "tmm"):
+    """Opción 10 (modo='tmm'): login + TuneMyMusic.
+    Opción 18 (modo='login'): solo login Tidal; cierra Chrome al éxito.
+    """
+    modo = (modo or "tmm").strip().lower()
+    if modo not in ("tmm", "login"):
+        modo = "tmm"
+    solo_login = modo == "login"
+    n_opcion = "18" if solo_login else "10"
+
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}   INICIO DE SESIÓN AUTOMÁTICO DE CUENTAS TIDAL / TMM{Color.ENDC}")
+    if solo_login:
+        print(f"{Color.BLUE}{Color.BOLD}   INICIO DE SESIÓN ÚNICAMENTE (SIN TUNEMYMUSIC){Color.ENDC}")
+    else:
+        print(f"{Color.BLUE}{Color.BOLD}   INICIO DE SESIÓN AUTOMÁTICO DE CUENTAS TIDAL / TMM{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    
+    if solo_login:
+        print(f"{Color.CYAN}Flujo opción 18: si hay contraseña en sesiones_imap_cuentas.txt → pwd; "
+              f"si no → código IMAP (alias exacto con puntos). Sin TuneMyMusic.{Color.ENDC}")
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -14425,22 +14882,28 @@ def iniciar_sesion_automatico_tidal(correos):
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
 
-    path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
-    if not path_cuentas.exists():
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe en la carpeta actual.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
-        
-    cuentas_map = cargar_mapa_cuentas_sesiones()
-    if not cuentas_map:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+    if solo_login:
+        cuentas_map = preparar_cuentas_login_opcion18(correos)
+        if cuentas_map is None:
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
+    else:
+        path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+        if not path_cuentas.exists():
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe en la carpeta actual.")
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
+            
+        cuentas_map = cargar_mapa_cuentas_sesiones()
+        if not cuentas_map:
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
 
-    cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
-    if cuentas_map is None:
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
+        if cuentas_map is None:
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
         
     correos_lista = list(cuentas_map.keys())
     print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
@@ -14457,10 +14920,10 @@ def iniciar_sesion_automatico_tidal(correos):
 
     num_cuentas = len(correos_lista)
     if MODO_SIN_PROXY:
-        print(f"\n{Color.CYAN}[Sin Proxy] Opcion 10 con IP real.{Color.ENDC}")
+        print(f"\n{Color.CYAN}[Sin Proxy] Opción {n_opcion} con IP real.{Color.ENDC}")
         valid_pe_list = []
     else:
-        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para inicio de sesión (Opción 10)...{Color.ENDC}")
+        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para inicio de sesión (Opción {n_opcion})...{Color.ENDC}")
         valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
         if not valid_pe_list:
             print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige. Valida la lista con la opción 13 antes de continuar.")
@@ -14482,8 +14945,11 @@ def iniciar_sesion_automatico_tidal(correos):
                 input(">>> Presiona Enter para volver al menú principal <<<")
                 return
 
-    batch_size = 10
+    batch_size = 5 if solo_login else 10
     total_cuentas = len(correos_lista)
+    if solo_login and total_cuentas > 5:
+        print(f"\n{Color.CYAN}{Color.BOLD}Opción 18: oleadas de máximo {batch_size} "
+              f"(varios alias del mismo Gmail → OTP exacto sin cruzar códigos).{Color.ENDC}\n")
     print(f"\n{Color.CYAN}{Color.BOLD}Iniciando sesión de {total_cuentas} cuentas en bloques de máximo {batch_size} ventanas de Chrome simultáneas...{Color.ENDC}\n")
     
     for b_start in range(0, total_cuentas, batch_size):
@@ -14504,10 +14970,13 @@ def iniciar_sesion_automatico_tidal(correos):
             print(f"\n{Color.CYAN}{Color.BOLD}--- Procesando Lote ({b_start + 1} a {b_start + num_cuentas_lote} de {total_cuentas}) ---{Color.ENDC}")
 
         def login_un_correo(idx_rel, correo):
-            if idx_rel > 1:
-                time.sleep((idx_rel - 1) * 1.5)
+            # Más separación entre hermanos del mismo buzón (OTP IMAP)
+            delay = (idx_rel - 1) * (2.5 if solo_login else 1.5)
+            if delay > 0:
+                time.sleep(delay)
             idx_abs = b_start + idx_rel
-            contrasena = cuentas_map[correo]
+            contrasena = (cuentas_map.get(correo) or "").strip()
+            usar_codigo = solo_login and not contrasena
             
             if MODO_SIN_PROXY:
                 p_pe_server = p_pe_user = p_pe_pass = None
@@ -14536,12 +15005,19 @@ def iniciar_sesion_automatico_tidal(correos):
                 headless=headless,
                 barreras=barreras_lote,
                 thread_index=idx_abs,
-                mantener_ventana_si_falla=mantener_ventanas
+                mantener_ventana_si_falla=mantener_ventanas,
+                preferir_codigo=usar_codigo,
             )
             managers.append(manager)
-            print(f"\n{Color.CYAN}{Color.BOLD}[Login Automático Concurrente] Iniciando proceso para: {correo}{Color.ENDC}")
+            if usar_codigo:
+                etiqueta = "Login por código"
+            elif solo_login:
+                etiqueta = "Login único"
+            else:
+                etiqueta = "Login Automático Concurrente"
+            print(f"\n{Color.CYAN}{Color.BOLD}[{etiqueta}] Iniciando proceso para: {correo}{Color.ENDC}")
             try:
-                exito = manager.run_auto_login()
+                exito = manager.run_auto_login(modo=modo)
             finally:
                 # Cerrar la conexión IMAP reutilizable del hilo para no dejarla abierta contra Gmail
                 cerrar_sesion_imap_hilo()
@@ -14566,20 +15042,33 @@ def iniciar_sesion_automatico_tidal(correos):
     total_vacias = sum(1 for m in managers if getattr(m, "sin_playlists", False))
 
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"   RESUMEN DEL INICIO DE SESIÓN AUTOMÁTICO")
-    print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f" Cuentas procesadas: {total_cuentas}")
-    print(f" Inicios de sesión correctos: {total_login}")
-    print(f" CSV exportados desde TuneMyMusic: {total_export}")
-    print(f" Cuentas detectadas sin playlists: {total_vacias}")
-    print(f" Procesos completos (login + exportación CSV): {success_count}")
-    print(f" Procesos incompletos: {fail_count}")
+    if solo_login:
+        print(f"   RESUMEN DEL LOGIN ÚNICO (OPCIÓN 18)")
+        print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+        print(f" Cuentas procesadas: {total_cuentas}")
+        print(f" Logins correctos: {total_login}")
+        print(f" Procesos OK: {success_count}")
+        print(f" Procesos fallidos: {fail_count}")
+    else:
+        print(f"   RESUMEN DEL INICIO DE SESIÓN AUTOMÁTICO")
+        print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+        print(f" Cuentas procesadas: {total_cuentas}")
+        print(f" Inicios de sesión correctos: {total_login}")
+        print(f" CSV exportados desde TuneMyMusic: {total_export}")
+        print(f" Cuentas detectadas sin playlists: {total_vacias}")
+        print(f" Procesos completos (login + exportación CSV): {success_count}")
+        print(f" Procesos incompletos: {fail_count}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
 
     if fail_count and mantener_ventanas:
         print(f"{Color.WARNING}Las ventanas de las cuentas incompletas ya se cerraron tras el plazo de revisión manual.{Color.ENDC}")
 
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+
+
+def iniciar_sesion_unicamente_opcion18(correos):
+    """Opción 18: login Tidal únicamente (sin TuneMyMusic ni eliminación)."""
+    iniciar_sesion_automatico_tidal(correos, modo="login")
 
 
 def eliminar_cuentas_tidal_automatico_opcion15(correos):
@@ -16149,7 +16638,7 @@ def menu_principal():
         print(" 3. Obtener CÓDIGO DE INICIO DE SESIÓN (Login Verification)")
         print(" 4. Buscar y aceptar ENLACE DE INVITACIÓN (auto-login + cerrar Chrome)")
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
-        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en 8–17)")
+        print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en 8–18)")
         print(" 7. Salir")
         print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
@@ -16161,9 +16650,10 @@ def menu_principal():
         print(" 15. ELIMINAR CUENTA TIDAL AUTOMÁTICO")
         print(" 16. Verificar CSV en descargas/ (correos activos del menú)")
         print(" 17. Registrar (Nigeria) + restablecer contraseña")
+        print(" 18. Iniciar sesión únicamente (pwd o código IMAP; alias con puntos OK)")
         print(f"{Color.CYAN}{Color.BOLD}" + "-"*50 + f"{Color.ENDC}")
         
-        opcion = input(f"{Color.BOLD}Selecciona una opción (1-17):{Color.ENDC} ").strip()
+        opcion = input(f"{Color.BOLD}Selecciona una opción (1-18):{Color.ENDC} ").strip()
         
         if opcion in ("1", "2", "3"):
             for correo in correos:
@@ -16384,9 +16874,12 @@ def menu_principal():
 
         elif opcion == "17":
             registrar_y_restablecer_opcion17(correos)
+
+        elif opcion == "18":
+            iniciar_sesion_unicamente_opcion18(correos)
             
         else:
-            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 17.")
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} Opción inválida. Selecciona un número del 1 al 18.")
 
 
 if __name__ == "__main__":

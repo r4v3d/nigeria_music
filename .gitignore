@@ -29,6 +29,7 @@ sesiones_imap_cuentas.txt
 # Session cookies / progress
 tmm_cookies.json
 progreso_migraciones.json
+linksextraidos.txt
 
 # Proxy lists (source + validated)
 proxies.txt

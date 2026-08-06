@@ -33,6 +33,7 @@ if sys.stdout.encoding != 'utf-8':
         pass
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+LINKS_EXTRAIDOS_PATH = SCRIPT_DIR / "linksextraidos.txt"
 
 # Gmail rechaza las conexiones cuando se superan ~15 sesiones IMAP simultáneas por buzón.
 # Con lotes de 20 (opción 9) un semáforo de 5 dejaba a muchos hilos minutos en cola: cuando
@@ -1094,45 +1095,122 @@ def _invite_clic_modo_contrasena(page) -> bool:
     return bool(_invite_eval_modo_contrasena(page, "click"))
 
 
+def _invite_enlace_ya_aceptado_o_caducado(page) -> bool:
+    """True si Tidal muestra que el enlace ya se aceptó o caducó (sin login pendiente)."""
+    if not page:
+        return False
+    try:
+        if page.is_closed():
+            return False
+    except Exception:
+        return False
+    try:
+        return bool(page.evaluate("""() => {
+            try {
+                const txt = (document.body && (document.body.innerText || '') || '').toLowerCase();
+                if (!txt) return false;
+                // ES: "Este enlace de invitación ya se ha aceptado o ha caducado."
+                if (txt.includes('ya se ha aceptado') || txt.includes('ya se aceptó')) return true;
+                if (txt.includes('ha caducado') && (txt.includes('invit') || txt.includes('enlace'))) return true;
+                if (txt.includes('enlace de invitación') && (txt.includes('aceptado') || txt.includes('caducad'))) return true;
+                // EN
+                if (txt.includes('already been accepted') || txt.includes('already accepted')) return true;
+                if (txt.includes('invitation') && (txt.includes('expired') || txt.includes('has expired'))) return true;
+                if (txt.includes('invite link') && (txt.includes('accepted') || txt.includes('expired'))) return true;
+                return false;
+            } catch (e) {
+                return false;
+            }
+        }"""))
+    except Exception:
+        try:
+            txt = ((page.inner_text("body") or "") if page else "").lower()
+        except Exception:
+            return False
+        return (
+            "ya se ha aceptado" in txt
+            or "already been accepted" in txt
+            or ("ha caducado" in txt and "invit" in txt)
+            or ("expired" in txt and "invitation" in txt)
+        )
+
+
 def _invite_detectar_exito(page) -> bool:
-    """True si la invitación familiar ya quedó aceptada."""
+    """True si la invitación familiar ya quedó aceptada (evaluación instantánea, sin waits)."""
+    if not page:
+        return False
     try:
-        u = (page.url or "").lower()
+        if page.is_closed():
+            return False
     except Exception:
-        u = ""
-    if "/success" in u:
+        return False
+    # Enlace ya usado / caducado = proceso terminado para ese correo
+    if _invite_enlace_ya_aceptado_o_caducado(page):
         return True
-    if "family" in u and "/accept" not in u and "/login" not in u and "signin" not in u and "authorize" not in u:
-        if "tidal.com" in u or "account." in u:
-            return True
     try:
-        if page.locator(
-            "text=Ya está todo"
-        ).or_(page.locator("text=You're all set")).or_(
-            page.locator("text=all set")
-        ).or_(page.locator("text=preparado")).or_(
-            page.locator("text=bienvenido")
-        ).or_(page.locator("text=Welcome to the family")).or_(
-            page.locator("text=te has unido")
-        ).or_(page.locator("text=You've joined")).or_(
-            page.locator("text=joined the family")
-        ).count() > 0:
-            return True
+        # Una sola evaluate: evita locator.count()/inner_text con default timeout 35s
+        # que colgaban el bucle tras pulsar «Aceptar» (navegación a medias).
+        return bool(page.evaluate("""() => {
+            try {
+                const u = (location.href || '').toLowerCase();
+                if (u.includes('/success')) return true;
+                if (u.includes('family')
+                    && !u.includes('/accept')
+                    && !u.includes('/login')
+                    && !u.includes('signin')
+                    && !u.includes('authorize')
+                    && (u.includes('tidal.com') || u.includes('account.'))) {
+                    return true;
+                }
+                const txt = (document.body && (document.body.innerText || '') || '').toLowerCase();
+                const frags = [
+                    'ya está todo', "you're all set", 'youre all set', 'all set',
+                    'welcome to the family', 'te has unido', "you've joined",
+                    'joined the family', 'formas parte', "you're in", 'preparado',
+                    'bienvenido a la familia', 'has joined',
+                ];
+                return frags.some(f => txt.includes(f));
+            } catch (e) {
+                return false;
+            }
+        }"""))
     except Exception:
-        pass
-    # Texto en body (más tolerante a markup)
-    try:
-        txt = (page.inner_text("body") or "").lower()
-        for frag in (
-            "ya está todo", "you're all set", "youre all set", "all set",
-            "welcome to the family", "te has unido", "you've joined",
-            "joined the family", "formas parte", "you're in",
-        ):
-            if frag in txt:
+        # Durante navegación post-aceptar, evaluate puede fallar: no bloquear
+        try:
+            u = (page.url or "").lower()
+            if "/success" in u:
                 return True
+            if (
+                "family" in u
+                and "/accept" not in u
+                and "/login" not in u
+                and "signin" not in u
+                and "authorize" not in u
+            ):
+                return True
+        except Exception:
+            pass
+        return False
+
+
+def _invite_queda_boton_aceptar(page) -> bool:
+    """True si aún hay CTA de aceptación visible (rápido, sin waits largos)."""
+    try:
+        return bool(page.evaluate("""() => {
+            const re = /aceptar invitaci[oó]n|accept invitation|join family|join the family|unirse a la familia|unirse al plan/i;
+            const skip = /cookie|preferenc|onetrust/i;
+            for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                const t = (el.innerText || el.textContent || '').trim();
+                if (!t || t.length > 80 || skip.test(t) || !re.test(t)) continue;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                const r = el.getBoundingClientRect();
+                if (r.width > 2 && r.height > 2) return true;
+            }
+            return false;
+        }"""))
     except Exception:
-        pass
-    return False
+        return False
 
 
 def _invite_pulsar_aceptar(page) -> bool:
@@ -1304,8 +1382,15 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
     # 1) ¿Ya hay botón de aceptar? (sesión lista)
     if _invite_pulsar_aceptar(page):
         print(f"    [Invitación] [{correo}] Pulsado botón de aceptación.")
-        time.sleep(2.0)
-        if _invite_detectar_exito(page):
+        # Esperar éxito real unos segundos; si el CTA desapareció, dar por aceptada
+        for _ in range(12):
+            time.sleep(0.35)
+            if _invite_detectar_exito(page):
+                return "ok"
+            if not _invite_queda_boton_aceptar(page):
+                # Aceptación aplicada (botón ya no está) aunque la URL aún cargue
+                return "ok"
+        if _invite_detectar_exito(page) or not _invite_queda_boton_aceptar(page):
             return "ok"
         return "progreso"
 
@@ -1443,6 +1528,10 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     break
                 time.sleep(0.5)
             time.sleep(0.4)
+            if wrote:
+                # Tras OTP no reabrir ablink: la sesión ya avanzó; un ERR_TUNNEL
+                # en tracking quemaría el progreso.
+                estado["otp_escrito"] = True
             _invite_pulsar_continuar_o_login(page)
             time.sleep(1.5)
             if _invite_pulsar_aceptar(page):
@@ -1561,18 +1650,25 @@ def abrir_enlace_familia_con_autocierre(
     correo: str,
     proxy_pe: dict | None = None,
     proxy_ng: dict | None = None,
-) -> None:
+) -> bool:
     """Abre el enlace de invitación, completa login/alta + aceptación y cierra Chrome al éxito.
 
     - Cuenta ya existente (hay pwd o login): proxy PE.
     - Cuenta aún no registrada (alta DOB/Suscríbete): proxy NG (Nigeria), obligatorio.
+    Devuelve True si la invitación quedó aceptada.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         print(f"{Color.WARNING}[Navegador]{Color.ENDC} Playwright no está instalado. Usando fallback...")
         abrir_enlace_en_perfil_chrome(url, correo)
-        return
+        return False
+
+    # Evitar ablink en Chrome+proxy NG (ERR_TUNNEL crónico). Resolver a accept directo.
+    url_orig = (url or "").strip()
+    url = _resolver_ablink_a_invitacion(url_orig)
+    if url != url_orig and _es_url_invitacion_directa(url):
+        print(f"    {Color.CYAN}[Invitación] [{correo}] Usando URL directa (sin ablink).{Color.ENDC}")
 
     pwd_cuenta = buscar_contrasena_cuenta(correo)
     # Sin contraseña → se asume alta nueva → Nigeria desde el inicio.
@@ -1587,7 +1683,7 @@ def abrir_enlace_familia_con_autocierre(
         if not proxy_ng or not proxy_ng.get("server"):
             print(f"    {Color.FAIL}[Navegador] [{correo}] Sin proxy de Nigeria disponible. "
                   f"El alta de cuentas nuevas exige NG. Se omite.{Color.ENDC}")
-            return
+            return False
         current_proxy = proxy_ng
         proxy_tipo = "NG"
         # Devolver PE si se reservó de más
@@ -1601,7 +1697,7 @@ def abrir_enlace_familia_con_autocierre(
         if not proxy_pe or not proxy_pe.get("server"):
             print(f"    {Color.FAIL}[Navegador] [{correo}] Sin proxy de Perú disponible. Se omite la "
                   f"invitación antes de exponer tu IP real.{Color.ENDC}")
-            return
+            return False
         current_proxy = proxy_pe
         proxy_tipo = "PE"
 
@@ -1657,14 +1753,35 @@ def abrir_enlace_familia_con_autocierre(
         _max_intentos_inv = 5
 
         def _cerrar_contexto():
+            """Cierre rápido en EL MISMO hilo (Playwright sync no admite close desde otro thread).
+
+            Cerrar pestañas primero hace que la ventana desaparezca al momento; luego
+            context.close() suele ser breve. Nunca usar threading aquí → greenlet.error.
+            """
             nonlocal context, page
+            pages = []
             try:
                 if context:
-                    context.close()
+                    pages = list(context.pages)
             except Exception:
                 pass
-            context = None
+            for pg in pages:
+                try:
+                    if not pg.is_closed():
+                        pg.close()
+                except Exception:
+                    pass
             page = None
+
+            ctx = context
+            context = None
+            if not ctx:
+                return
+            try:
+                ctx.close()
+            except Exception:
+                # TargetClosedError / ya cerrado tras pg.close(): ignorar
+                pass
 
         def _liberar_proxy_actual():
             srv = (current_proxy or {}).get("server")
@@ -1739,29 +1856,127 @@ def abrir_enlace_familia_con_autocierre(
                 pass
             return True
 
-        def _reabrir_invitacion_con_proxy_actual() -> bool:
-            nonlocal context, page
-            try:
-                context = abrir_contexto(current_proxy, profile_dir, proxy_tipo)
-                page = context.pages[0] if context.pages else context.new_page()
-                print(f"    [Invitación] [{correo}] Calentando reputación (proxy {proxy_tipo})...")
-                navegar_tidal_tolerante(page, "https://tidal.com/pricing", timeout_ms=45000)
-                time.sleep(random.uniform(1.2, 2.2))
-                aceptar_cookies_con_espera(page)
-                _invite_limpiar_cookies_agresivo(page)
-                time.sleep(0.4)
-                print(f"    [Invitación] [{correo}] Reabriendo enlace de invitación con proxy {proxy_tipo}...")
-                navegar_tidal_tolerante(
-                    page, url,
-                    referer="https://tidal.com/pricing",
-                    timeout_ms=60000,
-                )
-                time.sleep(1.5)
-                _invite_limpiar_cookies_agresivo(page)
-                return True
-            except Exception as e_reab:
-                print(f"    {Color.FAIL}[Invitación] [{correo}] Falló reapertura con {proxy_tipo}: {e_reab}{Color.ENDC}")
-                return False
+        def _reabrir_invitacion_con_proxy_actual(max_intentos: int = 4) -> bool:
+            """Reabre el enlace con el proxy actual; ante ERR_TUNNEL/antibot rota y reintenta.
+
+            Usa URL directa (sin ablink) siempre que se pueda resolver.
+            """
+            nonlocal context, page, url
+            # Re-resolver por si aún es ablink
+            if "ablink." in (url or "").lower():
+                resuelto = _resolver_ablink_a_invitacion(url)
+                if resuelto and resuelto != url:
+                    url = resuelto
+
+            ultimo_err = ""
+            for intento in range(1, max_intentos + 1):
+                try:
+                    if context is None:
+                        context = abrir_contexto(current_proxy, profile_dir, proxy_tipo)
+                        page = context.pages[0] if context.pages else context.new_page()
+
+                    print(f"    [Invitación] [{correo}] Calentando reputación "
+                          f"(proxy {proxy_tipo}, intento reopen {intento}/{max_intentos})...")
+                    navegar_tidal_tolerante(page, "https://tidal.com/pricing", timeout_ms=45000)
+                    time.sleep(random.uniform(1.2, 2.2))
+                    aceptar_cookies_con_espera(page)
+                    _invite_limpiar_cookies_agresivo(page)
+                    time.sleep(0.4)
+
+                    try:
+                        navegar_tidal_tolerante(
+                            page, "https://account.tidal.com/",
+                            referer="https://tidal.com/pricing",
+                            timeout_ms=35000,
+                        )
+                        time.sleep(0.6)
+                    except Exception:
+                        pass
+
+                    destino = url
+                    # Si sigue siendo ablink, intentar resolver otra vez antes del goto
+                    if "ablink." in (destino or "").lower():
+                        destino2 = _resolver_ablink_a_invitacion(destino)
+                        if _es_url_invitacion_directa(destino2):
+                            destino = destino2
+                            url = destino2
+
+                    print(f"    [Invitación] [{correo}] Reabriendo enlace "
+                          f"{'(directo) ' if _es_url_invitacion_directa(destino) else '(tracking) '}"
+                          f"con proxy {proxy_tipo}...")
+                    try:
+                        navegar_tidal_tolerante(
+                            page, destino,
+                            referer="https://tidal.com/pricing",
+                            timeout_ms=60000,
+                        )
+                    except Exception as e_goto:
+                        try:
+                            u_now = (page.url or "").lower()
+                        except Exception:
+                            u_now = ""
+                        if url_es_flujo_invitacion_familiar(u_now) and not detectar_pantalla_antirobot(page):
+                            print(f"    [Invitación] [{correo}] goto con error ({e_goto}) pero "
+                                  f"pestaña ya en flujo familiar: {u_now[:80]}")
+                        elif "ablink." in (destino or "").lower():
+                            # Último intento: resolver ablink y navegar solo a la URL final
+                            destino3 = _resolver_ablink_a_invitacion(destino)
+                            if _es_url_invitacion_directa(destino3):
+                                print(f"    [Invitación] [{correo}] Reintento con URL resuelta "
+                                      f"(sin ablink)...")
+                                url = destino3
+                                navegar_tidal_tolerante(
+                                    page, destino3,
+                                    referer="https://tidal.com/pricing",
+                                    timeout_ms=60000,
+                                )
+                            else:
+                                raise
+                        else:
+                            raise
+
+                    time.sleep(1.2)
+                    _invite_limpiar_cookies_agresivo(page)
+
+                    try:
+                        u_fin = (page.url or "").lower()
+                    except Exception:
+                        u_fin = ""
+                    if detectar_pantalla_antirobot(page):
+                        raise RuntimeError("Antibot al reabrir la invitación")
+                    if url_es_pagina_marketing(u_fin) or "chrome-error" in u_fin:
+                        raise RuntimeError(
+                            f"Reapertura quedó en {(u_fin or '?')[:90]} (no es accept/login)"
+                        )
+                    if not url_es_flujo_invitacion_familiar(u_fin):
+                        if not url_es_login_o_cuenta(u_fin):
+                            raise RuntimeError(
+                                f"Tras reopen URL inesperada: {(u_fin or '?')[:90]}"
+                            )
+                    return True
+
+                except Exception as e_reab:
+                    ultimo_err = str(e_reab)
+                    print(f"    {Color.FAIL}[Invitación] [{correo}] Falló reapertura con "
+                          f"{proxy_tipo} ({intento}/{max_intentos}): {e_reab}{Color.ENDC}")
+                    try:
+                        _cerrar_contexto()
+                    except Exception:
+                        pass
+                    if intento >= max_intentos:
+                        break
+                    razon = "ERR_TUNNEL/proxy al reabrir"
+                    if "antibot" in ultimo_err.lower() or "robot" in ultimo_err.lower():
+                        razon = "Antibot al reabrir"
+                    elif not es_error_proxy_o_red(e_reab) and "tunnel" not in ultimo_err.lower():
+                        razon = f"Reapertura fallida: {ultimo_err[:60]}"
+                    if not _rotar_proxy_y_perfil(razon):
+                        break
+                    time.sleep(random.uniform(1.0, 2.0))
+
+            print(f"    {Color.FAIL}[Invitación] [{correo}] No se pudo reabrir tras "
+                  f"{max_intentos} intentos. Último error: {ultimo_err[:120]}{Color.ENDC}")
+            return False
 
         for intento_inv in range(1, _max_intentos_inv + 1):
             if context is None:
@@ -1777,18 +1992,77 @@ def abrir_enlace_familia_con_autocierre(
                 _invite_limpiar_cookies_agresivo(page)
                 time.sleep(random.uniform(0.5, 1.0))
 
-                print(f"    [Invitación] [{correo}] Cargando enlace de invitación con referer orgánico...")
-                navegar_tidal_tolerante(
-                    page, url,
-                    referer="https://tidal.com/pricing",
-                    timeout_ms=60000,
-                )
+                # Calentar account antes del ablink (reduce ERR_TUNNEL en tracking links)
+                try:
+                    navegar_tidal_tolerante(
+                        page, "https://account.tidal.com/",
+                        referer="https://tidal.com/pricing",
+                        timeout_ms=35000,
+                    )
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+
+                # Re-resolver por si el enlace IMAP quedó en ablink
+                if "ablink." in (url or "").lower():
+                    resuelto0 = _resolver_ablink_a_invitacion(url)
+                    if _es_url_invitacion_directa(resuelto0):
+                        url = resuelto0
+
+                destino_inv = url
+                print(f"    [Invitación] [{correo}] Cargando enlace "
+                      f"{'(directo) ' if _es_url_invitacion_directa(destino_inv) else '(tracking) '}"
+                      f"con referer orgánico...")
+                try:
+                    navegar_tidal_tolerante(
+                        page, destino_inv,
+                        referer="https://tidal.com/pricing",
+                        timeout_ms=60000,
+                    )
+                except Exception as e_goto:
+                    try:
+                        u_now = (page.url or "").lower()
+                    except Exception:
+                        u_now = ""
+                    if url_es_flujo_invitacion_familiar(u_now) and not detectar_pantalla_antirobot(page):
+                        print(f"    [Invitación] [{correo}] goto con error pero ya en flujo: "
+                              f"{u_now[:80]}")
+                    elif "ablink." in (destino_inv or "").lower():
+                        destino_alt = _resolver_ablink_a_invitacion(destino_inv)
+                        if _es_url_invitacion_directa(destino_alt):
+                            print(f"    [Invitación] [{correo}] ablink falló por túnel; "
+                                  f"abriendo URL directa...")
+                            url = destino_alt
+                            navegar_tidal_tolerante(
+                                page, destino_alt,
+                                referer="https://tidal.com/pricing",
+                                timeout_ms=60000,
+                            )
+                        else:
+                            raise
+                    else:
+                        raise
                 time.sleep(2.0)
                 _invite_limpiar_cookies_agresivo(page)
                 try:
                     url_post = (page.url or "").lower()
                 except Exception:
                     url_post = ""
+                if "chrome-error" in url_post or "chromewebdata" in url_post:
+                    # Último recurso: resolver ablink fuera de Chrome y reintentar directo
+                    alt = _resolver_ablink_a_invitacion(url_orig if "ablink." in (url_orig or "").lower() else url)
+                    if _es_url_invitacion_directa(alt):
+                        url = alt
+                        navegar_tidal_tolerante(
+                            page, alt,
+                            referer="https://tidal.com/pricing",
+                            timeout_ms=60000,
+                        )
+                        time.sleep(1.0)
+                        try:
+                            url_post = (page.url or "").lower()
+                        except Exception:
+                            url_post = ""
                 if url_es_pagina_marketing(url_post) or not url_es_flujo_invitacion_familiar(url_post):
                     raise RuntimeError(
                         f"Tras abrir el enlace de invitación la pestaña sigue en "
@@ -1842,10 +2116,31 @@ def abrir_enlace_familia_con_autocierre(
                       f"antirobot. Se omite esta invitación.{Color.ENDC}")
             _cerrar_contexto()
             _liberar_proxy_actual()
-            return
+            return False
 
         aceptar_cookies_con_espera(page)
         _invite_limpiar_cookies_agresivo(page)
+
+        # Enlace ya aceptado/caducado → OK inmediato, cerrar Chrome sin login/OTP
+        if _invite_enlace_ya_aceptado_o_caducado(page):
+            print(f"    {Color.GREEN}[OK] [{correo}] Invitación ya aceptada o caducada. "
+                  f"Cerrando Chrome...{Color.ENDC}")
+            _cerrar_contexto()
+            try:
+                prof = profile_dir
+
+                def _rm_async_ya(p_dir):
+                    time.sleep(0.5)
+                    try:
+                        shutil.rmtree(p_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_rm_async_ya, args=(Path(prof),), daemon=True).start()
+            except Exception:
+                pass
+            _liberar_proxy_actual()
+            return True
 
         if pwd_cuenta:
             print(f"    [Invitación] [{correo}] Contraseña cargada desde sesiones_imap_cuentas.txt.")
@@ -1857,14 +2152,26 @@ def abrir_enlace_familia_con_autocierre(
         if proxy_tipo == "PE" and _invite_es_formulario_registro(page):
             if not _cambiar_a_nigeria_para_alta("Formulario de registro detectado tras abrir el enlace"):
                 _cerrar_contexto()
-                return
+                return False
             if not _reabrir_invitacion_con_proxy_actual():
                 _cerrar_contexto()
                 _liberar_proxy_actual()
-                return
+                return False
+            # Tras PE→NG el antibot puede aparecer ya en accept-invite
+            if detectar_pantalla_antirobot(page):
+                if not _rotar_proxy_y_perfil("Antirobot tras cambiar a Nigeria"):
+                    _cerrar_contexto()
+                    _liberar_proxy_actual()
+                    return False
+                if not _reabrir_invitacion_con_proxy_actual():
+                    _cerrar_contexto()
+                    _liberar_proxy_actual()
+                    return False
 
         success_detected = False
         reabiertos_enlace = 0
+        rotaciones_antibot_loop = 0
+        max_rotaciones_antibot_loop = 5
         estado_login = {}
         print(f"    [Invitación] [{correo}] Completando aceptación automática "
               f"(login PE o alta NG, hasta 5 minutos)...")
@@ -1877,12 +2184,102 @@ def abrir_enlace_familia_con_autocierre(
                 except Exception:
                     url_actual = ""
 
+                # chrome-error / ERR_TUNNEL mid-flujo: ir a URL directa (nunca insistir en ablink)
+                if "chrome-error" in url_actual or "chromewebdata" in url_actual:
+                    if reabiertos_enlace >= 4:
+                        print(f"    {Color.FAIL}[Invitación] [{correo}] chrome-error persistente. "
+                              f"Se omite.{Color.ENDC}")
+                        break
+                    reabiertos_enlace += 1
+                    print(f"    {Color.WARNING}[Invitación] [{correo}] chrome-error/túnel. "
+                          f"Recuperando con URL directa ({reabiertos_enlace}/4)...{Color.ENDC}")
+                    if "ablink." in (url or "").lower() or "ablink." in (url_orig or "").lower():
+                        res = _resolver_ablink_a_invitacion(
+                            url if "ablink." in (url or "").lower() else url_orig
+                        )
+                        if _es_url_invitacion_directa(res):
+                            url = res
+                    # Si ya se escribió OTP, rotar + reopen completo pierde el avance; intentar
+                    # goto directo primero; si falla, rotar y reopen con URL ya resuelta.
+                    try:
+                        if _es_url_invitacion_directa(url):
+                            navegar_tidal_tolerante(
+                                page, url,
+                                referer="https://tidal.com/pricing",
+                                timeout_ms=45000,
+                            )
+                            time.sleep(1.0)
+                            continue
+                    except Exception:
+                        pass
+                    if not _rotar_proxy_y_perfil("ERR_TUNNEL / chrome-error en bucle"):
+                        break
+                    if not _reabrir_invitacion_con_proxy_actual():
+                        break
+                    if estado_login.get("otp_escrito"):
+                        # Mantener flag OTP: la cuenta ya existe; buscar accept/login
+                        estado_login = {
+                            k: v for k, v in estado_login.items()
+                            if k in ("ng_switch_hecho", "registro_nuevo", "otp_escrito",
+                                     "dob_ok", "suscribete_pulsado", "baseline_id")
+                        }
+                    else:
+                        estado_login = {
+                            k: v for k, v in estado_login.items()
+                            if k in ("ng_switch_hecho", "registro_nuevo")
+                        }
+                    time.sleep(0.8)
+                    continue
+
+                # Antibot a mitad de flujo (p. ej. tras Suscríbete / accept-invite): ROTAR IP
+                if check_sec % 2 == 0 or check_sec < 3:
+                    try:
+                        hay_antibot = detectar_pantalla_antirobot(page)
+                    except Exception:
+                        hay_antibot = False
+                    if hay_antibot:
+                        if rotaciones_antibot_loop >= max_rotaciones_antibot_loop:
+                            print(f"    {Color.FAIL}[Invitación] [{correo}] Antibot persistente tras "
+                                  f"{max_rotaciones_antibot_loop} rotaciones. Se omite.{Color.ENDC}")
+                            break
+                        rotaciones_antibot_loop += 1
+                        print(f"    {Color.WARNING}[Invitación] [{correo}] Antibot en accept/login "
+                              f"(rotación {rotaciones_antibot_loop}/{max_rotaciones_antibot_loop})..."
+                              f"{Color.ENDC}")
+                        # Intento corto de slider antes de quemar IP
+                        try:
+                            if resolver_slider_captcha_playwright(page):
+                                time.sleep(2.0)
+                                if not detectar_pantalla_antirobot(page):
+                                    print(f"    [Invitación] [{correo}] Slider resuelto; se continúa.")
+                                    continue
+                        except Exception:
+                            pass
+                        if not _rotar_proxy_y_perfil(
+                            f"Antibot en bucle de aceptación ({proxy_tipo})"
+                        ):
+                            break
+                        if not _reabrir_invitacion_con_proxy_actual():
+                            break
+                        # Tras rotar, reiniciar progreso de formulario (misma cuenta, IP nueva)
+                        # Conservar otp_escrito: tras OTP la cuenta ya existe en Tidal
+                        keep = ("ng_switch_hecho", "registro_nuevo")
+                        if estado_login.get("otp_escrito"):
+                            keep = keep + ("otp_escrito", "dob_ok", "suscribete_pulsado", "baseline_id")
+                        estado_login = {k: v for k, v in estado_login.items() if k in keep}
+                        time.sleep(0.8)
+                        continue
+
                 if url_es_pagina_marketing(url_actual):
                     if reabiertos_enlace < 4:
                         reabiertos_enlace += 1
                         print(f"    [Invitación] [{correo}] Pestaña en marketing/pricing. "
                               f"Reabriendo enlace ({reabiertos_enlace}/4)...")
                         try:
+                            if "ablink." in (url or "").lower():
+                                res_m = _resolver_ablink_a_invitacion(url)
+                                if _es_url_invitacion_directa(res_m):
+                                    url = res_m
                             navegar_tidal_tolerante(
                                 page, url,
                                 referer="https://tidal.com/pricing",
@@ -1896,7 +2293,10 @@ def abrir_enlace_familia_con_autocierre(
                     continue
 
                 if check_sec % 2 == 0:
-                    _invite_limpiar_cookies_agresivo(page)
+                    try:
+                        _invite_limpiar_cookies_agresivo(page)
+                    except Exception:
+                        pass
 
                 # Alta detectada a mitad de login PE → cambiar a NG y reabrir
                 if (
@@ -1909,10 +2309,23 @@ def abrir_enlace_familia_con_autocierre(
                         break
                     if not _reabrir_invitacion_con_proxy_actual():
                         break
+                    if detectar_pantalla_antirobot(page):
+                        if rotaciones_antibot_loop >= max_rotaciones_antibot_loop:
+                            break
+                        rotaciones_antibot_loop += 1
+                        if not _rotar_proxy_y_perfil("Antibot tras PE→NG"):
+                            break
+                        if not _reabrir_invitacion_con_proxy_actual():
+                            break
                     # Reiniciar progreso de formulario (correo/continuar puede hacer falta otra vez)
                     estado_login = {"ng_switch_hecho": True, "registro_nuevo": True}
                     time.sleep(0.5)
                     continue
+
+                if _invite_enlace_ya_aceptado_o_caducado(page):
+                    print(f"    {Color.GREEN}[OK] [{correo}] Invitación ya aceptada o caducada.{Color.ENDC}")
+                    success_detected = True
+                    break
 
                 if _invite_detectar_exito(page):
                     success_detected = True
@@ -1923,22 +2336,32 @@ def abrir_enlace_familia_con_autocierre(
                     success_detected = True
                     break
                 if resultado == "sin_pwd":
-                    time.sleep(1.0)
+                    time.sleep(0.6)
                     continue
                 if resultado == "progreso":
-                    time.sleep(0.8)
+                    time.sleep(0.4)
                     continue
             except Exception as e_loop:
                 if check_sec % 30 == 0:
                     print(f"    [Invitación] [{correo}] [WARN] Bucle: {e_loop}")
-            time.sleep(1.0)
+            time.sleep(0.55)
 
         if success_detected:
             print(f"    {Color.GREEN}[OK] ¡Invitación familiar aceptada correctamente para {correo}! "
                   f"Cerrando ventana de Chrome...{Color.ENDC}")
             _cerrar_contexto()
+            # Borrar perfil en background (no bloquear el hilo de la oleada)
             try:
-                shutil.rmtree(profile_dir, ignore_errors=True)
+                prof = profile_dir
+
+                def _rm_async(p_dir):
+                    time.sleep(0.8)
+                    try:
+                        shutil.rmtree(p_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_rm_async, args=(Path(prof),), daemon=True).start()
             except Exception:
                 pass
         else:
@@ -1946,6 +2369,329 @@ def abrir_enlace_familia_con_autocierre(
                   f"en el tiempo límite. La ventana permanece abierta para revisión.{Color.ENDC}")
 
         _liberar_proxy_actual()
+        return bool(success_detected)
+
+
+def _norm_correo_simple(c: str) -> str:
+    return (c or "").strip().lower()
+
+
+def _parece_url_invitacion_familiar(url: str) -> bool:
+    u = (url or "").strip()
+    if not u.lower().startswith("http"):
+        return False
+    ul = u.lower()
+    if "resetpass" in ul or "reset-password" in ul:
+        return False
+    return (
+        "ablink." in ul
+        or "tidal.com" in ul
+        or "/family/" in ul
+        or "/accept" in ul
+        or "invite" in ul
+    )
+
+
+def parsear_pares_enlace_invitacion(
+    texto: str,
+    correos_preferidos: list[str] | None = None,
+) -> dict[str, str]:
+    """Parsea texto al estilo linksextraidos.txt o líneas sueltas.
+
+    Formatos aceptados:
+      N. https://...
+         correo: user@gmail.com
+      user@gmail.com|https://...
+      user@gmail.com\\thttps://...
+      https://...   (se empareja por orden con correos_preferidos)
+    """
+    preferidos = [c.strip() for c in (correos_preferidos or []) if (c or "").strip()]
+    pref_por_norm = {_norm_correo_simple(c): c for c in preferidos}
+    resultado: dict[str, str] = {}  # correo_norm -> url
+    orden_correos: list[str] = []
+    urls_sin_correo: list[str] = []
+    pendiente_url: str | None = None
+
+    def _registrar(correo: str, url: str) -> None:
+        nonlocal pendiente_url
+        correo = (correo or "").strip()
+        url = (url or "").strip()
+        if not correo or not _parece_url_invitacion_familiar(url):
+            return
+        k = _norm_correo_simple(correo)
+        # Preferir la forma del menú activo si coincide
+        correo_out = pref_por_norm.get(k, correo)
+        if k not in resultado:
+            orden_correos.append(correo_out)
+        resultado[k] = url
+        pendiente_url = None
+
+    for raw in (texto or "").splitlines():
+        line = (raw or "").strip()
+        if not line or line.startswith("=") or line.upper().startswith("ENLACES DE"):
+            continue
+        if line.lower().startswith("fecha:") or line.lower().startswith("total:"):
+            continue
+
+        # correo: email
+        m_correo = re.match(r"^(?:correo|email|cuenta)\s*:\s*(.+)$", line, flags=re.I)
+        if m_correo:
+            correo = m_correo.group(1).strip()
+            if pendiente_url and "@" in correo:
+                _registrar(correo, pendiente_url)
+            continue
+
+        # email|url  o  email<TAB>url  o  email url
+        m_pair = re.match(
+            r"^([^\s|;,]{1,}@[^\s|;,]+\.[^\s|;,]+)\s*[|\t]\s*(https?://\S+)\s*$",
+            line,
+            flags=re.I,
+        )
+        if not m_pair:
+            m_pair = re.match(
+                r"^([^\s]{1,}@[^\s]+\.[^\s]+)\s+(https?://\S+)\s*$",
+                line,
+                flags=re.I,
+            )
+        if m_pair:
+            _registrar(m_pair.group(1), m_pair.group(2))
+            continue
+
+        # "N. https://..." o solo URL
+        m_num = re.match(r"^\d+[\.\)]\s*(https?://\S+)\s*$", line, flags=re.I)
+        if m_num:
+            pendiente_url = m_num.group(1).strip()
+            urls_sin_correo.append(pendiente_url)
+            continue
+        if line.lower().startswith("http"):
+            # puede traer basura al final
+            url_cand = line.split()[0].rstrip("),.;'\"")
+            if _parece_url_invitacion_familiar(url_cand):
+                pendiente_url = url_cand
+                urls_sin_correo.append(url_cand)
+            continue
+
+    # Emparejar URLs huérfanas con correos del menú (por orden, sin sobrescribir)
+    usados = set(resultado.keys())
+    cola_pref = [c for c in preferidos if _norm_correo_simple(c) not in usados]
+    # urls_sin_correo puede incluir las que luego tuvieron correo:; quitar las ya usadas
+    urls_ya = set(resultado.values())
+    huérfanas = [u for u in urls_sin_correo if u not in urls_ya]
+    # Si todas las urls_sin_correo tuvieron correo, huérfanas estará vacío — bien
+    # Si algunas tuvieron correo vía "correo:", estánaron de pendiente pero siguen en urls_sin_correo
+    # Mejor: solo emparejar las que quedaron en pendiente al final + las sin pair
+    # Simplificación: si hay preferidos sin enlace, asignar URLs que no están en resultado.values()
+    for url in huérfanas:
+        if not cola_pref:
+            break
+        if url in resultado.values():
+            continue
+        correo = cola_pref.pop(0)
+        _registrar(correo, url)
+
+    # Salida con correo canónico del menú cuando exista
+    out: dict[str, str] = {}
+    for k, url in resultado.items():
+        out[pref_por_norm.get(k, k)] = url
+    return out
+
+
+def leer_enlaces_desde_linksextraidos(
+    correos: list[str] | None = None,
+    path: Path | None = None,
+) -> dict[str, str]:
+    """Lee linksextraidos.txt; si se pasan correos, solo los que estén en esa lista."""
+    path = path or LINKS_EXTRAIDOS_PATH
+    if not path.exists():
+        return {}
+    try:
+        texto = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        print(f"    {Color.FAIL}[Enlaces] No se pudo leer {path.name}: {e}{Color.ENDC}")
+        return {}
+    todos = parsear_pares_enlace_invitacion(texto, correos_preferidos=correos)
+    if not correos:
+        return todos
+    want = {_norm_correo_simple(c) for c in correos}
+    return {c: u for c, u in todos.items() if _norm_correo_simple(c) in want}
+
+
+def guardar_enlaces_en_linksextraidos(
+    enlaces_map: dict[str, str],
+    *,
+    merge: bool = True,
+    path: Path | None = None,
+) -> Path:
+    """Anota/actualiza linksextraidos.txt en el formato estándar del proyecto."""
+    path = path or LINKS_EXTRAIDOS_PATH
+    merged: dict[str, tuple[str, str]] = {}
+    orden: list[str] = []
+
+    if merge and path.exists():
+        try:
+            prev = parsear_pares_enlace_invitacion(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+            for c, u in prev.items():
+                k = _norm_correo_simple(c)
+                if k not in merged:
+                    orden.append(c)
+                merged[k] = (c, u)
+        except Exception:
+            pass
+
+    for c, u in (enlaces_map or {}).items():
+        c = (c or "").strip()
+        u = (u or "").strip()
+        if not c or not u:
+            continue
+        k = _norm_correo_simple(c)
+        if k not in merged:
+            orden.append(c)
+            merged[k] = (c, u)
+        else:
+            # Actualizar URL; conservar etiqueta de correo previa si es la misma cuenta
+            old_c, _ = merged[k]
+            merged[k] = (old_c if _norm_correo_simple(old_c) == k else c, u)
+
+    # Orden: primero los del merge histórico, luego nuevos
+    lineas = [
+        "=" * 60,
+        "ENLACES DE INVITACIÓN TIDAL FAMILY",
+        f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Total: {len(merged)}",
+        "=" * 60,
+        "",
+    ]
+    for i, c_key in enumerate(orden, 1):
+        k = _norm_correo_simple(c_key)
+        if k not in merged:
+            continue
+        correo, url = merged[k]
+        lineas.append(f"{i}. {url}")
+        lineas.append(f"   correo: {correo}")
+        lineas.append("")
+
+    path.write_text("\n".join(lineas).rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+def pedir_fuente_enlaces_opcion4(correos: list[str]) -> tuple[dict[str, str] | None, str]:
+    """Pregunta fuente opcional de enlaces para la opción 4.
+
+    Returns:
+      (enlaces_map, origen) — enlaces_map es None si hay que buscar por IMAP.
+      origen: 'imap' | 'pegar' | 'archivo'
+    """
+    print(f"\n{Color.CYAN}Fuente de enlaces de invitación:{Color.ENDC}")
+    print("  [Enter] Buscar por IMAP (como siempre)")
+    print("  p       Pegar enlaces manualmente ahora")
+    print(f"  a       Usar {LINKS_EXTRAIDOS_PATH.name} (correos activos)")
+    elec = input(f"{Color.BOLD}Elige [Enter/p/a]:{Color.ENDC} ").strip().lower()
+
+    if elec in ("a", "archivo", "f", "file"):
+        mapa = leer_enlaces_desde_linksextraidos(correos)
+        if not mapa:
+            print(f"    {Color.WARNING}[Enlaces] No hay pares correo↔link en "
+                  f"{LINKS_EXTRAIDOS_PATH.name} para los correos activos.{Color.ENDC}")
+        else:
+            print(f"    {Color.GREEN}[Enlaces] {len(mapa)} enlace(s) cargados desde "
+                  f"{LINKS_EXTRAIDOS_PATH.name}.{Color.ENDC}")
+        return mapa, "archivo"
+
+    if elec in ("p", "pegar", "paste", "m", "manual"):
+        print(f"\n{Color.CYAN}Pega los enlaces. Formatos:{Color.ENDC}")
+        print("  correo|https://ablink...   ó   https://... + línea 'correo: user@...'")
+        print("  (mismo formato que linksextraidos.txt)")
+        print("  Si solo pegas URLs, se emparejan en orden con los correos activos.")
+        print(f"{Color.CYAN}Línea vacía para terminar.{Color.ENDC}")
+        buf: list[str] = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if not (line or "").strip():
+                if buf:
+                    break
+                # primera vacía: salir sin datos
+                break
+            buf.append(line)
+        mapa = parsear_pares_enlace_invitacion("\n".join(buf), correos_preferidos=correos)
+        if not mapa:
+            print(f"    {Color.WARNING}[Enlaces] No se pudo parsear ningún par correo↔link.{Color.ENDC}")
+        else:
+            print(f"    {Color.GREEN}[Enlaces] {len(mapa)} enlace(s) pegados.{Color.ENDC}")
+            try:
+                path = guardar_enlaces_en_linksextraidos(mapa, merge=True)
+                print(f"    {Color.CYAN}[Enlaces] Anotados en {path}{Color.ENDC}")
+            except Exception as e:
+                print(f"    {Color.WARNING}[Enlaces] No se pudo anotar en "
+                      f"{LINKS_EXTRAIDOS_PATH.name}: {e}{Color.ENDC}")
+        return mapa, "pegar"
+
+    return None, "imap"
+
+
+def _imprimir_resumen_opcion4(
+    correos_menu: list[str],
+    ok_list: list[str],
+    fail_list: list[str],
+    sin_enlace: list[str] | None = None,
+) -> None:
+    """Resumen visual de la opción 4: aceptadas vs pendientes/fallidas."""
+    def _norm(c: str) -> str:
+        return (c or "").strip().lower()
+
+    vistos_ok: set[str] = set()
+    ok_unique: list[str] = []
+    for c in ok_list:
+        k = _norm(c)
+        if k and k not in vistos_ok:
+            vistos_ok.add(k)
+            ok_unique.append(c.strip())
+
+    vistos_fail: set[str] = set()
+    fail_unique: list[str] = []
+    for c in fail_list:
+        k = _norm(c)
+        if k and k not in vistos_ok and k not in vistos_fail:
+            vistos_fail.add(k)
+            fail_unique.append(c.strip())
+
+    # Cualquier correo del menú que no esté en OK ni FAIL
+    for c in correos_menu or []:
+        k = _norm(c)
+        if k and k not in vistos_ok and k not in vistos_fail:
+            fail_unique.append(c.strip())
+            vistos_fail.add(k)
+
+    sin_enlace = sin_enlace or []
+    sin_enlace_set = {_norm(c) for c in sin_enlace}
+
+    print(f"\n{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   RESUMEN OPCIÓN 4 — INVITACIONES FAMILIARES{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
+    print(f" Total en menú: {len(correos_menu or [])}")
+    print(f" {Color.GREEN}Aceptadas OK: {len(ok_unique)}{Color.ENDC}")
+    print(f" {Color.FAIL}Pendientes / fallidas: {len(fail_unique)}{Color.ENDC}")
+
+    if ok_unique:
+        print(f"\n{Color.GREEN}{Color.BOLD}✓ Procesadas correctamente:{Color.ENDC}")
+        for i, c in enumerate(ok_unique, 1):
+            print(f"  {Color.GREEN}{i:2d}. {c}{Color.ENDC}")
+    else:
+        print(f"\n{Color.WARNING}✓ Ninguna cuenta quedó aceptada en esta corrida.{Color.ENDC}")
+
+    if fail_unique:
+        print(f"\n{Color.FAIL}{Color.BOLD}✗ Faltan / fallaron:{Color.ENDC}")
+        for i, c in enumerate(fail_unique, 1):
+            motivo = "sin enlace IMAP" if _norm(c) in sin_enlace_set else "no aceptada / error"
+            print(f"  {Color.FAIL}{i:2d}. {c}{Color.ENDC}  ({motivo})")
+    else:
+        print(f"\n{Color.GREEN}✗ No quedan pendientes.{Color.ENDC}")
+
+    print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
 
 
 def abrir_enlace_restablecimiento_con_autocierre(url: str, correo: str, proxy_pe: dict | None = None) -> bool:
@@ -2949,6 +3695,144 @@ def _extraer_cuerpo_y_html_msg(msg) -> tuple[str, str]:
     return body_text or "", html_raw or ""
 
 
+def _es_url_invitacion_directa(url: str) -> bool:
+    """True si es accept/join/family en login|account.tidal.com (NO ablink tracking)."""
+    u = (url or "").strip().lower()
+    if not u.startswith("http"):
+        return False
+    if "ablink." in u or "resetpass" in u or "reset-password" in u:
+        return False
+    if any(x in u for x in ("/privacy", "/terms", "/legal", "support.tidal.com")):
+        return False
+    return (
+        "login.tidal.com/family" in u
+        or "account.tidal.com/family" in u
+        or ("/family/" in u and ("accept" in u or "join" in u))
+        or "/accept/" in u
+        or "/join/" in u
+    )
+
+
+def _resolver_ablink_a_invitacion(url: str, timeout_s: float = 18.0) -> str:
+    """Sigue ablink.info.tidal.com hasta la URL final de accept (sin Chrome).
+
+    Los proxies NG suelen romper el túnel a ablink (ERR_TUNNEL); login.tidal.com/family
+    o account.tidal.com/family/accept-invite suelen abrir bien con el mismo proxy.
+    """
+    url = (url or "").strip()
+    if not url:
+        return url
+    if _es_url_invitacion_directa(url):
+        return url
+    if "ablink." not in url.lower():
+        return url
+
+    def _pick_direct(candidatos: list[str]) -> str | None:
+        for cand in candidatos:
+            c = (cand or "").strip()
+            if _es_url_invitacion_directa(c):
+                preview = c if len(c) <= 95 else c[:95] + "..."
+                print(f"    {Color.CYAN}[Invitación]{Color.ENDC} ablink resuelto → {preview}")
+                return c
+        return None
+
+    # 1) requests con redirects
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        r = session.get(url, allow_redirects=True, timeout=max(5.0, float(timeout_s)))
+        historial: list[str] = []
+        for h in (getattr(r, "history", None) or []):
+            try:
+                historial.append((h.url or "").strip())
+            except Exception:
+                pass
+        final = (getattr(r, "url", None) or "").strip()
+        if final:
+            historial.append(final)
+        # Location headers explícitos
+        for h in (getattr(r, "history", None) or []):
+            try:
+                loc = (h.headers.get("Location") or "").strip()
+                if loc.startswith("http"):
+                    historial.append(loc)
+            except Exception:
+                pass
+
+        picked = _pick_direct(list(reversed(historial)))
+        if picked:
+            return picked
+
+        html = ""
+        try:
+            html = r.text or ""
+        except Exception:
+            html = ""
+        html_cands = [
+            m.group(0).rstrip(").,;'\"").replace("&amp;", "&")
+            for m in re.finditer(
+                r'https?://(?:login|account)\.tidal\.com/[^"\'\s<>\\]+',
+                html,
+                flags=re.I,
+            )
+        ]
+        picked = _pick_direct(html_cands)
+        if picked:
+            return picked
+
+        if final and "tidal.com" in final.lower() and "ablink." not in final.lower():
+            return final
+    except Exception as e1:
+        print(f"    {Color.WARNING}[Invitación]{Color.ENDC} Resolver ablink (requests) falló: "
+              f"{type(e1).__name__}: {e1}")
+
+    # 2) Fallback urllib (a veces requests se atasca en el proxy de sistema)
+    try:
+        import urllib.request
+        import urllib.error
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                ),
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=max(5.0, float(timeout_s))) as resp:
+            final2 = (getattr(resp, "geturl", lambda: "")() or "").strip()
+            body = ""
+            try:
+                body = resp.read(120000).decode("utf-8", errors="ignore")
+            except Exception:
+                body = ""
+        cands2 = [final2] if final2 else []
+        cands2.extend(
+            m.group(0).rstrip(").,;'\"").replace("&amp;", "&")
+            for m in re.finditer(
+                r'https?://(?:login|account)\.tidal\.com/[^"\'\s<>\\]+',
+                body or "",
+                flags=re.I,
+            )
+        )
+        picked = _pick_direct(cands2)
+        if picked:
+            return picked
+        if final2 and "tidal.com" in final2.lower() and "ablink." not in final2.lower():
+            return final2
+    except Exception as e2:
+        print(f"    {Color.WARNING}[Invitación]{Color.ENDC} No se pudo resolver ablink "
+              f"({type(e2).__name__}: {e2}). Se usará el tracking (puede fallar por túnel).")
+    return url
+
+
 def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") -> str | None:
     """Solo enlaces reales de invitación familiar (nunca resetpass ni footers genéricos)."""
     JOIN_TEXTS = ["join", "unir", "nete", "accept invitation", "aceptar invit", "unirse"]
@@ -2968,6 +3852,7 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
             or "/accept/" in u
             or "/join/" in u
             or ("ablink." in u and "tidal" in u and any(k in u for k in ("family", "invite", "accept", "join")))
+            or ("ablink." in u and "tidal" in u)  # CTA tracking genérico de Tidal
         )
 
     def _es_ablink_tidal(url: str) -> bool:
@@ -2987,8 +3872,11 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
             for href, inner_html in a_tags_full:
                 href = (href or "").strip()
                 inner_text = re.sub(r'<[^>]+>', '', inner_html or "").strip().lower()
-                if _es_enlace_invitacion(href):
+                if _es_enlace_invitacion(href) and not _es_ablink_tidal(href):
                     candidatos_fuertes.append(href)
+                    continue
+                if _es_enlace_invitacion(href) and _es_ablink_tidal(href):
+                    candidatos_ablink.append(href)
                     continue
                 # CTA "Join / Accept" cuyo href es ablink de tracking de Tidal
                 if _es_ablink_tidal(href) and any(jt in inner_text for jt in JOIN_TEXTS):
@@ -3001,7 +3889,7 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
             a_tags = re.findall(r'<a[^>]+href=["\'][^"\']+["\'][^>]*>([\s\S]*?)</a>', html_raw, re.I)
             for inner_html in a_tags:
                 inner_text = re.sub(r'<[^>]+>', '', inner_html).strip()
-                if _es_enlace_invitacion(inner_text):
+                if _es_enlace_invitacion(inner_text) and not _es_ablink_tidal(inner_text):
                     candidatos_fuertes.append(inner_text)
         except Exception:
             pass
@@ -3018,16 +3906,29 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
             pass
 
     for link in enlaces:
-        if _es_enlace_invitacion(link):
+        if _es_enlace_invitacion(link) and not _es_ablink_tidal(link):
             candidatos_fuertes.append(link)
         elif _es_ablink_tidal(link):
             candidatos_ablink.append(link)
 
+    def _rank_directa(u: str) -> tuple:
+        ul = u.lower()
+        if "login.tidal.com/family" in ul:
+            return (0, u)
+        if "account.tidal.com/family" in ul or "accept-invite" in ul:
+            return (1, u)
+        if "/accept" in ul or "/join" in ul:
+            return (2, u)
+        return (3, u)
+
     if candidatos_fuertes:
-        return candidatos_fuertes[0]
-    # Solo ablink si el correo ya pasó el filtro de keywords de invitación familiar
+        candidatos_fuertes.sort(key=_rank_directa)
+        elegido = candidatos_fuertes[0]
+        return elegido if _es_url_invitacion_directa(elegido) else _resolver_ablink_a_invitacion(elegido)
+
+    # Solo ablink: resolver a URL final antes de devolver (evita ERR_TUNNEL en Chrome+proxy)
     if candidatos_ablink:
-        return candidatos_ablink[0]
+        return _resolver_ablink_a_invitacion(candidatos_ablink[0])
     return None
 
 
@@ -4959,14 +5860,50 @@ def detectar_pantalla_antirobot(page) -> bool:
     try:
         if not page or page.is_closed():
             return False
-            
-        # Si algún campo de formulario ya está visible, la página NO está bloqueada
-        if _formulario_login_visible(page):
-            return False
+
+        patrones = [
+            "nos aseguramos de que", "nos dirigimos a usted", "no a un robot",
+            "desliza hacia la derecha",
+            "making sure you are not a robot", "not a robot", "slide to right",
+            "verify you are human", "confirmar que eres humano",
+            "access denied", "error code 1020", "unusual activity",
+            "bot detection", "acceso está restringido", "acceso restringido", "restringido temporalmente",
+            "comportamiento del navegador nos ha intrigado",
+            "something about your browser", "triggered this security",
+            "datadome", "cf-challenge", "just a moment",
+        ]
+
+        # PRIMERO el texto antibot: el interstitial de Tidal a veces deja inputs en el DOM
+        # y el early-return por formulario ocultaba el bloqueo (opción 4 no rotaba IP).
+        for frame in page.frames:
+            try:
+                body_text = frame.evaluate("() => document.body ? document.body.innerText : ''")
+                if body_text:
+                    body_text_lower = body_text.lower()
+                    for pat in patrones:
+                        if pat in body_text_lower:
+                            print(f"  [Anti-bot DEBUG] Detectado bloqueo/error de IP por patrón: '{pat}'")
+                            return True
+
+                    if re.search(
+                        r"403\s*ERROR|generated by cloudfront|request blocked|access denied|"
+                        r"error code 1020|ray id|not a robot|no a un robot",
+                        body_text,
+                        re.I,
+                    ):
+                        print("  [Anti-bot DEBUG] Detectado bloqueo por body text en frame")
+                        return True
+            except Exception:
+                continue
 
         try:
             titulo = page.title()
-            if re.search(r"403|request could not be satisfied|access denied|attention required|security|blocked|datadome", titulo, re.I):
+            if re.search(
+                r"403|request could not be satisfied|access denied|attention required|"
+                r"security|blocked|datadome|robot",
+                titulo,
+                re.I,
+            ):
                 print(f"  [Anti-bot DEBUG] Detectado por TITULO: '{titulo}'")
                 return True
         except Exception:
@@ -4977,30 +5914,9 @@ def detectar_pantalla_antirobot(page) -> bool:
             print("  [Anti-bot DEBUG] Detectado error genérico de login.tidal.com ('Algo salió mal')")
             return True
 
-        patrones = [
-            "nos aseguramos de que", "no a un robot", "desliza hacia la derecha",
-            "making sure you are not a robot", "not a robot", "slide to right",
-            "verify you are human", "confirmar que eres humano",
-            "access denied", "error code 1020", "unusual activity",
-            "bot detection", "acceso está restringido", "acceso restringido", "restringido temporalmente",
-            "comportamiento del navegador nos ha intrigado",
-        ]
-        
-        for frame in page.frames:
-            try:
-                body_text = frame.evaluate("() => document.body ? document.body.innerText : ''")
-                if body_text:
-                    body_text_lower = body_text.lower()
-                    for pat in patrones:
-                        if pat in body_text_lower:
-                            print(f"  [Anti-bot DEBUG] Detectado bloqueo/error de IP por patrón: '{pat}'")
-                            return True
-                    
-                    if re.search(r"403\s*ERROR|generated by cloudfront|request blocked|access denied|error code 1020|ray id", body_text, re.I):
-                        print(f"  [Anti-bot DEBUG] Detectado bloqueo por body text en frame")
-                        return True
-            except Exception:
-                continue
+        # Solo si NO hay señales de antibot: formulario visible ⇒ página usable
+        if _formulario_login_visible(page):
+            return False
     except Exception:
         pass
     return False
@@ -11632,6 +12548,8 @@ def restablecer_contrasenas_tidal(correos=None):
 
     success_count = 0
     fail_count = 0
+    ok_list: list[str] = []
+    fail_list: list[str] = []
 
     num_cuentas = len(correos_lista)
     print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para restablecimiento (Opción 9)...{Color.ENDC}")
@@ -11728,14 +12646,13 @@ def restablecer_contrasenas_tidal(correos=None):
 
     batch_size = 5
     total_cuentas = len(correos_lista)
-    if total_cuentas > 10:
-        n_oleadas = (total_cuentas + batch_size - 1) // batch_size
+    n_oleadas = max(1, (total_cuentas + batch_size - 1) // batch_size)
+    if total_cuentas > batch_size:
         print(f"\n{Color.CYAN}{Color.BOLD}[Opción 9] {total_cuentas} cuentas → {n_oleadas} oleadas "
-              f"de hasta {batch_size} (solo proxy PE)...{Color.ENDC}\n")
+              f"de hasta {batch_size} ventanas en simultáneo (solo proxy PE)...{Color.ENDC}\n")
     else:
-        print(f"\n{Color.CYAN}{Color.BOLD}Iniciando restablecimiento de {total_cuentas} cuentas "
-              f"en un solo lote (solo proxy PE)...{Color.ENDC}\n")
-        batch_size = max(1, total_cuentas)
+        print(f"\n{Color.CYAN}{Color.BOLD}[Opción 9] Restableciendo {total_cuentas} cuenta(s) "
+              f"(hasta {batch_size} ventanas en simultáneo, solo proxy PE)...{Color.ENDC}\n")
 
     for b_start in range(0, total_cuentas, batch_size):
         lote_correos = correos_lista[b_start : b_start + batch_size]
@@ -11748,11 +12665,10 @@ def restablecer_contrasenas_tidal(correos=None):
             "final": BarreraTolerante(num_cuentas_lote)
         }
 
-        workers = num_cuentas_lote
-        if total_cuentas > 10:
-            n_oleada = (b_start // batch_size) + 1
-            n_total_oleadas = (total_cuentas + batch_size - 1) // batch_size
-            print(f"\n{Color.BLUE}{Color.BOLD}=== Oleada {n_oleada}/{n_total_oleadas}: "
+        workers = min(batch_size, num_cuentas_lote)
+        n_oleada = (b_start // batch_size) + 1
+        if n_oleadas > 1:
+            print(f"\n{Color.BLUE}{Color.BOLD}=== Oleada {n_oleada}/{n_oleadas}: "
                   f"{num_cuentas_lote} cuenta(s) "
                   f"({b_start + 1}-{b_start + num_cuentas_lote} de {total_cuentas}) ==={Color.ENDC}")
             for c_o in lote_correos:
@@ -11797,14 +12713,18 @@ def restablecer_contrasenas_tidal(correos=None):
                     c, exito = future.result()
                     if exito:
                         success_count += 1
+                        ok_list.append(c)
                     else:
                         fail_count += 1
+                        fail_list.append(c)
                 except Exception as e:
                     print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
                     fail_count += 1
+                    fail_list.append(correo)
 
-        if total_cuentas > 10 and (b_start + batch_size) < total_cuentas:
-            print(f"  {Color.CYAN}[Opción 9] Oleada terminada. Pasando a la siguiente...{Color.ENDC}")
+        if n_oleada < n_oleadas:
+            print(f"  {Color.CYAN}[Opción 9] Oleada {n_oleada}/{n_oleadas} terminada. "
+                  f"Pasando a la siguiente...{Color.ENDC}")
             time.sleep(1.5)
     vivos = [t for t in inviter_threads if t.is_alive()]
     if vivos:
@@ -11821,6 +12741,19 @@ def restablecer_contrasenas_tidal(correos=None):
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f" Cuentas procesadas con éxito: {Color.GREEN}{success_count}{Color.ENDC}")
     print(f" Cuentas fallidas: {Color.FAIL}{fail_count}{Color.ENDC}")
+
+    if ok_list:
+        print(f"\n{Color.GREEN}{Color.BOLD}✓ Restablecidas OK:{Color.ENDC}")
+        for i, c in enumerate(ok_list, 1):
+            print(f"  {Color.GREEN}{i:2d}. {c}{Color.ENDC}")
+
+    if fail_list:
+        print(f"\n{Color.FAIL}{Color.BOLD}✗ Fallaron:{Color.ENDC}")
+        for i, c in enumerate(fail_list, 1):
+            print(f"  {Color.FAIL}{i:2d}. {c}{Color.ENDC}")
+    elif success_count > 0:
+        print(f"\n{Color.GREEN}✗ Ninguna cuenta falló.{Color.ENDC}")
+
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
     print(f"{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
 
@@ -16262,7 +17195,7 @@ def menu_principal():
         print(" 1. Obtener CÓDIGO DE REGISTRO (Welcome / Verification)")
         print(" 2. Obtener CÓDIGO DE ELIMINACIÓN (Delete Account)")
         print(" 3. Obtener CÓDIGO DE INICIO DE SESIÓN (Login Verification)")
-        print(" 4. Buscar y aceptar ENLACE DE INVITACIÓN (auto login/alta + OTP IMAP + cerrar Chrome)")
+        print(" 4. Aceptar ENLACE DE INVITACIÓN (IMAP / pegar links / linksextraidos.txt + auto + cerrar)")
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
         print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en el menú)")
         print(" 7. Salir")
@@ -16389,23 +17322,36 @@ def menu_principal():
             
         elif opcion == "4":
             print(f"\n{Color.CYAN}{Color.BOLD}=== PROCESANDO INVITACIONES FAMILIARES SIMULTÁNEAMENTE ==={Color.ENDC}")
-            # Asignación coordinada por buzón: N alias con puntos del mismo Gmail ya no
-            # compiten por el mismo UID (To: canónico) dejando 4/5 sin enlace.
-            print("  Buscando y asignando enlaces de invitación (coordinado por buzón Gmail)...")
             print("  Cuentas ya registradas: login con proxy PE (sesiones_imap_cuentas.txt o código IMAP).")
             print("  Cuentas aún sin registrar: alta automática con proxy NG (DOB + Suscríbete + OTP IMAP).")
             print("  Hasta 5 alias del mismo Gmail en paralelo sin mezclar códigos.")
-            enlaces_map = asignar_enlaces_invitacion_a_correos(correos)
+
+            enlaces_manual, origen_enlaces = pedir_fuente_enlaces_opcion4(correos)
+            if origen_enlaces == "imap":
+                # Asignación coordinada por buzón: N alias con puntos del mismo Gmail ya no
+                # compiten por el mismo UID (To: canónico) dejando 4/5 sin enlace.
+                print("  Buscando y asignando enlaces de invitación (coordinado por buzón Gmail)...")
+                enlaces_map = asignar_enlaces_invitacion_a_correos(correos)
+            else:
+                enlaces_map = dict(enlaces_manual or {})
+
             for c in correos:
                 e = enlaces_map.get(c)
                 if not e:
                     # claves pueden estar strip'eadas
-                    e = next((enlaces_map[k] for k in enlaces_map if k.strip().lower() == c.strip().lower()), None)
+                    e = next(
+                        (enlaces_map[k] for k in enlaces_map
+                         if k.strip().lower() == c.strip().lower()),
+                        None,
+                    )
                     if e:
                         enlaces_map[c] = e
                 if e:
                     preview = e if len(e) <= 90 else e[:90] + "..."
-                    print(f"    {Color.GREEN}[IMAP] Enlace asignado para {c}: {preview}{Color.ENDC}")
+                    etiqueta = "IMAP" if origen_enlaces == "imap" else (
+                        "Archivo" if origen_enlaces == "archivo" else "Manual"
+                    )
+                    print(f"    {Color.GREEN}[{etiqueta}] Enlace para {c}: {preview}{Color.ENDC}")
                     if buscar_contrasena_cuenta(c):
                         print(f"    {Color.GREEN}[Cuentas] Contraseña lista para auto-login de {c}.{Color.ENDC}")
                     else:
@@ -16413,9 +17359,22 @@ def menu_principal():
                               f"para {c} — si es cuenta nueva se hará el alta automática; "
                               f"si ya existe se usará código IMAP.{Color.ENDC}")
                 else:
-                    print(f"    {Color.FAIL}[IMAP] No se encontró invitación para {c}{Color.ENDC}")
+                    origen_msg = "IMAP" if origen_enlaces == "imap" else "fuente elegida"
+                    print(f"    {Color.FAIL}[{origen_msg}] No se encontró invitación para {c}{Color.ENDC}")
 
             enlaces_map = {c: enlaces_map[c] for c in correos if enlaces_map.get(c)}
+            # Anotar en linksextraidos.txt (también los hallados por IMAP)
+            if enlaces_map:
+                try:
+                    path_links = guardar_enlaces_en_linksextraidos(enlaces_map, merge=True)
+                    print(f"\n  {Color.CYAN}[Enlaces] Guardados/actualizados en {path_links}{Color.ENDC}")
+                except Exception as e_save:
+                    print(f"\n  {Color.WARNING}[Enlaces] No se pudo escribir "
+                          f"{LINKS_EXTRAIDOS_PATH.name}: {e_save}{Color.ENDC}")
+
+            sin_enlace = [c for c in correos if not enlaces_map.get(c)]
+            ok_list: list[str] = []
+            fail_list: list[str] = list(sin_enlace)  # sin invitación = pendiente/fallo
 
             if enlaces_map:
                 global valid_pe_list, CACHE_PROXIES_PE, valid_ng_list, CACHE_PROXIES_NG
@@ -16454,6 +17413,8 @@ def menu_principal():
                 if sin_pwd and not proxies_ng:
                     print(f"\n{Color.FAIL}[Error]{Color.ENDC} Hay cuentas sin registrar y no hay "
                           f"proxies de Nigeria. Valida con la opción 13.")
+                    fail_list.extend(list(enlaces_map.keys()))
+                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
                     print()
                     continue
 
@@ -16463,10 +17424,14 @@ def menu_principal():
                 if con_pwd and not proxies_pe:
                     print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y hay "
                           f"cuentas con login. Valida la lista con la opción 13.")
+                    fail_list.extend(list(enlaces_map.keys()))
+                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
                     print()
                     continue
                 if not proxies_pe and not proxies_ng:
                     print(f"\n{Color.FAIL}[Error]{Color.ENDC} Sin proxies PE ni NG. Abortando opción 4.")
+                    fail_list.extend(list(enlaces_map.keys()))
+                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
                     print()
                     continue
 
@@ -16483,9 +17448,13 @@ def menu_principal():
                           f"{min(tam_oleada, len(items))} en paralelo)...")
 
                 def procesar_invitacion_hilo(idx, item):
-                    if idx > 1:
-                        time.sleep((idx - 1) * random.uniform(1.5, 3.0))
                     correo, enlace = item
+                    # Más separación en altas NG: 5 ablink simultáneos → ERR_TUNNEL frecuente
+                    if buscar_contrasena_cuenta(correo):
+                        if idx > 1:
+                            time.sleep((idx - 1) * random.uniform(1.5, 3.0))
+                    else:
+                        time.sleep((idx - 1) * random.uniform(2.8, 4.5))
                     p_pe = None
                     p_ng = None
                     if buscar_contrasena_cuenta(correo):
@@ -16496,9 +17465,9 @@ def menu_principal():
                         p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico(espera_s=60.0)
                         if not p_ng and proxies_ng:
                             p_ng = proxies_ng[(idx - 1) % len(proxies_ng)]
-                    abrir_enlace_familia_con_autocierre(
+                    return correo, bool(abrir_enlace_familia_con_autocierre(
                         enlace, correo, proxy_pe=p_pe, proxy_ng=p_ng
-                    )
+                    ))
 
                 for n_oleada, oleada in enumerate(oleadas, 1):
                     if len(oleadas) > 1:
@@ -16508,21 +17477,30 @@ def menu_principal():
                             print(f"    • {correo_o}")
                     workers = min(tam_oleada, len(oleada))
                     with ThreadPoolExecutor(max_workers=workers) as executor:
-                        futures = [
-                            executor.submit(procesar_invitacion_hilo, idx + 1, item)
+                        futures = {
+                            executor.submit(procesar_invitacion_hilo, idx + 1, item): item[0]
                             for idx, item in enumerate(oleada)
-                        ]
+                        }
                         for future in as_completed(futures):
+                            correo_f = futures[future]
                             try:
-                                future.result()
+                                c_res, exito = future.result()
+                                if exito:
+                                    ok_list.append(c_res)
+                                else:
+                                    fail_list.append(c_res)
                             except Exception as ex_h:
-                                print(f"    {Color.FAIL}[ERROR] Excepción en invitación: {ex_h}{Color.ENDC}")
+                                fail_list.append(correo_f)
+                                print(f"    {Color.FAIL}[ERROR] Excepción en invitación "
+                                      f"de {correo_f}: {ex_h}{Color.ENDC}")
                     if n_oleada < len(oleadas):
                         print(f"  {Color.CYAN}[Opción 4] Oleada {n_oleada} terminada. "
                               f"Pasando a la siguiente...{Color.ENDC}")
                         time.sleep(1.5)
             else:
                 print(f"\n{Color.FAIL}>>> No se encontró ningún enlace de invitación en las cuentas activas. <<<\n")
+
+            _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
             print()
             
         elif opcion == "6":
