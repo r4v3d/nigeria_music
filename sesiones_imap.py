@@ -8,7 +8,6 @@ import time
 import imaplib
 import email
 import webbrowser
-import winreg
 import tempfile
 import subprocess
 import shutil
@@ -22,6 +21,11 @@ from pathlib import Path
 from email.header import decode_header
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import winreg  # solo Windows
+except ImportError:
+    winreg = None
 
 
 # Configurar salida estándar para UTF-8 en Windows
@@ -436,23 +440,24 @@ def guardar_csv_descarga_playwright(download, client_email: str) -> Path | None:
 
 def buscar_ruta_chrome():
     """Busca la ruta del ejecutable de Google Chrome en Windows."""
-    for hkey in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+    if winreg is not None:
+        for hkey in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hkey, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as key:
+                    path, _ = winreg.QueryValueEx(key, "")
+                    if os.path.exists(path):
+                        return path
+            except OSError:
+                pass
+                
         try:
-            with winreg.OpenKey(hkey, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as key:
-                path, _ = winreg.QueryValueEx(key, "")
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Clients\StartMenuInternet\Google Chrome\shell\open\command") as key:
+                raw_cmd, _ = winreg.QueryValueEx(key, "")
+                path = raw_cmd.strip('"')
                 if os.path.exists(path):
                     return path
         except OSError:
             pass
-            
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Clients\StartMenuInternet\Google Chrome\shell\open\command") as key:
-            raw_cmd, _ = winreg.QueryValueEx(key, "")
-            path = raw_cmd.strip('"')
-            if os.path.exists(path):
-                return path
-    except OSError:
-        pass
         
     rutas_por_defecto = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -490,11 +495,23 @@ def abrir_enlace_en_perfil_chrome(url: str, correo: str) -> None:
         webbrowser.open(url)
 
 def clean_email(email_str: str) -> str:
-    """Limpia espacios, caracteres especiales finales y convierte un correo a minúsculas."""
+    """Limpia espacios, invisibles Unicode y basura final; deja el correo en minúsculas.
+
+    Tidal a veces inserta U+200C (zero-width non-joiner) delante del correo en el DOM
+    ('\\u200cg.et.mushroom...'). Si ese string llega a imaplib.login(), falla con:
+    'ascii' codec can't encode character '\\u200c' — aunque la App Password sea correcta.
+    """
     if not email_str:
         return ""
+    email_str = str(email_str)
+    # Zero-width / BOM / soft hyphen / bidi marks que ensucian correos scrapados del DOM
+    email_str = re.sub(
+        r"[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060\ufeff\u00ad]",
+        "",
+        email_str,
+    )
     email_str = email_str.strip().lower()
-    email_str = re.sub(r'[\s.,]+$', '', email_str)
+    email_str = re.sub(r"[\s.,]+$", "", email_str)
     return email_str
 
 def _parse_linea_cuenta_sesiones(line: str) -> tuple[str, str] | None:
@@ -1650,6 +1667,7 @@ def abrir_enlace_familia_con_autocierre(
     correo: str,
     proxy_pe: dict | None = None,
     proxy_ng: dict | None = None,
+    headless: bool = False,
 ) -> bool:
     """Abre el enlace de invitación, completa login/alta + aceptación y cierra Chrome al éxito.
 
@@ -1707,18 +1725,11 @@ def abrir_enlace_familia_con_autocierre(
 
     print(f"    {Color.CYAN}[Navegador]{Color.ENDC} Iniciando automatización familiar ({correo}) "
           f"con proxy {proxy_tipo}"
-          f"{' (alta/registro Nigeria)' if proxy_tipo == 'NG' else ' (login/aceptar Perú)'}...")
+          f"{' (alta/registro Nigeria)' if proxy_tipo == 'NG' else ' (login/aceptar Perú)'}"
+          f"{' [headless]' if (headless or headless_forzado_por_entorno()) else ''}...")
 
     with sync_playwright() as p:
-        base_launch_kwargs = {
-            "user_data_dir": str(profile_dir),
-            "headless": False,
-            "args": list(CHROME_SILENT_ARGS),
-            "ignore_default_args": ["--enable-automation", "--no-sandbox"],
-            "viewport": {"width": 1280, "height": 800},
-            "locale": "es-ES",
-            "channel": "chrome"
-        }
+        base_launch_kwargs = kwargs_launch_persistent(profile_dir, headless=headless)
 
         def abrir_contexto(proxy, prof_dir, tipo: str):
             kwargs = dict(base_launch_kwargs)
@@ -2694,7 +2705,12 @@ def _imprimir_resumen_opcion4(
     print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
 
 
-def abrir_enlace_restablecimiento_con_autocierre(url: str, correo: str, proxy_pe: dict | None = None) -> bool:
+def abrir_enlace_restablecimiento_con_autocierre(
+    url: str,
+    correo: str,
+    proxy_pe: dict | None = None,
+    headless: bool = False,
+) -> bool:
     """Abre el enlace de restablecimiento, coloca la contraseña de sesiones_imap_cuentas.txt,
     envía el formulario y cierra Chrome al completar con éxito.
     """
@@ -2722,19 +2738,12 @@ def abrir_enlace_restablecimiento_con_autocierre(url: str, correo: str, proxy_pe
     profile_dir = Path(tempfile.gettempdir()) / f"tidal_reset_link_{email_safe}_{random.randint(1000, 9999)}"
     reparar_perfil_corrupto(profile_dir)
 
-    print(f"    {Color.CYAN}[Navegador]{Color.ENDC} Automatizando restablecimiento de contraseña ({correo})...")
+    print(f"    {Color.CYAN}[Navegador]{Color.ENDC} Automatizando restablecimiento de contraseña ({correo})"
+          f"{' [headless]' if (headless or headless_forzado_por_entorno()) else ''}...")
 
     success_detected = False
     with sync_playwright() as p:
-        base_launch_kwargs = {
-            "user_data_dir": str(profile_dir),
-            "headless": False,
-            "args": list(CHROME_SILENT_ARGS),
-            "ignore_default_args": ["--enable-automation", "--no-sandbox"],
-            "viewport": {"width": 1280, "height": 800},
-            "locale": "es-ES",
-            "channel": "chrome",
-        }
+        base_launch_kwargs = kwargs_launch_persistent(profile_dir, headless=headless)
 
         def abrir_contexto(proxy, prof_dir):
             kwargs = dict(base_launch_kwargs)
@@ -3142,8 +3151,10 @@ def obtener_credenciales_imap_reales(gmail_user_solicitado: str) -> tuple[str | 
         print(f"{Color.FAIL}[Error]{Color.ENDC} No se pudo leer 'passwords.txt': {e}")
         return None, None
     
-    # 1. Limpiar el correo solicitado (remover puntos del username de Gmail)
-    gmail_user_solicitado = gmail_user_solicitado.lower().strip()
+    # 1. Limpiar el correo solicitado (invisibles Unicode + puntos del username de Gmail)
+    gmail_user_solicitado = clean_email(gmail_user_solicitado)
+    if not gmail_user_solicitado or "@" not in gmail_user_solicitado:
+        return None, None
     if "@gmail.com" in gmail_user_solicitado:
         username, domain = gmail_user_solicitado.split("@", 1)
         solicitado_no_dots = username.replace(".", "") + "@" + domain
@@ -3231,6 +3242,13 @@ def sesion_imap(user_real: str, app_pwd: str):
     Garantiza además la limpieza: antes, si la búsqueda lanzaba una excepción, el logout no
     llegaba a ejecutarse porque no estaba en un finally y la conexión quedaba colgada.
     """
+    # Sanear usuario/clave: un U+200C al inicio tumba imaplib con error de codec ascii
+    # aunque la App Password sea correcta (síntoma: "No se pudo conectar por IMAP ... \\u200c").
+    user_real = clean_email(user_real) or (user_real or "").strip()
+    app_pwd = (app_pwd or "").strip().replace("\u200b", "").replace("\u200c", "").replace("\ufeff", "")
+    if not user_real or not app_pwd:
+        raise RuntimeError(f"Credenciales IMAP incompletas tras limpiar (user={user_real!r}).")
+
     if not hasattr(_IMAP_HILO, "conexiones"):
         _IMAP_HILO.conexiones = {}
         _IMAP_HILO.profundidad = 0
@@ -3628,6 +3646,23 @@ KEYWORDS_REGISTRO_CUENTA = [
     "registr", "bienven", "código", "codigo", "code",
     "verific", "sign-up", "signup", "sign up",
     "finish creating", "terminar de crear",
+]
+
+# Asunto real ES: "Restablecer tu contraseña Tidal" (sin "de").
+# Cuerpo: "...link para restaurar su contraseña" + https://login.tidal.com/resetpass/UUID
+KEYWORDS_RESTABLECER_PWD = [
+    "restablecer tu contraseña tidal",
+    "restablecer tu contraseña",
+    "restablecer tu contrasena tidal",
+    "restablecer tu contrasena",
+    "restablecer tu contraseña de tidal",  # variante antigua / EN-ES mixto
+    "restaurar su contraseña",
+    "restaurar su contrasena",
+    "resetting your tidal password",
+    "reset your tidal password",
+    "reset your password",
+    "link to reset your password",
+    "login.tidal.com/resetpass/",
 ]
 
 
@@ -4951,6 +4986,7 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             # (Antes estaba hardcodeado a 180s e ignoraba el parámetro max_age_minutes.)
             is_newer_id = (after_email_id == 0 or msg_id_int > after_email_id)
             is_recent_age = False
+            date_parsed = False
             try:
                 from email.utils import parsedate_to_datetime
                 date_str = msg.get("Date")
@@ -4958,6 +4994,7 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                     msg_date = parsedate_to_datetime(date_str)
                     now_tz = datetime.now(timezone.utc)
                     age_seconds = (now_tz - msg_date.astimezone(timezone.utc)).total_seconds()
+                    date_parsed = True
                     if age_seconds <= max_age_s:
                         is_recent_age = True
             except Exception:
@@ -4965,6 +5002,9 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 
             if not (is_newer_id or is_recent_age):
                 # Ignorar correos antiguos
+                continue
+            # Enlaces (reset/invite) sin baseline: exigir frescura real (reset caduca ~10 min)
+            if after_email_id == 0 and solo_link and date_parsed and not is_recent_age:
                 continue
             
             # Destinatario: con varios alias con puntos del mismo Gmail hay que atribuir el
@@ -5059,7 +5099,25 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             
             # Verificar keywords requeridas
             if required_keywords:
-                cumple = any(kw.lower() in text_to_check.lower() for kw in required_keywords)
+                text_l = text_to_check.lower()
+                cumple = any((kw or "").lower() in text_l for kw in required_keywords)
+                # Reset ES: asunto "Restablecer tu contraseña Tidal" (sin "de") + URL resetpass
+                if not cumple and solo_link:
+                    es_kw_reset = any(
+                        any(x in (kw or "").lower() for x in (
+                            "resetpass", "reset", "restablec", "restaurar", "password", "contrase",
+                        ))
+                        for kw in required_keywords
+                    )
+                    if es_kw_reset and (
+                        "login.tidal.com/resetpass/" in text_l
+                        or "restablecer tu contraseña" in text_l
+                        or "restablecer tu contrasena" in text_l
+                        or "restaurar su contraseña" in text_l
+                        or "restaurar su contrasena" in text_l
+                        or "resetting your tidal password" in text_l
+                    ):
+                        cumple = True
                 if not cumple:
                     continue
             
@@ -5079,6 +5137,16 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                     or "invit" in (kw or "").lower()
                     or "family" in (kw or "").lower()
                     for kw in (required_keywords or [])
+                )
+            )
+            es_busqueda_reset = bool(
+                required_keywords
+                and any(
+                    any(x in (kw or "").lower() for x in (
+                        "resetpass", "resetting your", "restablecer tu", "restaurar su",
+                        "link to reset", "reset your password",
+                    ))
+                    for kw in required_keywords
                 )
             )
             if es_busqueda_invitacion:
@@ -5226,8 +5294,8 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                     return link
             
             # Prioridad 2: Fallback a cualquier otro enlace dinámico de Tidal (incluyendo tracking click/ablink)
-            # En invitaciones NO usar este fallback (mezcla footers / otros mails).
-            if not es_busqueda_invitacion:
+            # En invitaciones/reset NO usar este fallback (mezcla footers / otros mails).
+            if not es_busqueda_invitacion and not es_busqueda_reset:
                 for link in enlaces:
                     link_lower = link.lower()
                     if any(x in link_lower for x in ["/privacy", "/terms", "/legal", "support.tidal.com", "tidal.com/es", "tidal.com/en", "tidal.com/us"]):
@@ -5399,6 +5467,49 @@ CHROME_SILENT_ARGS = [
     "--disable-notifications",
     "--disable-popup-blocking"
 ]
+
+
+def headless_forzado_por_entorno() -> bool:
+    """True si TIDAL_HEADLESS=1/true/yes (p. ej. servicio systemd en Contabo)."""
+    v = (os.environ.get("TIDAL_HEADLESS") or "").strip().lower()
+    return v in ("1", "true", "yes", "y", "si", "sí")
+
+
+def kwargs_launch_persistent(profile_dir, *, headless: bool = False) -> dict:
+    """Kwargs comunes para launch_persistent_context (PC Windows o VPS Linux headless)."""
+    usar_headless = bool(headless) or headless_forzado_por_entorno()
+    es_linux = sys.platform.startswith("linux")
+    args = list(CHROME_SILENT_ARGS)
+    # Contabo/VPS como root: Chromium EXIGE --no-sandbox. No meterlo en ignore_default_args.
+    ignore = ["--enable-automation"]
+    if usar_headless or es_linux:
+        for extra in (
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ):
+            if extra not in args:
+                args.append(extra)
+    else:
+        # Windows (histórico): no forzar el default de Playwright
+        ignore.append("--no-sandbox")
+
+    kwargs = {
+        "user_data_dir": str(profile_dir),
+        "headless": usar_headless,
+        "args": args,
+        "ignore_default_args": ignore,
+        "viewport": {"width": 1280, "height": 800},
+        "locale": "es-ES",
+    }
+    # Desactiva sandbox a nivel Playwright (root en Linux)
+    if usar_headless or es_linux:
+        kwargs["chromium_sandbox"] = False
+    # En Windows preferir Chrome instalado; en Linux/VPS usar Chromium de Playwright.
+    if sys.platform == "win32":
+        kwargs["channel"] = "chrome"
+    return kwargs
 
 # El proveedor de proxies residenciales deniega los dominios de pasarela de pago con
 # "503 Target host denied" (política antifraude). Como los campos de tarjeta de Tidal son iframes
@@ -10060,7 +10171,6 @@ class TidalResetPasswordManager:
             from playwright.sync_api import sync_playwright
             self.playwright = sync_playwright().start()
             
-        launch_args = list(CHROME_SILENT_ARGS)
         p_serv = self.proxy_pe_server
         if p_serv and not p_serv.startswith("http"):
             p_serv = "http://" + p_serv
@@ -10071,16 +10181,8 @@ class TidalResetPasswordManager:
             proxy_dict["password"] = self.proxy_pe_pass
         print(f"  [Proxy PE] [{self.client_email}] Usando proxy de PERÚ para el restablecimiento: {p_serv}")
             
-        launch_kwargs = {
-            "user_data_dir": str(self.main_profile),
-            "headless": self.headless,
-            "args": launch_args,
-            "ignore_default_args": ["--enable-automation", "--no-sandbox"],
-            "viewport": {"width": 1280, "height": 800},
-            "locale": "es-ES",
-            "proxy": proxy_dict,
-            "channel": "chrome"
-        }
+        launch_kwargs = kwargs_launch_persistent(self.main_profile, headless=self.headless)
+        launch_kwargs["proxy"] = proxy_dict
             
         try:
             self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -10088,6 +10190,9 @@ class TidalResetPasswordManager:
             print(f"  [Navegador] [WARN] Falló el lanzamiento: {e}. Reparando y reintentando...")
             reparar_perfil_corrupto(self.main_profile)
             time.sleep(2.0)
+            # Si falló por channel=chrome en Linux, reintentar sin channel
+            if "channel" in launch_kwargs:
+                launch_kwargs.pop("channel", None)
             self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
             
         self.context.set_default_navigation_timeout(60000)
@@ -10096,7 +10201,10 @@ class TidalResetPasswordManager:
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.client_email = self.client_email
         self.page.manager = self
-        self.page.bring_to_front()
+        try:
+            self.page.bring_to_front()
+        except Exception:
+            pass
 
     def _limpiar_overlays_reset(self) -> None:
         """Cookies + restos de overlay que interceptan el click en Continuar."""
@@ -10523,7 +10631,7 @@ class TidalResetPasswordManager:
                 print(f"  [Reset Pass] Intento {intento}/{_max_intentos_imap}: Buscando correo de cambio de contraseña...")
                 enlace_reset = obtener_codigo_via_imap(
                     gmail_user=self.client_email,
-                    required_keywords=["resetting your tidal password", "restablecer tu contraseña de tidal", "reset your password", "link to reset your password"],
+                    required_keywords=KEYWORDS_RESTABLECER_PWD,
                     query_exclude="invited to a tidal family",
                     after_email_id=reset_baseline_id,
                     max_age_minutes=15,
@@ -12511,40 +12619,83 @@ class TidalFamilyInviter:
             print("  [Inviter] Hilo de invitación finalizado y ventana de Chrome cerrada.")
 
 
-def restablecer_contrasenas_tidal(correos=None):
+def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None, interactive: bool = True):
+    """Restablece contraseñas (opción 9).
+
+    interactive=False: sin prompts (bot Telegram / VPS). headless=True por defecto en ese modo.
+    Devuelve dict con ok_list / fail_list / success_count / fail_count.
+    """
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   RESTABLECIMIENTO AUTOMÁTICO DE CONTRASEÑAS TIDAL{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+
+    def _pause_o_return(msg: str | None = None, *, error: str | None = None):
+        if msg:
+            print(msg)
+        if interactive:
+            input(">>> Presiona Enter para volver al menú principal <<<")
+        err = error or (msg or "Error en opción 9")
+        # Limpiar códigos ANSI del mensaje para Telegram
+        err_plain = re.sub(r"\x1b\[[0-9;]*m", "", str(err))
+        return {
+            "ok_list": [],
+            "fail_list": list(correos or []),
+            "success_count": 0,
+            "fail_count": len(correos or []),
+            "error": err_plain.strip()[:500],
+        }
     
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright  # noqa: F401
     except ImportError:
-        print(f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. Ejecute 'pip install playwright' e instale los navegadores con 'playwright install'.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        return _pause_o_return(
+            f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. "
+            f"Ejecute 'pip install playwright' e instale los navegadores con 'playwright install'."
+        )
 
     path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
     if not path_cuentas.exists():
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe en la carpeta actual.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        return _pause_o_return(
+            f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe "
+            f"en la carpeta actual."
+        )
         
     cuentas_map = cargar_mapa_cuentas_sesiones()
     if not cuentas_map:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        return _pause_o_return(
+            f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en "
+            f"'sesiones_imap_cuentas.txt' (formato: correo contraseña)."
+        )
 
     cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
     if cuentas_map is None:
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        if interactive:
+            input(">>> Presiona Enter para volver al menú principal <<<")
+        return {
+            "ok_list": [],
+            "fail_list": list(correos or []),
+            "success_count": 0,
+            "fail_count": len(correos or []),
+            "error": (
+                "Ningún correo del menú está en sesiones_imap_cuentas.txt "
+                "(hace falta: correo\\tcontraseña exactos)."
+            ),
+        }
         
     correos_lista = list(cuentas_map.keys())
     print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
-    headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
-    headless = headless_opt in ("s", "si", "yes", "y")
+    if headless is None:
+        if interactive:
+            headless_opt = input(
+                "\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): "
+            ).strip().lower()
+            headless = headless_opt in ("s", "si", "yes", "y")
+        else:
+            headless = True
+    headless = bool(headless) or headless_forzado_por_entorno()
+    if headless:
+        print(f"  {Color.CYAN}[Opción 9] Modo headless activado.{Color.ENDC}")
 
     success_count = 0
     fail_count = 0
@@ -12555,10 +12706,10 @@ def restablecer_contrasenas_tidal(correos=None):
     print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para restablecimiento (Opción 9)...{Color.ENDC}")
     valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas + 5)
     if not valid_pe_list:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige (solicitud y enlace de restablecimiento). "
-              f"Valida la lista con la opción 13 antes de continuar.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        return _pause_o_return(
+            f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige "
+            f"(solicitud y enlace de restablecimiento). Valida la lista con la opción 13 antes de continuar."
+        )
 
     inviter_threads: list[threading.Thread] = []
     # Invitar solo los correos procesados, cada uno al titular de su bloque en titular_familiar.txt
@@ -12756,6 +12907,12 @@ def restablecer_contrasenas_tidal(correos=None):
 
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
     print(f"{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+    return {
+        "ok_list": list(ok_list),
+        "fail_list": list(fail_list),
+        "success_count": success_count,
+        "fail_count": fail_count,
+    }
 
 
 TIEMPO_REVISION_MANUAL_S = 900
@@ -15342,8 +15499,9 @@ class TidalAutoLoginManager:
         correo = None
         try:
             correo = self.page.evaluate(r"""() => {
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const esEmail = (s) => /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test((s || '').trim());
+                const stripInv = (s) => (s || '').replace(/[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060\ufeff\u00ad]/g, '');
+                const norm = (s) => stripInv(s).replace(/\s+/g, ' ').trim().toLowerCase();
+                const esEmail = (s) => /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(stripInv(s || '').trim());
                 const labelsOk = new Set([
                     'correo electrónico', 'correo electronico', 'email address', 'e-mail', 'email'
                 ]);
@@ -15368,7 +15526,7 @@ class TidalAutoLoginManager:
                     const candidatos = [];
                     const pushEmails = (root) => {
                         if (!root) return;
-                        const t = (root.innerText || root.textContent || '');
+                        const t = stripInv(root.innerText || root.textContent || '');
                         for (const m of t.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || []) {
                             if (!m.toLowerCase().endsWith('@tidal.com')) candidatos.push(m.trim());
                         }
@@ -15382,12 +15540,12 @@ class TidalAutoLoginManager:
                         const k = c.toLowerCase();
                         if (vistos.has(k)) continue;
                         vistos.add(k);
-                        if (esEmail(c)) return c;
+                        if (esEmail(c)) return stripInv(c).trim();
                     }
                 }
 
                 // Fallback: sección "Información general" / "General information"
-                const body = document.body ? document.body.innerText : '';
+                const body = stripInv(document.body ? document.body.innerText : '');
                 const reSec = /informaci[oó]n\s+general|general\s+information/i;
                 const idx = body.search(reSec);
                 if (idx >= 0) {
@@ -15406,7 +15564,7 @@ class TidalAutoLoginManager:
             correo = None
 
         if correo:
-            correo = correo.strip()
+            correo = clean_email(correo)
             print(f"  [Perfil] [{self.client_email}] Correo electrónico registrado en perfil: "
                   f"{Color.CYAN}{correo}{Color.ENDC}")
             return correo
@@ -15443,8 +15601,8 @@ class TidalAutoLoginManager:
                 "No se pudo leer el 'Correo electrónico' del perfil. No se elimina la cuenta."
             )
 
-        self.correo_registrado_perfil = correo_perfil.strip().lower()
-        login_email = (self.client_email or "").strip().lower()
+        self.correo_registrado_perfil = clean_email(correo_perfil)
+        login_email = clean_email(self.client_email or "")
         if not correos_iguales_exacto(self.correo_registrado_perfil, login_email):
             print(f"  [Perfil] [{self.client_email}] Nombre de acceso/login: {login_email}")
             print(f"  [Perfil] [{self.client_email}] Correo registrado (destino del código): "
@@ -17259,17 +17417,22 @@ def menu_principal():
                 else:
                     print(f"    {Color.WARNING}[Cuentas] Sin contraseña anotada para {correo}. "
                           f"Añade 'correo\\tcontraseña' en sesiones_imap_cuentas.txt.{Color.ENDC}")
-                enlace = obtener_codigo_via_imap(
-                    gmail_user=correo,
-                    required_keywords=[
-                        "resetting your tidal password",
-                        "restablecer tu contraseña de tidal",
-                        "reset your password",
-                        "link to reset your password",
-                    ],
-                    query_exclude="cancel",
-                    solo_link=True,
-                )
+                enlace = None
+                for intento_imap in range(1, 6):
+                    enlace = obtener_codigo_via_imap(
+                        gmail_user=correo,
+                        required_keywords=KEYWORDS_RESTABLECER_PWD,
+                        query_exclude="cancel",
+                        solo_link=True,
+                        max_age_minutes=20,
+                        silencioso=(intento_imap > 1),
+                    )
+                    if enlace:
+                        break
+                    if intento_imap < 5:
+                        print(f"    {Color.WARNING}[IMAP] Sin enlace aún (intento "
+                              f"{intento_imap}/5). Reintentando...{Color.ENDC}")
+                        time.sleep(2.5)
                 if enlace:
                     preview = enlace if len(enlace) <= 90 else enlace[:90] + "..."
                     print(f"    {Color.GREEN}[IMAP] Enlace de restablecimiento: {preview}{Color.ENDC}")

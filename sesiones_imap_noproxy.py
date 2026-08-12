@@ -2777,6 +2777,22 @@ KEYWORDS_INVITACION_FAMILIAR = [
     "join their tidal family", "has invited you", "te ha invitado",
 ]
 
+# Asunto real ES: "Restablecer tu contraseña Tidal" (sin "de").
+KEYWORDS_RESTABLECER_PWD = [
+    "restablecer tu contraseña tidal",
+    "restablecer tu contraseña",
+    "restablecer tu contrasena tidal",
+    "restablecer tu contrasena",
+    "restablecer tu contraseña de tidal",
+    "restaurar su contraseña",
+    "restaurar su contrasena",
+    "resetting your tidal password",
+    "reset your tidal password",
+    "reset your password",
+    "link to reset your password",
+    "login.tidal.com/resetpass/",
+]
+
 
 def _extraer_cuerpo_y_html_msg(msg) -> tuple[str, str]:
     """Devuelve (texto_plano_aprox, html_crudo) del mensaje IMAP."""
@@ -3182,10 +3198,14 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No se encontraron correos de '{query_from}'.")
             return None
         
-        # Tomar los ultimos correos (mas recientes primero). El margen es amplio porque con
-        # 10 ventanas simultaneas el buzon recibe muchos correos de Tidal en paralelo y el de
-        # esta cuenta podria quedar fuera de una ventana corta.
-        msg_ids = messages[0].split()[-50:]
+        # Tomar los ultimos correos (mas recientes primero). Con buzones grandes / solo_link
+        # ampliar ventana (mismo criterio que sesiones_imap.py).
+        limite_msgs = 50
+        if solo_link or (max_age_minutes and int(max_age_minutes) >= 120):
+            limite_msgs = 400
+        if max_age_minutes and int(max_age_minutes) >= 1440:
+            limite_msgs = 500
+        msg_ids = messages[0].split()[-limite_msgs:]
         msg_ids.reverse()
         
         max_age_s = max(60, int((max_age_minutes or 15) * 60))
@@ -3206,6 +3226,7 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             # (Antes estaba hardcodeado a 180s e ignoraba el parámetro max_age_minutes.)
             is_newer_id = (after_email_id == 0 or msg_id_int > after_email_id)
             is_recent_age = False
+            date_parsed = False
             try:
                 from email.utils import parsedate_to_datetime
                 date_str = msg.get("Date")
@@ -3213,6 +3234,7 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                     msg_date = parsedate_to_datetime(date_str)
                     now_tz = datetime.now(timezone.utc)
                     age_seconds = (now_tz - msg_date.astimezone(timezone.utc)).total_seconds()
+                    date_parsed = True
                     if age_seconds <= max_age_s:
                         is_recent_age = True
             except Exception:
@@ -3220,6 +3242,8 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 
             if not (is_newer_id or is_recent_age):
                 # Ignorar correos antiguos
+                continue
+            if after_email_id == 0 and solo_link and date_parsed and not is_recent_age:
                 continue
             
             # Destinatario: exigir alias EXACTO cuando el mensaje menciona algún alias con puntos.
@@ -3314,7 +3338,24 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             
             # Verificar keywords requeridas
             if required_keywords:
-                cumple = any(kw.lower() in text_to_check.lower() for kw in required_keywords)
+                text_l = text_to_check.lower()
+                cumple = any((kw or "").lower() in text_l for kw in required_keywords)
+                if not cumple and solo_link:
+                    es_kw_reset = any(
+                        any(x in (kw or "").lower() for x in (
+                            "resetpass", "reset", "restablec", "restaurar", "password", "contrase",
+                        ))
+                        for kw in required_keywords
+                    )
+                    if es_kw_reset and (
+                        "login.tidal.com/resetpass/" in text_l
+                        or "restablecer tu contraseña" in text_l
+                        or "restablecer tu contrasena" in text_l
+                        or "restaurar su contraseña" in text_l
+                        or "restaurar su contrasena" in text_l
+                        or "resetting your tidal password" in text_l
+                    ):
+                        cumple = True
                 if not cumple:
                     continue
             
@@ -3421,15 +3462,26 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                         break
                     return link
             
-            # Prioridad 2: Fallback a cualquier otro enlace dinámico de Tidal (incluyendo tracking click/ablink)
-            for link in enlaces:
-                link_lower = link.lower()
-                if any(x in link_lower for x in ["/privacy", "/terms", "/legal", "support.tidal.com", "tidal.com/es", "tidal.com/en", "tidal.com/us"]):
-                    continue
-                if "tidal.com" in link_lower:
-                    if not _reclamar_uid_correo(buzon_clave, msg_id_int):
-                        break
-                    return link
+            # Prioridad 2: Fallback genérico Tidal (NO en búsquedas de reset: solo resetpass)
+            es_busqueda_reset = bool(
+                required_keywords
+                and any(
+                    any(x in (kw or "").lower() for x in (
+                        "resetpass", "resetting your", "restablecer tu", "restaurar su",
+                        "link to reset", "reset your password",
+                    ))
+                    for kw in required_keywords
+                )
+            )
+            if not es_busqueda_reset:
+                for link in enlaces:
+                    link_lower = link.lower()
+                    if any(x in link_lower for x in ["/privacy", "/terms", "/legal", "support.tidal.com", "tidal.com/es", "tidal.com/en", "tidal.com/us"]):
+                        continue
+                    if "tidal.com" in link_lower:
+                        if not _reclamar_uid_correo(buzon_clave, msg_id_int):
+                            break
+                        return link
         
     except Exception as e:
         print(f"    {Color.FAIL}[Error]{Color.ENDC} Error al interactuar con IMAP: {e}")
@@ -9167,7 +9219,7 @@ class TidalResetPasswordManager:
                 print(f"  [Reset Pass] Intento {intento}/{_max_intentos_imap}: Buscando correo de cambio de contraseña...")
                 enlace_reset = obtener_codigo_via_imap(
                     gmail_user=self.client_email,
-                    required_keywords=["resetting your tidal password", "restablecer tu contraseña de tidal", "reset your password", "link to reset your password"],
+                    required_keywords=KEYWORDS_RESTABLECER_PWD,
                     query_exclude="invited to a tidal family",
                     after_email_id=reset_baseline_id,
                     max_age_minutes=15,
@@ -16704,17 +16756,21 @@ def menu_principal():
                 else:
                     print(f"    {Color.WARNING}[Cuentas] Sin contraseña anotada para {correo}. "
                           f"Añade 'correo\\tcontraseña' en sesiones_imap_cuentas.txt.{Color.ENDC}")
-                enlace = obtener_codigo_via_imap(
-                    gmail_user=correo,
-                    required_keywords=[
-                        "resetting your tidal password",
-                        "restablecer tu contraseña de tidal",
-                        "reset your password",
-                        "link to reset your password",
-                    ],
-                    query_exclude="cancel",
-                    solo_link=True,
-                )
+                enlace = None
+                for intento_imap in range(1, 6):
+                    enlace = obtener_codigo_via_imap(
+                        gmail_user=correo,
+                        required_keywords=KEYWORDS_RESTABLECER_PWD,
+                        query_exclude="cancel",
+                        solo_link=True,
+                        max_age_minutes=20,
+                    )
+                    if enlace:
+                        break
+                    if intento_imap < 5:
+                        print(f"    {Color.WARNING}[IMAP] Sin enlace aún (intento "
+                              f"{intento_imap}/5). Reintentando...{Color.ENDC}")
+                        time.sleep(2.5)
                 if enlace:
                     preview = enlace if len(enlace) <= 90 else enlace[:90] + "..."
                     print(f"    {Color.GREEN}[IMAP] Enlace de restablecimiento: {preview}{Color.ENDC}")
