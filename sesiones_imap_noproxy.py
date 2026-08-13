@@ -3205,6 +3205,88 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
     return asignados
 
 
+def _imap_since_str(max_age_minutes: int | None) -> str:
+    """Fecha IMAP SINCE en inglés (strftime %b depende del locale y Gmail la rechaza)."""
+    from datetime import datetime, timedelta, timezone
+    mins = max(15, int(max_age_minutes or 15))
+    dt = datetime.now(timezone.utc) - timedelta(minutes=mins, days=1)
+    meses = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    return f"{dt.day:02d}-{meses[dt.month - 1]}-{dt.year}"
+
+
+def _imap_aliases_to_dirigido(aliases_ok: list[str], user_real: str) -> list[str]:
+    """Aliases cuyo To: se puede buscar en el servidor (dominio catch-all, no Gmail)."""
+    out: list[str] = []
+    vistos: set[str] = set()
+    for a in aliases_ok or []:
+        a = (a or "").strip().lower()
+        if not a or "@" not in a or a in vistos:
+            continue
+        dom = a.split("@", 1)[1]
+        if "gmail.com" in dom or "googlemail.com" in dom:
+            continue
+        vistos.add(a)
+        out.append(a)
+    return out
+
+
+def _imap_uid_search(
+    mail,
+    query_from: str,
+    aliases_ok: list[str],
+    user_real: str,
+    after_email_id: int = 0,
+    max_age_minutes: int = 15,
+) -> tuple[list, bool]:
+    """UIDs de Tidal. dirigido=True si filtró por To: del alias catch-all."""
+    query_from = (query_from or "tidal").strip() or "tidal"
+    since = _imap_since_str(max_age_minutes)
+    after = int(after_email_id or 0)
+    dirigidos = _imap_aliases_to_dirigido(aliases_ok, user_real)
+
+    def _try(*parts):
+        try:
+            status, messages = mail.uid("search", None, *parts)
+            if status == "OK" and messages and messages[0]:
+                return messages[0].split()
+        except Exception:
+            return None
+        return None
+
+    newer = "newer_than:1d"
+    if max_age_minutes and int(max_age_minutes) >= 1440:
+        newer = "newer_than:7d"
+    elif max_age_minutes and int(max_age_minutes) >= 120:
+        newer = "newer_than:2d"
+
+    for alias in dirigidos[:8]:
+        uids = _try("X-GM-RAW", f"from:{query_from} to:{alias} {newer}")
+        if uids:
+            return uids, True
+        uids = _try(f'(FROM "{query_from}" TO "{alias}" SINCE {since})')
+        if uids:
+            return uids, True
+        uids = _try(f'(FROM "{query_from}" TO "{alias}")')
+        if uids:
+            return uids, True
+
+    if after > 0:
+        uids = _try(f'(UID {after + 1}:* FROM "{query_from}" SINCE {since})')
+        if uids:
+            return uids, False
+        uids = _try(f'(UID {after + 1}:* FROM "{query_from}")')
+        if uids:
+            return uids, False
+    uids = _try(f'(FROM "{query_from}" SINCE {since})')
+    if uids:
+        return uids, False
+    uids = _try(f'(FROM "{query_from}")')
+    if uids:
+        return uids, False
+    return [], False
+
+
 def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_password=None, 
                              query_from="tidal", required_keywords=None, query_exclude=None, 
                              max_age_minutes=15, after_email_id=0, solo_link=False,
@@ -3240,34 +3322,36 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
     # el cierre queda garantizado igualmente al salir de la función.
     stack = contextlib.ExitStack()
     try:
-        print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Consultando {_servidor_imap_para(user_real)} ({user_real})...")
+        alias_hint = aliases_ok[0] if aliases_ok else gmail_user
+        print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Consultando {_servidor_imap_para(user_real)} "
+              f"({user_real}) por {alias_hint}...")
         mail = stack.enter_context(sesion_imap(user_real, app_pwd))
 
-        # Buscar correos recientes del remitente (por UID estable, no por número de secuencia).
-        # Si hay baseline, pedir solo UIDs posteriores: menos FETCH bajo el semáforo y menos
-        # oportunidades de que otro hilo reclame antes de que leamos el nuestro.
-        if after_email_id and int(after_email_id) > 0:
-            search_criteria = f'(UID {int(after_email_id) + 1}:* FROM "{query_from}")'
-        else:
-            search_criteria = f'(FROM "{query_from}")'
-        status, messages = mail.uid("search", None, search_criteria)
-        if status != "OK" or not messages or not messages[0]:
-            # Fallback si el servidor no acepta UID en SEARCH combinado
-            if after_email_id and int(after_email_id) > 0:
-                status, messages = mail.uid("search", None, f'(FROM "{query_from}")')
-        if status != "OK" or not messages or not messages[0]:
+        # Catch-all: buscar por To: del alias (Gmail X-GM-RAW / TO) + SINCE.
+        msg_ids, dirigido = _imap_uid_search(
+            mail, query_from, aliases_ok, user_real,
+            after_email_id=after_email_id, max_age_minutes=max_age_minutes,
+        )
+        if not msg_ids:
             print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No se encontraron correos de '{query_from}'.")
             return None
-        
-        # Tomar los ultimos correos (mas recientes primero). Con buzones grandes / solo_link
-        # ampliar ventana (mismo criterio que sesiones_imap.py).
-        limite_msgs = 50
-        if solo_link or (max_age_minutes and int(max_age_minutes) >= 120):
-            limite_msgs = 400
-        if max_age_minutes and int(max_age_minutes) >= 1440:
-            limite_msgs = 500
-        msg_ids = messages[0].split()[-limite_msgs:]
+
+        limite_msgs = 20 if dirigido else 50
+        if dirigido:
+            if solo_link or (max_age_minutes and int(max_age_minutes) >= 120):
+                limite_msgs = 80
+        else:
+            if solo_link or (max_age_minutes and int(max_age_minutes) >= 120):
+                limite_msgs = 400
+            if max_age_minutes and int(max_age_minutes) >= 1440:
+                limite_msgs = 500
+        msg_ids = msg_ids[-limite_msgs:]
         msg_ids.reverse()
+        if dirigido and aliases_ok:
+            filtro = f"to:{aliases_ok[0]}"
+        else:
+            filtro = f"from:{query_from} reciente"
+        print(f"    {Color.CYAN}[IMAP]{Color.ENDC} {len(msg_ids)} mensaje(s) ({filtro})...")
         
         max_age_s = max(60, int((max_age_minutes or 15) * 60))
         for msg_id in msg_ids:
