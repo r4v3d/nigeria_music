@@ -3503,6 +3503,22 @@ def _reclamar_uid_correo(buzon_clave: str, uid: int) -> bool:
         return True
 
 
+def _headers_destinatario(msg) -> str:
+    """To/Cc/Received/X-Forwarded: Cloudflare deja el alias original fuera del sobre IMAP."""
+    keys = (
+        "To", "Cc", "Delivered-To", "Envelope-To", "X-Original-To",
+        "X-Forwarded-To", "X-Forwarded-For", "Resent-To", "Apparently-To",
+        "X-Google-Original-To", "Received",
+    )
+    partes: list[str] = []
+    for k in keys:
+        vals = msg.get_all(k) if hasattr(msg, "get_all") else [msg.get(k)]
+        for v in vals or []:
+            if v:
+                partes.append(str(v))
+    return " ".join(partes).lower()
+
+
 def _destinatario_es_para_alias(
     gmail_user: str,
     recipients_text: str,
@@ -4757,7 +4773,7 @@ def reclamar_otp_registro_para_alias(
         return obtener_codigo_via_imap(
             gmail_user=alias,
             required_keywords=KEYWORDS_REGISTRO_CUENTA,
-            query_exclude="cancel",
+            query_exclude=EXCLUDE_OTP_GENERICO,
             after_email_id=after_email_id,
             max_age_minutes=max_age_minutes,
             aliases_solo=[alias],
@@ -4771,6 +4787,11 @@ KEYWORDS_LOGIN_ACCESO = [
     "sign-in code", "signin code", "login code", "código de acceso", "codigo de acceso",
     "código de inicio", "codigo de inicio", "access code", "verification code",
     "código", "codigo", "code", "inici",
+]
+
+# No usar "cancel" suelto: el pie de Tidal / unsubscribe lo contiene y se descartaba el OTP.
+EXCLUDE_OTP_GENERICO = [
+    "invitation cancelled", "invitación cancelada", "family invitation cancel",
 ]
 
 
@@ -4788,7 +4809,7 @@ def reclamar_otp_login_para_alias(
         return obtener_codigo_via_imap(
             gmail_user=alias,
             required_keywords=KEYWORDS_LOGIN_ACCESO,
-            query_exclude="cancel",
+            query_exclude=EXCLUDE_OTP_GENERICO,
             after_email_id=after_email_id,
             max_age_minutes=max_age_minutes,
             aliases_solo=[alias],
@@ -4987,7 +5008,8 @@ def _imap_uid_search(
     after_email_id: int = 0,
     max_age_minutes: int = 15,
 ) -> tuple[list, bool]:
-    """UIDs de Tidal. dirigido=True si filtró por To: del alias catch-all."""
+    """UIDs de Tidal. Nunca se queda solo con to:alias: Gmail no indexa el To: del catch-all
+    (el sobre es el Gmail destino) y X-GM-RAW puede ir atrasado respecto al INBOX."""
     query_from = (query_from or "tidal").strip() or "tidal"
     since = _imap_since_str(max_age_minutes)
     after = int(after_email_id or 0)
@@ -5002,37 +5024,47 @@ def _imap_uid_search(
             return None
         return None
 
+    def _unir(*listas):
+        vistos: set = set()
+        out: list = []
+        for lista in listas:
+            for uid in lista or []:
+                if uid not in vistos:
+                    vistos.add(uid)
+                    out.append(uid)
+        return out
+
     newer = "newer_than:1d"
     if max_age_minutes and int(max_age_minutes) >= 1440:
         newer = "newer_than:7d"
     elif max_age_minutes and int(max_age_minutes) >= 120:
         newer = "newer_than:2d"
 
-    for alias in dirigidos[:8]:
-        uids = _try("X-GM-RAW", f"from:{query_from} to:{alias} {newer}")
-        if uids:
-            return uids, True
-        uids = _try(f'(FROM "{query_from}" TO "{alias}" SINCE {since})')
-        if uids:
-            return uids, True
-        uids = _try(f'(FROM "{query_from}" TO "{alias}")')
-        if uids:
-            return uids, True
-
+    recientes: list = []
     if after > 0:
-        uids = _try(f'(UID {after + 1}:* FROM "{query_from}" SINCE {since})')
-        if uids:
-            return uids, False
-        uids = _try(f'(UID {after + 1}:* FROM "{query_from}")')
-        if uids:
-            return uids, False
-    uids = _try(f'(FROM "{query_from}" SINCE {since})')
-    if uids:
-        return uids, False
-    uids = _try(f'(FROM "{query_from}")')
-    if uids:
-        return uids, False
-    return [], False
+        recientes = _try(f'(UID {after + 1}:* FROM "{query_from}" SINCE {since})') or []
+        if not recientes:
+            recientes = _try(f'(UID {after + 1}:* FROM "{query_from}")') or []
+    if not recientes:
+        recientes = _try(f'(FROM "{query_from}" SINCE {since})') or []
+    if not recientes:
+        recientes = _try(f'(FROM "{query_from}")') or []
+    if not recientes:
+        recientes = _try("X-GM-RAW", f"{newer} (from:tidal OR subject:tidal OR tidal)") or []
+
+    extra: list = []
+    for alias in dirigidos[:8]:
+        extra = _unir(
+            extra,
+            _try("X-GM-RAW", f'from:{query_from} to:"{alias}" {newer}'),
+            _try("X-GM-RAW", f'to:"{alias}" {newer} (from:tidal OR tidal)'),
+        )
+
+    if extra:
+        # El correo recién llegado puede no estar aún en el índice to:alias.
+        cola = recientes[-20:] if recientes else []
+        return _unir(extra, cola), True
+    return recientes, False
 
 
 def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_password=None, 
@@ -5096,15 +5128,13 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No se encontraron correos de '{query_from}'.")
             return None
 
-        limite_msgs = 20 if dirigido else 50
+        limite_msgs = 50
         if dirigido:
-            if solo_link or (max_age_minutes and int(max_age_minutes) >= 120):
-                limite_msgs = 80
-        else:
-            if solo_link or (max_age_minutes and int(max_age_minutes) >= 120):
-                limite_msgs = 400
-            if max_age_minutes and int(max_age_minutes) >= 1440:
-                limite_msgs = 500
+            limite_msgs = 80
+        if solo_link or (max_age_minutes and int(max_age_minutes) >= 120):
+            limite_msgs = 400
+        if max_age_minutes and int(max_age_minutes) >= 1440:
+            limite_msgs = 500
         msg_ids = msg_ids[-limite_msgs:]
         msg_ids.reverse()
         if not silencioso:
@@ -5160,7 +5190,9 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             envelope_to = (msg.get("Envelope-To") or "").lower()
             x_original = (msg.get("X-Original-To") or "").lower()
             x_forwarded = (msg.get("X-Forwarded-To") or "").lower()
-            recipients = f"{to_header} {delivered_to} {envelope_to} {x_original} {x_forwarded}"
+            recipients = _headers_destinatario(msg) or (
+                f"{to_header} {delivered_to} {envelope_to} {x_original} {x_forwarded}"
+            )
 
             # El cuerpo se mira después; aquí solo headers. Si no hay match por headers aún
             # no descartamos del todo hasta tener body (por si el alias solo aparece ahí).
@@ -5455,6 +5487,9 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
         print(f"    {Color.FAIL}[Error]{Color.ENDC} Error al interactuar con IMAP: {e}")
     finally:
         stack.close()
+    if not silencioso:
+        print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Sin OTP usable para {aliases_ok[0] if aliases_ok else gmail_user}. "
+              f"Si ya está en Gmail, mira Spam / Promociones (el catch-all a veces cae ahí).")
     return None
 # --- CONSTANTES Y CONFIGURACIONES DE AUTOMATIZACIÓN (PLAYWRIGHT & PROXIES) ---
 STEALTH_SCRIPT = """
@@ -13355,7 +13390,7 @@ class TidalAutoLoginManager:
             codigo = obtener_codigo_via_imap(
                 gmail_user=self.client_email,
                 required_keywords=["código", "code", "inici"],
-                query_exclude="cancel",
+                query_exclude=EXCLUDE_OTP_GENERICO,
                 after_email_id=base_email_id
             )
             if codigo:
@@ -17532,7 +17567,7 @@ def menu_principal():
                     codigo = obtener_codigo_via_imap(
                         gmail_user=correo,
                         required_keywords=["registr", "bienven", "código", "code", "verific"],
-                        query_exclude="cancel"
+                        query_exclude=EXCLUDE_OTP_GENERICO
                     )
                     if codigo:
                         print(f"{Color.GREEN}{Color.BOLD}>>> CÓDIGO ENCONTRADO: {codigo} <<<{Color.ENDC}")
@@ -17553,7 +17588,7 @@ def menu_principal():
                     codigo = obtener_codigo_via_imap(
                         gmail_user=correo,
                         required_keywords=["código", "code", "inici"],
-                        query_exclude="cancel"
+                        query_exclude=EXCLUDE_OTP_GENERICO
                     )
                     if codigo:
                         print(f"{Color.GREEN}{Color.BOLD}>>> CÓDIGO ENCONTRADO: {codigo} <<<{Color.ENDC}")
