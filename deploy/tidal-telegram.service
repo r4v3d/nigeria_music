@@ -1,0 +1,23 @@
+[Unit]
+Description=Tidal sesiones_imap Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tidal-nigeria
+EnvironmentFile=-/opt/tidal-nigeria/.env
+Environment=PYTHONUNBUFFERED=1
+# Forzar Chrome con ventana (Xvfb). Ignora TIDAL_HEADLESS=1 viejo del .env
+Environment=TIDAL_HEADLESS=0
+# Chrome con ventana (vía Xvfb): más estable que Playwright headless en Contabo
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1280x720x24" /opt/tidal-nigeria/.venv/bin/python /opt/tidal-nigeria/telegram_bot.py
+Restart=on-failure
+RestartSec=8
+
+# Contabo: Chromium a veces necesita más memoria de mapa
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -25,6 +25,7 @@ sesiones_imap_cuentas.txt
 *.env
 .env
 .env.*
+!.env.example
 
 # Session cookies / progress
 tmm_cookies.json

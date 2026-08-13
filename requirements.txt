@@ -1,3 +1,7 @@
+# Telegram bot + automation
+python-telegram-bot>=21.0
 playwright>=1.49.0
-pywinauto>=0.6.8
-requests
+requests>=2.31.0
+
+# Windows-only helper (opcional; en Contabo Linux no hace falta)
+# pywinauto>=0.6.8

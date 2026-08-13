@@ -2260,8 +2260,67 @@ def abrir_enlace_restablecimiento_con_autocierre(url: str, correo: str, proxy_pe
 
     return success_detected
 
+
+# Catch-all Cloudflare Email Routing: el alias @dominio llega a un Gmail real (IMAP).
+# Se puede ampliar/cambiar en passwords.txt:
+#   imap_forward_cheapmusic.best=otro@gmail.com
+_FORWARD_IMAP_DEFAULT = {
+    "cheapmusic.best": "cakeseller1234@gmail.com",
+}
+
+
+def _pares_passwords_txt() -> list[tuple[str, str]]:
+    pwd_file = SCRIPT_DIR / "passwords.txt"
+    if not pwd_file.exists():
+        return []
+    try:
+        lines = pwd_file.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    pares: list[tuple[str, str]] = []
+    for line in lines:
+        raw = (line or "").strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, val = raw.split("=", 1)
+        pares.append((key.strip().lower(), val.strip().strip('"').strip("'")))
+    return pares
+
+
+def _mapa_dominios_forward_imap() -> dict[str, str]:
+    """Dominio catch-all → Gmail IMAP. passwords.txt pisa el default."""
+    mapa = dict(_FORWARD_IMAP_DEFAULT)
+    for key, val in _pares_passwords_txt():
+        if not val or "@" not in val:
+            continue
+        dominio = ""
+        if key.startswith("imap_forward_domain_"):
+            dominio = key[len("imap_forward_domain_"):].strip()
+        elif key.startswith("imap_forward_"):
+            dominio = key[len("imap_forward_"):].strip()
+        else:
+            continue
+        dominio = dominio.lstrip("@").lower()
+        if dominio:
+            mapa[dominio] = val.strip().lower()
+    return mapa
+
+
+def destino_imap_de_alias(correo: str) -> str:
+    """Si el dominio tiene catch-all, el Gmail real; si no, el propio correo."""
+    correo = (correo or "").strip().lower()
+    if "@" not in correo:
+        return correo
+    _, dom = correo.split("@", 1)
+    return _mapa_dominios_forward_imap().get(dom.lower()) or correo
+
+
 def obtener_credenciales_imap_reales(gmail_user_solicitado: str) -> tuple[str | None, str | None]:
-    """Busca en passwords.txt el usuario real de IMAP y su App Password."""
+    """Busca en passwords.txt el usuario real de IMAP y su App Password.
+
+    Alias de dominio catch-all (p. ej. titular-0003@cheapmusic.best) se resuelven
+    al Gmail de destino (cakeseller1234@gmail.com o imap_forward_<dominio>=).
+    """
     pwd_file = SCRIPT_DIR / "passwords.txt"
     if not pwd_file.exists():
         print(f"{Color.FAIL}[Error]{Color.ENDC} No se encuentra el archivo 'passwords.txt' en {pwd_file}.")
@@ -2275,6 +2334,8 @@ def obtener_credenciales_imap_reales(gmail_user_solicitado: str) -> tuple[str | 
     
     # 1. Limpiar el correo solicitado (remover puntos del username de Gmail)
     gmail_user_solicitado = gmail_user_solicitado.lower().strip()
+    if gmail_user_solicitado:
+        gmail_user_solicitado = destino_imap_de_alias(gmail_user_solicitado)
     if "@gmail.com" in gmail_user_solicitado:
         username, domain = gmail_user_solicitado.split("@", 1)
         solicitado_no_dots = username.replace(".", "") + "@" + domain
@@ -2437,7 +2498,7 @@ _IMAP_REGISTRO_LOCKS_GUARD = threading.Lock()
 
 
 def _lock_registro_mismo_buzon(gmail_user: str) -> threading.Lock:
-    clave = _norm_dots_gmail(gmail_user)
+    clave = _norm_dots_gmail(destino_imap_de_alias(gmail_user))
     with _IMAP_REGISTRO_LOCKS_GUARD:
         lock = _IMAP_REGISTRO_LOCKS.get(clave)
         if lock is None:
@@ -2572,7 +2633,7 @@ def _norm_dots_gmail(correo: str) -> str:
 
 
 def _buzon_imap_clave(gmail_user: str, user_real: str | None = None) -> str:
-    return _norm_dots_gmail(user_real or gmail_user)
+    return _norm_dots_gmail(user_real or destino_imap_de_alias(gmail_user))
 
 
 def _reclamar_uid_correo(buzon_clave: str, uid: int) -> bool:
@@ -16325,7 +16386,7 @@ def tiene_contrasena_imap_registrada(gmail_user_solicitado: str) -> bool:
     except Exception:
         return False
     
-    gmail_user_solicitado = gmail_user_solicitado.lower().strip()
+    gmail_user_solicitado = destino_imap_de_alias((gmail_user_solicitado or "").lower().strip())
     if "@gmail.com" in gmail_user_solicitado:
         username, domain = gmail_user_solicitado.split("@", 1)
         solicitado_no_dots = username.replace(".", "") + "@" + domain
@@ -16387,12 +16448,22 @@ def verificar_contrasenas_imap_opcion12(correos: list[str]):
         return
 
     faltantes = []
+    forwards: dict[str, str] = {}
     
     for correo in correos:
+        correo_l = (correo or "").strip().lower()
+        dest = destino_imap_de_alias(correo_l)
+        if dest != correo_l and "@" in correo_l:
+            forwards[correo_l.split("@", 1)[1]] = dest
         if not tiene_contrasena_imap_registrada(correo):
             correo_limpio = remover_puntos_correo(correo)
             if correo_limpio not in faltantes:
                 faltantes.append(correo_limpio)
+
+    if forwards:
+        print(f"\n{Color.CYAN}Catch-all (Cloudflare Email Routing):{Color.ENDC}")
+        for dom, dest in sorted(forwards.items()):
+            print(f"  @{dom} → IMAP {dest}")
             
     if not faltantes:
         print(f"\n{Color.GREEN}{Color.BOLD}>>> TODO ESTÁ CORRECTO: Todos los correos tienen su contraseña IMAP registrada. <<<{Color.ENDC}\n")
