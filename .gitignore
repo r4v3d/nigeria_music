@@ -55,6 +55,9 @@ tmm_body.html
 # Local notes / process media (optional private)
 PASOS DEL PROCESO/
 
+# Cloudflare Wrangler local cache / miniflare (account + KV state)
+.wrangler/
+
 # Environment / IDE / scratch
 .vscode/
 .idea/

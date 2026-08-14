@@ -1386,6 +1386,72 @@ def _invite_pulsar_continuar_o_login(page) -> bool:
     return False
 
 
+def _invite_arrancar_prefetch_otp(estado: dict, correo: str, *, es_alta: bool) -> None:
+    """Empieza a pedir el OTP al worker en cuanto Tidal manda el mail (no espera a la UI)."""
+    if estado.get("_otp_prefetch_started"):
+        return
+    try:
+        from otp_worker_client import worker_cubre_alias, esperar_desde_worker
+        if not worker_cubre_alias(correo):
+            return
+    except Exception:
+        return
+    estado["_otp_prefetch_started"] = True
+    estado["_otp_prefetch_done"] = False
+    estado["otp_prefetch"] = None
+    kind = "register" if es_alta else "login"
+    gen = int(estado.get("_otp_gen") or 0)
+
+    def _run():
+        try:
+            val = esperar_desde_worker(
+                correo, kind,
+                max_wait_s=20.0,
+                interval_s=0.18,
+                after_email_id=0,
+                max_age_minutes=12,
+                silencioso=True,
+            )
+            if int(estado.get("_otp_gen") or 0) == gen:
+                estado["otp_prefetch"] = val
+        except Exception:
+            if int(estado.get("_otp_gen") or 0) == gen:
+                estado["otp_prefetch"] = None
+        if int(estado.get("_otp_gen") or 0) == gen:
+            estado["_otp_prefetch_done"] = True
+
+    threading.Thread(target=_run, daemon=True, name=f"otp-prefetch-{correo}").start()
+
+
+def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 8.0) -> str | None:
+    """Usa el prefetch si ya llegó; si no, sondea el worker cada ~0.12 s.
+
+    No usa after_email_id (el dummy IMAP=1 excluía el código que ya estaba en KV).
+    Tampoco lanza un segundo wait largo que compita con el prefetch y luego pulse Resend.
+    """
+    _invite_arrancar_prefetch_otp(estado, correo, es_alta=es_alta)
+    t0 = time.time()
+    while time.time() - t0 < max_wait_s:
+        codigo = estado.get("otp_prefetch")
+        if codigo:
+            return str(codigo)
+        time.sleep(0.12)
+    codigo = estado.get("otp_prefetch")
+    if codigo:
+        return str(codigo)
+    try:
+        from otp_worker_client import reclamar_desde_worker
+        kind = "register" if es_alta else "login"
+        return reclamar_desde_worker(
+            correo, kind,
+            max_age_minutes=12,
+            after_email_id=0,
+            silencioso=False,
+        )
+    except Exception:
+        return None
+
+
 def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dict) -> str:
     """Avanza un paso del login/alta en la invitación.
 
@@ -1446,7 +1512,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 estado["suscribete_pulsado"] = True
                 estado["reintentar_suscribete"] = False
                 estado["codigo_intentado"] = False  # permitir OTP de registro
-                time.sleep(0.8)
+                _invite_arrancar_prefetch_otp(estado, correo, es_alta=True)
                 return "progreso"
             print(f"    {Color.WARNING}[Invitación] [{correo}] No se pudo pulsar Suscríbete.{Color.ENDC}")
             return "esperar"
@@ -1475,9 +1541,17 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 return "progreso"
 
         if not encontrar_locator_en_frames(page, pwd_selectors) or es_alta:
-            # Evitar martillar IMAP: cooldown corto tras un intento; luego se puede reintentar
-            # (p. ej. código rechazado o Resend).
-            if estado.get("codigo_intentado") and (time.time() - float(estado.get("codigo_ts") or 0)) < 10:
+            usa_worker = False
+            try:
+                from otp_worker_client import worker_cubre_alias
+                usa_worker = bool(worker_cubre_alias(correo))
+            except Exception:
+                pass
+            # IMAP: cooldown 10 s. Worker: 5 s para no bloquear 8 s en cada vuelta del bucle.
+            _cd_otp = 5.0 if usa_worker else 10.0
+            if estado.get("codigo_intentado") and (
+                time.time() - float(estado.get("codigo_ts") or 0)
+            ) < _cd_otp:
                 return "esperar"
             estado["codigo_intentado"] = True
             estado["codigo_ts"] = time.time()
@@ -1488,53 +1562,79 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     estado["baseline_id"] = 0
 
             tipo = "registro" if es_alta else "acceso"
-            print(f"    [Invitación] [{correo}] Obteniendo código de {tipo} por IMAP "
+            canal = "WORKER" if usa_worker else "IMAP"
+            print(f"    [Invitación] [{correo}] Obteniendo código de {tipo} por {canal} "
                   f"(alias exacto)...")
             codigo = None
-            for intento in range(1, 11):
-                if es_alta:
-                    codigo = reclamar_otp_registro_para_alias(
-                        correo,
-                        after_email_id=estado.get("baseline_id") or 0,
-                        max_age_minutes=25,
-                        silencioso=(intento > 1),
-                    )
-                else:
-                    codigo = reclamar_otp_login_para_alias(
-                        correo,
-                        after_email_id=estado.get("baseline_id") or 0,
-                        max_age_minutes=20,
-                        silencioso=(intento > 1),
-                    )
-                if codigo:
-                    break
-                # Resend a mitad de camino si no llega
-                if intento in (4, 7):
-                    try:
-                        btn_resend = esperar_locator_en_frames(
-                            page,
-                            [
-                                "button:has-text('Resend code')", "button:has-text('Resend')",
-                                "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
-                                "a:has-text('Resend')", "a:has-text('Reenviar')",
-                            ],
-                            timeout_s=1.5,
+            if usa_worker:
+                codigo = _invite_tomar_otp_worker(estado, correo, es_alta=es_alta, max_wait_s=8.0)
+            else:
+                n_intentos = 10
+                for intento in range(1, n_intentos + 1):
+                    if es_alta:
+                        codigo = reclamar_otp_registro_para_alias(
+                            correo,
+                            after_email_id=estado.get("baseline_id") or 0,
+                            max_age_minutes=25,
+                            silencioso=(intento > 1),
                         )
-                        if btn_resend:
-                            print(f"    [Invitación] [{correo}] Pulsando Resend code...")
-                            btn_resend.click(force=True)
-                            time.sleep(1.2)
-                            try:
-                                estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                print(f"    [Invitación] [{correo}] Esperando código IMAP ({intento}/10)...")
-                time.sleep(1.8)
+                    else:
+                        codigo = reclamar_otp_login_para_alias(
+                            correo,
+                            after_email_id=estado.get("baseline_id") or 0,
+                            max_age_minutes=20,
+                            silencioso=(intento > 1),
+                        )
+                    if codigo:
+                        break
+                    if intento in (5, 9):
+                        try:
+                            btn_resend = esperar_locator_en_frames(
+                                page,
+                                [
+                                    "button:has-text('Resend code')", "button:has-text('Resend')",
+                                    "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
+                                    "a:has-text('Resend')", "a:has-text('Reenviar')",
+                                ],
+                                timeout_s=1.5,
+                            )
+                            if btn_resend:
+                                print(f"    [Invitación] [{correo}] Pulsando Resend code...")
+                                btn_resend.click(force=True)
+                                time.sleep(1.2)
+                                try:
+                                    estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    print(f"    [Invitación] [{correo}] Esperando código IMAP ({intento}/{n_intentos})...")
+                    time.sleep(1.8)
+            if not codigo and usa_worker:
+                try:
+                    btn_resend = esperar_locator_en_frames(
+                        page,
+                        [
+                            "button:has-text('Resend code')", "button:has-text('Resend')",
+                            "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
+                            "a:has-text('Resend')", "a:has-text('Reenviar')",
+                        ],
+                        timeout_s=1.2,
+                    )
+                    if btn_resend:
+                        print(f"    [Invitación] [{correo}] Código no llegó en 8 s; pulsando Resend...")
+                        btn_resend.click(force=True, timeout=2500)
+                        estado["_otp_gen"] = int(estado.get("_otp_gen") or 0) + 1
+                        estado["_otp_prefetch_started"] = False
+                        estado["_otp_prefetch_done"] = False
+                        estado["otp_prefetch"] = None
+                        _invite_arrancar_prefetch_otp(estado, correo, es_alta=es_alta)
+                        codigo = _invite_tomar_otp_worker(estado, correo, es_alta=es_alta, max_wait_s=8.0)
+                except Exception:
+                    pass
             if not codigo:
                 print(f"    {Color.FAIL}[Invitación] [{correo}] No llegó el código de {tipo}.{Color.ENDC}")
-                # Permitir nuevo ciclo IMAP tras el cooldown
+                # Permitir nuevo ciclo OTP tras el cooldown
                 return "esperar"
             print(f"    [Invitación] [{correo}] Código de {tipo} obtenido: {codigo}. Escribiéndolo...")
             wrote = False
@@ -1563,7 +1663,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
     pwd_inp = encontrar_locator_en_frames(page, pwd_selectors)
     if pwd_inp and not estado.get("registro_nuevo"):
         try:
-            visible = pwd_inp.is_visible()
+            visible = pwd_inp.is_visible(timeout=0)
         except Exception:
             visible = True
         if visible:
@@ -1609,7 +1709,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
     email_inp = encontrar_locator_en_frames(page, email_selectors)
     if email_inp:
         try:
-            visible = email_inp.is_visible()
+            visible = email_inp.is_visible(timeout=0)
         except Exception:
             visible = True
         if visible:
@@ -3282,6 +3382,19 @@ def _servidor_imap_para(user_real: str) -> str:
     return "imap.gmail.com"
 
 
+def _abrir_imap_ssl(host: str):
+    """Conexión IMAP con timeout para que un SEARCH de Gmail no deje la terminal colgada."""
+    try:
+        mail = imaplib.IMAP4_SSL(host, timeout=45)
+    except TypeError:
+        mail = imaplib.IMAP4_SSL(host)
+    try:
+        mail.sock.settimeout(45)
+    except Exception:
+        pass
+    return mail
+
+
 def cerrar_sesion_imap_hilo() -> None:
     """Cierra la conexión IMAP reutilizable del hilo actual (llamar al terminar cada cuenta)."""
     conexiones = getattr(_IMAP_HILO, "conexiones", None)
@@ -3325,6 +3438,10 @@ def sesion_imap(user_real: str, app_pwd: str):
         mail = _IMAP_HILO.conexiones.get(clave)
         if mail is not None:
             try:
+                try:
+                    mail.sock.settimeout(45)
+                except Exception:
+                    pass
                 mail.noop()
             except Exception:
                 try:
@@ -3338,7 +3455,7 @@ def sesion_imap(user_real: str, app_pwd: str):
             ultimo_error = None
             for intento in range(1, 4):
                 try:
-                    mail = imaplib.IMAP4_SSL(_servidor_imap_para(user_real))
+                    mail = _abrir_imap_ssl(_servidor_imap_para(user_real))
                     mail.login(user_real, app_pwd)
                     break
                 except Exception as e:
@@ -4157,20 +4274,22 @@ def _imap_parse_fetch_messages(data) -> dict[int, "email.message.Message"]:
         return out
     pending_uid = None
     for item in data:
-        if isinstance(item, tuple) and len(item) >= 2 and item[1]:
-            meta = item[0]
-            if isinstance(meta, bytes):
-                m = re.search(br"UID\s+(\d+)", meta, flags=re.I)
-                if m:
-                    pending_uid = int(m.group(1))
-            try:
-                msg = email.message_from_bytes(item[1])
-            except Exception:
-                pending_uid = None
+        chunks = item if isinstance(item, tuple) else (item,)
+        msg = None
+        for chunk in chunks:
+            if not chunk or not isinstance(chunk, (bytes, bytearray)):
                 continue
-            if pending_uid:
-                out[pending_uid] = msg
-                pending_uid = None
+            m = re.search(br"UID\s+(\d+)", chunk, flags=re.I)
+            if m:
+                pending_uid = int(m.group(1))
+            if b"\n" in chunk and (b"From:" in chunk or b"Subject:" in chunk or b"To:" in chunk):
+                try:
+                    msg = email.message_from_bytes(chunk)
+                except Exception:
+                    pass
+        if pending_uid and msg is not None:
+            out[pending_uid] = msg
+            pending_uid = None
     return out
 
 
@@ -4277,12 +4396,34 @@ def listar_invitaciones_familiares_buzon(
     from datetime import datetime, timezone, timedelta
     from email.utils import parsedate_to_datetime
 
+    aliases_l = [(a or "").strip().lower() for a in (aliases_objetivo or []) if (a or "").strip()]
+    try:
+        from otp_worker_client import listar_invites_worker, worker_cubre_alias, worker_config
+        hits: list[dict] = []
+        cubre_todos = True
+        cubre_alguno = False
+        dests = aliases_l or [(gmail_user or "").strip().lower()]
+        for a in dests:
+            if worker_cubre_alias(a):
+                cubre_alguno = True
+                hits.extend(listar_invites_worker(a, max_age_minutes))
+            else:
+                cubre_todos = False
+        if hits:
+            print(f"    {Color.GREEN}[WORKER]{Color.ENDC} {len(hits)} invitación(es) para "
+                  f"{dests[0]}.")
+            if cubre_alguno and cubre_todos and not worker_config().get("imap_fallback"):
+                return hits
+        elif cubre_alguno and cubre_todos and not worker_config().get("imap_fallback"):
+            return []
+    except Exception:
+        pass
+
     user_real, app_pwd = obtener_credenciales_imap_reales(gmail_user)
     if not user_real or not app_pwd:
         print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Sin credenciales IMAP para listar invitaciones de {gmail_user}.")
         return []
 
-    aliases_l = [(a or "").strip().lower() for a in (aliases_objetivo or []) if (a or "").strip()]
     resultados: list[dict] = []
     stack = contextlib.ExitStack()
     try:
@@ -4295,10 +4436,9 @@ def listar_invitaciones_familiares_buzon(
               f"{_servidor_imap_para(user_real)} ({user_real}) "
               f"SINCE {since_str}, hasta {tope} UIDs...")
         mail = stack.enter_context(sesion_imap(user_real, app_pwd))
+        _imap_preparar_carpeta_otp(mail, aliases_l or [gmail_user])
 
-        status, messages = mail.uid("search", None, f'(FROM "tidal" SINCE {since_str})')
-        if status != "OK" or not messages or not messages[0]:
-            status, messages = mail.uid("search", None, '(FROM "tidal")')
+        status, messages = mail.uid("SEARCH", f'(FROM "tidal" SINCE {since_str})')
         if status != "OK" or not messages or not messages[0]:
             return []
 
@@ -4562,6 +4702,25 @@ def _buscar_invitacion_por_alias_exacto(
     links_excluir: set[str] | None = None,
 ) -> dict | None:
     """Wrapper: abre sesión y busca un solo alias (compatibilidad)."""
+    try:
+        from otp_worker_client import reclamar_desde_worker, worker_cubre_alias, worker_config
+        if worker_cubre_alias(alias):
+            enlace = reclamar_desde_worker(
+                alias, "invite", max_age_minutes=max_age_minutes, silencioso=False,
+            )
+            if enlace and "resetpass" not in enlace.lower():
+                if not (links_excluir and enlace in links_excluir):
+                    return {
+                        "uid": 0,
+                        "recipients": alias,
+                        "body": "",
+                        "link": enlace,
+                        "score": 100,
+                    }
+            if not worker_config().get("imap_fallback"):
+                return None
+    except Exception:
+        pass
     user_real, app_pwd = obtener_credenciales_imap_reales(gmail_user)
     if not user_real or not app_pwd:
         return None
@@ -4607,6 +4766,15 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
             if al and al not in vistos:
                 vistos.add(al)
                 aliases_unicos.append(a.strip())
+
+        try:
+            from otp_worker_client import reclamar_invites_para_aliases
+            w_ok, aliases_unicos = reclamar_invites_para_aliases(aliases_unicos, max_age)
+            asignados.update(w_ok)
+            if not aliases_unicos:
+                continue
+        except Exception:
+            pass
 
         if len(aliases_unicos) == 1:
             solo = aliases_unicos[0]
@@ -4786,7 +4954,7 @@ def reclamar_otp_registro_para_alias(
 KEYWORDS_LOGIN_ACCESO = [
     "sign-in code", "signin code", "login code", "código de acceso", "codigo de acceso",
     "código de inicio", "codigo de inicio", "access code", "verification code",
-    "código", "codigo", "code", "inici",
+    "código", "codigo", "code", "inici", "login",
 ]
 
 # No usar "cancel" suelto: el pie de Tidal / unsubscribe lo contiene y se descartaba el OTP.
@@ -4870,14 +5038,13 @@ def reclamar_otp_eliminacion_para_alias(
         candidatos: list[dict] = []
         try:
             with sesion_imap(user_real, app_pwd) as mail:
+                _imap_preparar_carpeta_otp(mail, [alias])
+                since_str = _imap_since_str(max(45, int(max_age_minutes or 45)))
                 if after_email_id and int(after_email_id) > 0:
                     criteria = f'(UID {int(after_email_id) + 1}:* FROM "tidal")'
                 else:
-                    criteria = '(FROM "tidal")'
-                status, messages = mail.uid("search", None, criteria)
-                if status != "OK" or not messages or not messages[0]:
-                    if after_email_id:
-                        status, messages = mail.uid("search", None, '(FROM "tidal")')
+                    criteria = f'(FROM "tidal" SINCE {since_str})'
+                status, messages = mail.uid("SEARCH", criteria)
                 if status != "OK" or not messages or not messages[0]:
                     return None
                 msg_ids = messages[0].split()[-40:]
@@ -4981,7 +5148,7 @@ def _imap_since_str(max_age_minutes: int | None) -> str:
     dt = datetime.now(timezone.utc) - timedelta(minutes=mins, days=1)
     meses = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-    return f"{dt.day:02d}-{meses[dt.month - 1]}-{dt.year}"
+    return f"{dt.day}-{meses[dt.month - 1]}-{dt.year}"
 
 
 def _imap_aliases_to_dirigido(aliases_ok: list[str], user_real: str) -> list[str]:
@@ -5000,6 +5167,321 @@ def _imap_aliases_to_dirigido(aliases_ok: list[str], user_real: str) -> list[str
     return out
 
 
+def _imap_listar_carpetas(mail) -> list[tuple[str, str]]:
+    """Devuelve (flags, nombre) de cada carpeta IMAP (etiquetas Gmail incluidas)."""
+    pares: list[tuple[str, str]] = []
+    try:
+        _typ, data = mail.list()
+        for item in data or []:
+            if not item:
+                continue
+            s = item.decode("utf-8", "replace") if isinstance(item, bytes) else str(item)
+            m = re.match(r"^\((.*)\)\s+\"([^\"]*)\"\s+(.+)$", s)
+            if not m:
+                continue
+            flags = m.group(1)
+            name = m.group(3).strip()
+            if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+                name = name[1:-1]
+            pares.append((flags, name))
+    except Exception:
+        pass
+    return pares
+
+
+def _imap_quote_mailbox(nombre: str) -> str:
+    """Python 3.13 imaplib no cita argumentos: EXAMINE TITULARES TIDAL → BAD parse."""
+    n = (nombre or "").strip()
+    if not n:
+        return n
+    if len(n) >= 2 and n[0] == '"' and n[-1] == '"':
+        return n
+    return '"' + n.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _imap_select_carpeta(mail, nombre: str) -> bool:
+    if not nombre:
+        return False
+    try:
+        status, data = mail.select(_imap_quote_mailbox(nombre), readonly=True)
+        if status != "OK":
+            return False
+        # EXISTS de ESTA carpeta (no el del INBOX anterior)
+        if data and data[0]:
+            try:
+                mail.untagged_responses["EXISTS"] = [data[0]]
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def _imap_etiquetas_filtro_en_buzon(mail, aliases_ok: list[str]) -> list[str]:
+    """Nombres reales IMAP de TITULARES/CLIENTES (el filtro puede no coincidir letra a letra)."""
+    alias_txt = " ".join(aliases_ok or []).lower()
+    claves: list[str] = []
+    if "titular" in alias_txt:
+        claves.append("titular")
+    if "cliente" in alias_txt:
+        claves.append("cliente")
+    if not claves:
+        return []
+    hallados: list[str] = []
+    for _flags, name in _imap_listar_carpetas(mail):
+        nl = (name or "").lower()
+        if "gmail" in nl or nl in ("inbox", "recibidos"):
+            continue
+        if any(k in nl for k in claves):
+            hallados.append(name)
+    return hallados
+
+
+def _imap_carpetas_otp_candidatas(aliases_ok: list[str], mail=None) -> list[str]:
+    """Etiqueta del filtro primero; All Mail al final (12k+ mails)."""
+    alias_txt = " ".join(aliases_ok or []).lower()
+    out: list[str] = []
+    if mail is not None:
+        out.extend(_imap_etiquetas_filtro_en_buzon(mail, aliases_ok))
+    if "titular" in alias_txt:
+        out += ["TITULARES TIDAL", "Titulares Tidal", "titulares-tidal", "Titulares"]
+    if "cliente" in alias_txt:
+        out += ["CLIENTES TIDAL", "Clientes Tidal", "clientes-tidal", "Clientes"]
+    out += [
+        "INBOX",
+        "[Gmail]/Spam", "[Gmail]/Correo no deseado",
+        "[Gmail]/All Mail", "[Gmail]/Todos", "[Google Mail]/All Mail",
+        "[Gmail]/Todos los mensajes",
+    ]
+    vistos: set[str] = set()
+    uniq: list[str] = []
+    for n in out:
+        k = n.lower()
+        if k in vistos:
+            continue
+        vistos.add(k)
+        uniq.append(n)
+    return uniq
+
+
+def _imap_carpeta_otp(mail, aliases_ok: list[str]) -> str | None:
+    for nombre in _imap_carpetas_otp_candidatas(aliases_ok, mail):
+        if _imap_select_carpeta(mail, nombre):
+            return nombre
+    return None
+
+
+def _imap_preparar_carpeta_otp(mail, aliases_ok: list[str]) -> str:
+    carpeta = _imap_carpeta_otp(mail, aliases_ok)
+    if carpeta:
+        return carpeta
+    return "INBOX"
+
+
+def _imap_carpeta_es_etiqueta_filtrada(carpeta: str, aliases_ok: list[str]) -> bool:
+    c = (carpeta or "").lower()
+    alias_txt = " ".join(aliases_ok or []).lower()
+    if "titular" in alias_txt and "titular" in c:
+        return True
+    if "cliente" in alias_txt and "cliente" in c:
+        return True
+    return False
+
+
+def _imap_untagged_int(mail, key: str) -> int:
+    try:
+        data = mail.untagged_responses.get(key) or []
+        if not data:
+            return 0
+        val = data[-1]
+        if isinstance(val, (list, tuple)):
+            val = val[0] if val else 0
+        if isinstance(val, bytes):
+            val = val.decode("utf-8", "replace")
+        return int(str(val).split()[0])
+    except Exception:
+        return 0
+
+
+def _imap_max_recientes(max_age_minutes: int) -> int:
+    if max_age_minutes and int(max_age_minutes) >= 1440:
+        return 12
+    if max_age_minutes and int(max_age_minutes) >= 120:
+        return 10
+    return 8
+
+
+def _imap_parece_otp_tidal(from_s: str, subj: str, query_from: str) -> bool:
+    blob = f"{from_s or ''} {subj or ''}".lower()
+    q = (query_from or "tidal").strip().lower() or "tidal"
+    if q in blob:
+        return True
+    return any(k in blob for k in (
+        "código", "codigo", "code", "login", "inici", "verific", "sign-in", "signin", "tidal",
+    ))
+
+
+def _imap_fetch_seq_header(mail, seq: int):
+    """Un solo mensaje, solo cabecera. El FETCH de 40 de golpe cuelga minutos en Gmail."""
+    try:
+        mail.sock.settimeout(10)
+    except Exception:
+        pass
+    try:
+        status, data = mail.fetch(str(int(seq)), "(UID RFC822.HEADER)")
+    except Exception:
+        return None, None
+    finally:
+        try:
+            mail.sock.settimeout(45)
+        except Exception:
+            pass
+    if status != "OK" or not data:
+        return None, None
+    parsed = _imap_parse_fetch_messages(data)
+    if parsed:
+        uid, msg = next(iter(sorted(parsed.items(), reverse=True)))
+        return uid, msg
+    import email as _email
+    for item in data:
+        if not isinstance(item, tuple) or len(item) < 2 or not item[1]:
+            continue
+        uid = 0
+        meta = item[0]
+        if isinstance(meta, bytes):
+            m = re.search(br"UID\s+(\d+)", meta, flags=re.I)
+            if m:
+                uid = int(m.group(1))
+        try:
+            return uid, _email.message_from_bytes(item[1])
+        except Exception:
+            return None, None
+    return None, None
+
+
+def _imap_fetch_seq_rfc822(mail, seq: int):
+    """Cuerpo de UN mensaje. Timeout corto: un RFC822 de rango es lo que colgaba minutos."""
+    try:
+        mail.sock.settimeout(12)
+    except Exception:
+        pass
+    try:
+        status, data = mail.fetch(str(int(seq)), "(RFC822)")
+    except Exception:
+        return None
+    finally:
+        try:
+            mail.sock.settimeout(45)
+        except Exception:
+            pass
+    if status != "OK" or not data:
+        return None
+    import email as _email
+    for item in data:
+        if isinstance(item, tuple) and len(item) >= 2 and item[1] and isinstance(item[1], (bytes, bytearray)):
+            try:
+                return _email.message_from_bytes(item[1])
+            except Exception:
+                continue
+    parsed = _imap_parse_fetch_messages(data)
+    if parsed:
+        return next(iter(parsed.values()))
+    return None
+
+
+def _imap_cuerpo_texto(msg) -> str:
+    if msg is None:
+        return ""
+    partes: list[str] = []
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = (part.get_content_type() or "").lower()
+                if ctype not in ("text/plain", "text/html"):
+                    continue
+                try:
+                    raw = part.get_payload(decode=True) or b""
+                    txt = raw.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                if ctype == "text/html":
+                    txt = re.sub(r"<style[^>]*>[\s\S]*?</style>", " ", txt, flags=re.I)
+                    txt = re.sub(r"<script[^>]*>[\s\S]*?</script>", " ", txt, flags=re.I)
+                    txt = re.sub(r"<[^>]+>", " ", txt)
+                partes.append(txt)
+        else:
+            raw = msg.get_payload(decode=True) or b""
+            partes.append(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        pass
+    return " ".join(partes)
+
+
+def _imap_asunto_es_aviso_login(subj: str) -> bool:
+    s = (subj or "").lower()
+    return "new login to your account" in s or "nuevo inicio de sesión" in s
+
+
+def _imap_otp_rapido_asunto(
+    mail,
+    aliases_ok: list[str],
+    query_from: str = "tidal",
+    after_email_id: int = 0,
+    preferir_otp_len: int | None = None,
+    max_n: int = 8,
+    silencioso: bool = False,
+    carpeta: str = "",
+) -> str | None:
+    """Gmail muestra el OTP en el snippet; el Subject IMAP no lo trae. Leer el cuerpo del más nuevo."""
+    exists = _imap_untagged_int(mail, "EXISTS")
+    if exists <= 0:
+        return None
+    n = min(max_n, exists)
+    after = int(after_email_id or 0)
+    en_etiqueta = _imap_carpeta_es_etiqueta_filtrada(carpeta, aliases_ok)
+    catch_all = bool(_imap_aliases_to_dirigido(aliases_ok, ""))
+    for seq in range(exists, exists - n, -1):
+        uid, msg = _imap_fetch_seq_header(mail, seq)
+        if msg is None:
+            continue
+        if after > 0 and uid and uid <= after:
+            continue
+        from_s = _imap_decode_header_value(msg.get("From"))
+        subj = _imap_decode_header_value(msg.get("Subject"))
+        if not _imap_parece_otp_tidal(from_s, subj, query_from):
+            continue
+        if _imap_asunto_es_aviso_login(subj):
+            continue
+        rec = _headers_destinatario(msg)
+        match_alias = any(
+            _destinatario_es_para_alias(a, rec, subj, exigir_exacto=False)
+            for a in (aliases_ok or [])
+        )
+        if not match_alias and not en_etiqueta and not catch_all:
+            continue
+        if not silencioso:
+            print(f"    {Color.CYAN}[IMAP]{Color.ENDC} #{seq} {(subj or '')[:72]!r}", flush=True)
+        codigos = _extraer_codigos_otp(subj or "", preferir_len=preferir_otp_len)
+        if not codigos:
+            if not silencioso:
+                print(f"    {Color.CYAN}[IMAP]{Color.ENDC} El código no está en el asunto; leyendo cuerpo #{seq}...",
+                      flush=True)
+            full = _imap_fetch_seq_rfc822(mail, seq)
+            texto = _imap_cuerpo_texto(full) if full else ""
+            if full:
+                rec2 = _headers_destinatario(full)
+                match_alias = match_alias or any(
+                    _destinatario_es_para_alias(a, rec2, texto, exigir_exacto=False)
+                    for a in (aliases_ok or [])
+                )
+            codigos = _extraer_codigos_otp(f"{subj} {texto}", preferir_len=preferir_otp_len)
+        if codigos:
+            if not silencioso:
+                print(f"    {Color.GREEN}[IMAP]{Color.ENDC} Código: {codigos[0]}")
+            return codigos[0]
+    return None
+
+
 def _imap_uid_search(
     mail,
     query_from: str,
@@ -5008,63 +5490,27 @@ def _imap_uid_search(
     after_email_id: int = 0,
     max_age_minutes: int = 15,
 ) -> tuple[list, bool]:
-    """UIDs de Tidal. Nunca se queda solo con to:alias: Gmail no indexa el To: del catch-all
-    (el sobre es el Gmail destino) y X-GM-RAW puede ir atrasado respecto al INBOX."""
-    query_from = (query_from or "tidal").strip() or "tidal"
-    since = _imap_since_str(max_age_minutes)
+    """Últimos N mensajes uno a uno (nunca un FETCH de rango: Gmail se queda minutos)."""
+    query_from = (query_from or "tidal").strip().lower() or "tidal"
     after = int(after_email_id or 0)
-    dirigidos = _imap_aliases_to_dirigido(aliases_ok, user_real)
-
-    def _try(*parts):
-        try:
-            status, messages = mail.uid("search", None, *parts)
-            if status == "OK" and messages and messages[0]:
-                return messages[0].split()
-        except Exception:
-            return None
-        return None
-
-    def _unir(*listas):
-        vistos: set = set()
-        out: list = []
-        for lista in listas:
-            for uid in lista or []:
-                if uid not in vistos:
-                    vistos.add(uid)
-                    out.append(uid)
-        return out
-
-    newer = "newer_than:1d"
-    if max_age_minutes and int(max_age_minutes) >= 1440:
-        newer = "newer_than:7d"
-    elif max_age_minutes and int(max_age_minutes) >= 120:
-        newer = "newer_than:2d"
-
-    recientes: list = []
-    if after > 0:
-        recientes = _try(f'(UID {after + 1}:* FROM "{query_from}" SINCE {since})') or []
-        if not recientes:
-            recientes = _try(f'(UID {after + 1}:* FROM "{query_from}")') or []
-    if not recientes:
-        recientes = _try(f'(FROM "{query_from}" SINCE {since})') or []
-    if not recientes:
-        recientes = _try(f'(FROM "{query_from}")') or []
-    if not recientes:
-        recientes = _try("X-GM-RAW", f"{newer} (from:tidal OR subject:tidal OR tidal)") or []
-
-    extra: list = []
-    for alias in dirigidos[:8]:
-        extra = _unir(
-            extra,
-            _try("X-GM-RAW", f'from:{query_from} to:"{alias}" {newer}'),
-            _try("X-GM-RAW", f'to:"{alias}" {newer} (from:tidal OR tidal)'),
-        )
-
-    if extra:
-        # El correo recién llegado puede no estar aún en el índice to:alias.
-        cola = recientes[-20:] if recientes else []
-        return _unir(extra, cola), True
-    return recientes, False
+    catch_all = bool(_imap_aliases_to_dirigido(aliases_ok, user_real))
+    exists = _imap_untagged_int(mail, "EXISTS")
+    if exists <= 0:
+        return [], False
+    max_n = _imap_max_recientes(max_age_minutes)
+    n = min(max_n, exists)
+    uids: list[bytes] = []
+    for seq in range(exists, exists - n, -1):
+        uid, msg = _imap_fetch_seq_header(mail, seq)
+        if msg is None or not uid:
+            continue
+        if after > 0 and uid <= after:
+            continue
+        from_s = _imap_decode_header_value(msg.get("From"))
+        subj = _imap_decode_header_value(msg.get("Subject"))
+        if _imap_parece_otp_tidal(from_s, subj, query_from):
+            uids.append(str(uid).encode())
+    return uids, catch_all
 
 
 def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_password=None, 
@@ -5091,12 +5537,6 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
     import email
     from email.header import decode_header
     from datetime import datetime, timezone
-    
-    user_real, app_pwd = obtener_credenciales_imap_reales(gmail_user)
-    if not user_real or not app_pwd:
-        if not silencioso:
-            print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No se encontraron credenciales de IMAP válidas para {gmail_user}.")
-        return None
 
     aliases_ok = []
     origen_aliases = aliases_solo if aliases_solo is not None else [gmail_user, *(aliases_extra or [])]
@@ -5106,6 +5546,30 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             aliases_ok.append(a_l)
     if not aliases_ok:
         aliases_ok = [(gmail_user or "").strip().lower()]
+
+    try:
+        from otp_worker_client import intentar_via_worker
+        val_w, skip_imap = intentar_via_worker(
+            aliases_ok[0], required_keywords, solo_link,
+            max_age_minutes=max_age_minutes or 15,
+            after_email_id=after_email_id or 0,
+            silencioso=silencioso,
+            aliases=aliases_ok,
+        )
+        if val_w:
+            return val_w
+        if skip_imap:
+            if not silencioso:
+                print(f"    {Color.WARNING}[WORKER]{Color.ENDC} Sin resultado aún para {aliases_ok[0]}.")
+            return None
+    except Exception:
+        pass
+    
+    user_real, app_pwd = obtener_credenciales_imap_reales(gmail_user)
+    if not user_real or not app_pwd:
+        if not silencioso:
+            print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No se encontraron credenciales de IMAP válidas para {gmail_user}.")
+        return None
     
     # ExitStack en lugar de un 'with' anidado para no reindentar todo el recorrido de mensajes:
     # el cierre queda garantizado igualmente al salir de la función.
@@ -5116,16 +5580,49 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Consultando {_servidor_imap_para(user_real)} "
                   f"({user_real}) por {alias_hint}...")
         mail = stack.enter_context(sesion_imap(user_real, app_pwd))
+        carpeta = _imap_preparar_carpeta_otp(mail, aliases_ok)
+        exists = _imap_untagged_int(mail, "EXISTS")
+        n_leer = min(_imap_max_recientes(max_age_minutes), exists) if exists else 0
+        if not silencioso:
+            print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Conectado ({carpeta}, {exists} msgs). "
+                  f"Leyendo los {n_leer} más nuevos...", flush=True)
 
-        # Catch-all: buscar por To: del alias (Gmail X-GM-RAW / TO) + SINCE.
-        # Antes era FROM tidal de TODO el buzón y FETCH de 50 RFC822 → minutos.
+        if not solo_link:
+            otp_asunto = _imap_otp_rapido_asunto(
+                mail, aliases_ok, query_from=query_from,
+                after_email_id=after_email_id, preferir_otp_len=preferir_otp_len,
+                max_n=n_leer or 8, silencioso=silencioso, carpeta=carpeta,
+            )
+            if otp_asunto:
+                return otp_asunto
+            if not silencioso:
+                print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Sin OTP numérico en los {n_leer} más nuevos de {carpeta}.")
+            return None
+
         msg_ids, dirigido = _imap_uid_search(
             mail, query_from, aliases_ok, user_real,
             after_email_id=after_email_id, max_age_minutes=max_age_minutes,
         )
+        if not msg_ids and not _imap_carpeta_es_etiqueta_filtrada(carpeta, aliases_ok):
+            for fallback in _imap_carpetas_otp_candidatas(aliases_ok, mail):
+                if fallback.lower() == (carpeta or "").lower():
+                    continue
+                if not _imap_select_carpeta(mail, fallback):
+                    continue
+                carpeta = fallback
+                exists = _imap_untagged_int(mail, "EXISTS")
+                if not silencioso:
+                    print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Probando {carpeta} ({exists} msgs)...")
+                msg_ids, dirigido = _imap_uid_search(
+                    mail, query_from, aliases_ok, user_real,
+                    after_email_id=after_email_id, max_age_minutes=max_age_minutes,
+                )
+                if msg_ids:
+                    break
         if not msg_ids:
             if not silencioso:
-                print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No se encontraron correos de '{query_from}'.")
+                print(f"    {Color.WARNING}[IMAP]{Color.ENDC} No hay correos recientes de '{query_from}' "
+                      f"en etiqueta/All Mail/INBOX/Spam.")
             return None
 
         limite_msgs = 50
@@ -5137,9 +5634,31 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             limite_msgs = 500
         msg_ids = msg_ids[-limite_msgs:]
         msg_ids.reverse()
+        if _imap_aliases_to_dirigido(aliases_ok, user_real) and msg_ids:
+            headers_map = _imap_fetch_headers_lote(mail, msg_ids)
+            filtrados = []
+            for uid_b in msg_ids:
+                try:
+                    uid = int(uid_b)
+                except ValueError:
+                    continue
+                msg_h = headers_map.get(uid)
+                if not msg_h:
+                    filtrados.append(uid_b)
+                    continue
+                rec = _headers_destinatario(msg_h)
+                if any(
+                    _destinatario_es_para_alias(a, rec, "", exigir_exacto=False)
+                    for a in aliases_ok
+                ):
+                    filtrados.append(uid_b)
+            if filtrados:
+                msg_ids = filtrados
+            else:
+                msg_ids = msg_ids[:8]
         if not silencioso:
             if dirigido and aliases_ok:
-                filtro = f"to:{aliases_ok[0]}"
+                filtro = f"alias {aliases_ok[0]}"
             else:
                 filtro = f"from:{query_from} reciente"
             print(f"    {Color.CYAN}[IMAP]{Color.ENDC} {len(msg_ids)} mensaje(s) ({filtro})...")
@@ -5257,15 +5776,37 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 except Exception:
                     pass
             
-            if not body_text:
-                continue
-
             if not match_headers and not any(
                 _destinatario_es_para_alias(
                     a, recipients, body_text, exigir_exacto=exigir_destinatario_exacto
                 ) for a in aliases_ok
             ):
-                continue
+                from_l = (msg.get("From") or "").lower()
+                subj_l = (subject_text or "").lower()
+                catch_all = bool(_imap_aliases_to_dirigido(aliases_ok, user_real))
+                parece_otp = any(
+                    k in subj_l
+                    for k in ("código", "codigo", "code", "login", "inici", "verific", "sign-in", "signin")
+                )
+                en_etiqueta = _imap_carpeta_es_etiqueta_filtrada(carpeta, aliases_ok)
+                otro_alias = False
+                texto_todo = f"{recipients} {body_text} {subject_text}".lower()
+                try:
+                    destinos = set(_mapa_dominios_forward_imap())
+                    objetivos = {(a or "").strip().lower() for a in aliases_ok}
+                    for addr in re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+", texto_todo):
+                        if addr.split("@")[-1] in destinos and addr not in objetivos:
+                            otro_alias = True
+                            break
+                except Exception:
+                    otro_alias = False
+                # Catch-all Cloudflare: To: a veces es el Gmail, no el alias. En la etiqueta
+                # del filtro es seguro; en All Mail solo si no menciona otro alias del dominio.
+                if not (catch_all and "tidal" in from_l and parece_otp and (en_etiqueta or not otro_alias)):
+                    if not silencioso:
+                        print(f"    {Color.CYAN}[IMAP]{Color.ENDC} omitido UID {msg_id_int}: "
+                              f"To={(to_header or '')[:70]!r} subj={(subject_text or '')[:55]!r}")
+                    continue
 
             buzon_clave = _buzon_imap_clave(gmail_user, user_real)
             # Saltar UIDs que otro hilo concurrente ya consumió (mismo buzón, otro alias)
@@ -7096,13 +7637,13 @@ def encontrar_locator_en_frames(page, selectors: list, label_regex=None, text_re
                 for idx in range(cnt):
                     btn = loc.nth(idx)
                     try:
-                        if not btn.is_visible():
+                        if not btn.is_visible(timeout=0):
                             continue
                     except Exception:
                         continue
                     if text_regex is not None:
                         try:
-                            txt = (btn.inner_text() or "").strip()
+                            txt = (btn.inner_text(timeout=1500) or "").strip()
                         except Exception:
                             txt = ""
                         if not txt:
@@ -7124,7 +7665,7 @@ def encontrar_locator_en_frames(page, selectors: list, label_regex=None, text_re
                 cnt = loc.count()
                 for idx in range(cnt):
                     btn = loc.nth(idx)
-                    if btn.is_visible():
+                    if btn.is_visible(timeout=0):
                         return btn
             except Exception:
                 pass
@@ -7134,14 +7675,14 @@ def encontrar_locator_en_frames(page, selectors: list, label_regex=None, text_re
                 cnt = loc.count()
                 for idx in range(cnt):
                     el = loc.nth(idx)
-                    if not el.is_visible():
+                    if not el.is_visible(timeout=0):
                         continue
                     # Preferir controles clicables asociados al texto
                     try:
                         tag = el.evaluate("e => (e.closest('button, a, [role=\"button\"]') || e).tagName")
                         if tag:
                             clickable = el.locator("xpath=ancestor-or-self::button[1] | ancestor-or-self::a[1] | ancestor-or-self::*[@role='button'][1]")
-                            if clickable.count() > 0 and clickable.first.is_visible():
+                            if clickable.count() > 0 and clickable.first.is_visible(timeout=0):
                                 return clickable.first
                     except Exception:
                         pass
@@ -7841,20 +8382,24 @@ def obtener_max_email_id(gmail_user="cakeseller1234@gmail.com", query_from="tida
     aliases del mismo Gmail varios hilos pueden subir el máximo, pero obtener_codigo_via_imap
     sigue filtrando por destinatario exacto.
     """
+    try:
+        from otp_worker_client import marcar_baseline_worker, worker_cubre_alias
+        marcar_baseline_worker(gmail_user)
+        if worker_cubre_alias(gmail_user):
+            return 1
+    except Exception:
+        pass
     user_real, app_pwd = obtener_credenciales_imap_reales(gmail_user)
     if not user_real or not app_pwd:
         return 0
-    remitente = (query_from or "tidal").strip() or "tidal"
-    criterio = f'(FROM "{remitente}")'
     try:
         with sesion_imap(user_real, app_pwd) as mail:
-            status, messages = mail.uid("search", None, criterio)
-            if status == "OK" and messages and messages[0]:
-                ids = [int(x) for x in messages[0].split() if x.isdigit()]
-                if ids:
-                    return max(ids)
+            _imap_preparar_carpeta_otp(mail, [gmail_user])
+            uidnext = _imap_untagged_int(mail, "UIDNEXT")
+            if uidnext > 1:
+                return uidnext - 1
     except Exception as e:
-        print(f"    [IMAP] [WARN] Error en obtener_max_email_id (FROM={remitente!r}): {e}")
+        print(f"    [IMAP] [WARN] Error en obtener_max_email_id ({gmail_user}): {e}")
     return 0
 
 stdin_lock = threading.Lock()
@@ -10804,27 +11349,43 @@ class TidalResetPasswordManager:
             # Sincronización tras el envío de correo de restablecimiento
             self.esperar_barrera("post_solicitud")
             
-            # 5. Esperar el enlace del Gmail via IMAP (5 min: cola del semáforo + aliases mismo buzón)
+            # 5. Enlace de reset: worker (sondeo 0.22 s) o IMAP (Gmail nativo).
             print("  [Reset Pass] Buscando enlace de restablecimiento enviado por correo...")
             enlace_reset = None
-            _max_intentos_imap = 30  # 30 * ~10s ≈ 5 min
-            for intento in range(1, _max_intentos_imap + 1):
-                print(f"  [Reset Pass] Intento {intento}/{_max_intentos_imap}: Buscando correo de cambio de contraseña...")
-                enlace_reset = obtener_codigo_via_imap(
-                    gmail_user=self.client_email,
-                    required_keywords=KEYWORDS_RESTABLECER_PWD,
-                    query_exclude="invited to a tidal family",
-                    after_email_id=reset_baseline_id,
-                    max_age_minutes=15,
-                    solo_link=True
-                )
-                if enlace_reset and enlace_reset.startswith("http"):
-                    break
-                if intento < _max_intentos_imap:
-                    time.sleep(8.0 + random.uniform(0.0, 3.0))
+            usa_worker_reset = False
+            try:
+                from otp_worker_client import cubre_y_esperar_reset, worker_config, worker_cubre_alias
+                if worker_cubre_alias(self.client_email):
+                    usa_worker_reset = True
+                    _, enlace_reset = cubre_y_esperar_reset(self.client_email, max_wait_s=50.0)
+                    if (not enlace_reset) and worker_config().get("imap_fallback"):
+                        usa_worker_reset = False
+            except Exception as e_wreset:
+                print(f"  [Reset Pass] [WARN] Worker reset: {e_wreset}")
+                try:
+                    from otp_worker_client import worker_cubre_alias
+                    usa_worker_reset = bool(worker_cubre_alias(self.client_email))
+                except Exception:
+                    usa_worker_reset = False
+            if not usa_worker_reset:
+                _max_intentos_imap = 30  # 30 * ~10s ≈ 5 min
+                for intento in range(1, _max_intentos_imap + 1):
+                    print(f"  [Reset Pass] Intento {intento}/{_max_intentos_imap}: Buscando correo de cambio de contraseña...")
+                    enlace_reset = obtener_codigo_via_imap(
+                        gmail_user=self.client_email,
+                        required_keywords=KEYWORDS_RESTABLECER_PWD,
+                        query_exclude="invited to a tidal family",
+                        after_email_id=reset_baseline_id,
+                        max_age_minutes=15,
+                        solo_link=True
+                    )
+                    if enlace_reset and enlace_reset.startswith("http"):
+                        break
+                    if intento < _max_intentos_imap:
+                        time.sleep(8.0 + random.uniform(0.0, 3.0))
             
             if not enlace_reset or not enlace_reset.startswith("http"):
-                raise RuntimeError("No se pudo extraer el enlace de reinicio automáticamente por IMAP.")
+                raise RuntimeError("No se pudo extraer el enlace de reinicio automáticamente.")
                 
             # --- PARTE 2: Abrir el enlace de restablecimiento con el mismo proxy de Perú ---
             print(f"  [Reset Pass] [{self.client_email}] Abriendo nuevo navegador con el proxy de PERÚ...")
@@ -17308,6 +17869,19 @@ def verificar_contrasenas_imap_opcion12(correos: list[str]):
         print(f"\n{Color.CYAN}Catch-all (Cloudflare Email Routing):{Color.ENDC}")
         for dom, dest in sorted(forwards.items()):
             print(f"  @{dom} → IMAP {dest}")
+
+    try:
+        from otp_worker_client import worker_salud, worker_config
+        ok_w, info_w = worker_salud()
+        cfg_w = worker_config()
+        marca = f"{Color.GREEN}OK{Color.ENDC}" if ok_w else f"{Color.FAIL}NO{Color.ENDC}"
+        print(f"\n{Color.CYAN}Email Worker:{Color.ENDC} {marca}  {info_w}")
+        if cfg_w.get("imap_fallback"):
+            print(f"  imap_fallback=1 (si el worker no tiene el mail, se intenta IMAP)")
+        elif ok_w:
+            print(f"  Catch-all (@cheapmusic.best): OTP/links por worker, sin IMAP.")
+    except Exception as e:
+        print(f"\n{Color.WARNING}Email Worker:{Color.ENDC} no se pudo comprobar ({e})")
             
     if not faltantes:
         print(f"\n{Color.GREEN}{Color.BOLD}>>> TODO ESTÁ CORRECTO: Todos los correos tienen su contraseña IMAP registrada. <<<{Color.ENDC}\n")
@@ -17564,32 +18138,68 @@ def menu_principal():
             for correo in correos:
                 print(f"\n{Color.BLUE}--- Procesando para: {correo} ---{Color.ENDC}")
                 if opcion == "1":
-                    codigo = obtener_codigo_via_imap(
-                        gmail_user=correo,
-                        required_keywords=["registr", "bienven", "código", "code", "verific"],
-                        query_exclude=EXCLUDE_OTP_GENERICO
-                    )
+                    codigo = None
+                    usa_w = False
+                    try:
+                        from otp_worker_client import worker_cubre_alias, esperar_desde_worker
+                        usa_w = bool(worker_cubre_alias(correo))
+                        if usa_w:
+                            codigo = esperar_desde_worker(
+                                correo, "register", max_wait_s=20, interval_s=0.25, silencioso=False,
+                            )
+                    except Exception:
+                        pass
+                    if not usa_w:
+                        codigo = obtener_codigo_via_imap(
+                            gmail_user=correo,
+                            required_keywords=["registr", "bienven", "código", "code", "verific"],
+                            query_exclude=EXCLUDE_OTP_GENERICO
+                        )
                     if codigo:
                         print(f"{Color.GREEN}{Color.BOLD}>>> CÓDIGO ENCONTRADO: {codigo} <<<{Color.ENDC}")
                     else:
                         print(f"{Color.FAIL}>>> No se encontró ningún código de registro reciente o las credenciales fallaron. <<<{Color.ENDC}")
                         
                 elif opcion == "2":
-                    codigo = obtener_codigo_via_imap(
-                        gmail_user=correo,
-                        required_keywords=["elimin", "desactiv", "delete", "code", "codigo"]
-                    )
+                    codigo = None
+                    usa_w = False
+                    try:
+                        from otp_worker_client import worker_cubre_alias, esperar_desde_worker
+                        usa_w = bool(worker_cubre_alias(correo))
+                        if usa_w:
+                            codigo = esperar_desde_worker(
+                                correo, "delete", max_wait_s=20, interval_s=0.25, silencioso=False,
+                            )
+                    except Exception:
+                        pass
+                    if not usa_w:
+                        codigo = obtener_codigo_via_imap(
+                            gmail_user=correo,
+                            required_keywords=["elimin", "desactiv", "delete", "code", "codigo"]
+                        )
                     if codigo:
                         print(f"{Color.GREEN}{Color.BOLD}>>> CÓDIGO ENCONTRADO: {codigo} <<<{Color.ENDC}")
                     else:
                         print(f"{Color.FAIL}>>> No se encontró ningún código de eliminación reciente o las credenciales fallaron. <<<{Color.ENDC}")
                         
                 elif opcion == "3":
-                    codigo = obtener_codigo_via_imap(
-                        gmail_user=correo,
-                        required_keywords=["código", "code", "inici"],
-                        query_exclude=EXCLUDE_OTP_GENERICO
-                    )
+                    codigo = None
+                    usa_w = False
+                    try:
+                        from otp_worker_client import worker_cubre_alias, esperar_desde_worker
+                        usa_w = bool(worker_cubre_alias(correo))
+                        if usa_w:
+                            codigo = esperar_desde_worker(
+                                correo, "login", max_wait_s=20, interval_s=0.25, silencioso=False,
+                            )
+                    except Exception:
+                        pass
+                    if not usa_w:
+                        codigo = obtener_codigo_via_imap(
+                            gmail_user=correo,
+                            required_keywords=["código", "codigo", "code", "inici", "login"],
+                            query_exclude=EXCLUDE_OTP_GENERICO
+                        )
                     if codigo:
                         print(f"{Color.GREEN}{Color.BOLD}>>> CÓDIGO ENCONTRADO: {codigo} <<<{Color.ENDC}")
                     else:

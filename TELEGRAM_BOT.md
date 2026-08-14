@@ -2,6 +2,8 @@
 
 Controla las opciones **1–5** y **9** desde el móvil. Códigos (1–3) y links (4–5) llegan en mensajes cortos con bloque `<code>` para copiar con un toque. 4/5/9 abren Chrome **con ventana** (vía Xvfb en Contabo) y proxies PE/NG.
 
+Los alias `@cheapmusic.best` usan el **Email Worker** (`otp.cheapmusic.best`), igual que `sesiones_imap.py`. En el VPS, `passwords.txt` debe incluir `email_worker_url` y `email_worker_secret`. Gmail nativo sigue por IMAP.
+
 ## 1. Preparar el bot
 
 1. En Telegram: [@BotFather](https://t.me/BotFather) → `/newbot` → copia el token.

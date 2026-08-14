@@ -343,11 +343,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/op1 — código registro\n"
         "/op2 — código eliminación\n"
         "/op3 — código login\n"
-        "/op4 — invitaciones (IMAP)\n"
+        "/op4 — invitaciones\n"
         "/op4_archivo — invitaciones desde archivo\n"
-        "/op5 — enlace reset IMAP\n"
+        "/op5 — enlace reset\n"
         "/op9 — restablecer contraseñas\n"
-        "/op12 — verificar IMAP en passwords.txt\n"
+        "/op12 — verificar Email Worker + IMAP\n"
         "/status — job actual\n"
         "/cancel — cancelar job o modo pegado\n"
         "/whoami — tu Telegram user id"
@@ -558,11 +558,11 @@ async def _start_job(update: Update, name: str, **kwargs) -> None:
         return
     job = _job_queue.submit(name, correos, chat_id=chat_id, **kwargs)
     if name in ("op1", "op2", "op3"):
-        modo = "Solo IMAP — codigo listo para copiar."
+        modo = "@cheapmusic.best por Email Worker; Gmail por IMAP. Código listo para copiar."
     elif name in ("op4", "op5"):
         modo = "Chrome visible + proxies. Link listo para copiar."
     elif name == "op12":
-        modo = "Verifica App Passwords en passwords.txt (sin Chrome)."
+        modo = "Verifica Email Worker (@cheapmusic.best) y App Passwords IMAP."
     else:
         modo = "Chrome visible + proxies PE/NG."
     await update.effective_message.reply_text(

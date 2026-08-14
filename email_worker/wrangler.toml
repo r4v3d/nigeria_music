@@ -1,0 +1,18 @@
+name = "tidal-otp-worker"
+main = "src/worker.js"
+compatibility_date = "2025-10-01"
+workers_dev = false
+
+routes = [
+  { pattern = "otp.cheapmusic.best", custom_domain = true }
+]
+
+[[kv_namespaces]]
+binding = "OTP"
+id = "cdf54fae793848968a168ba1b2584208"
+
+[vars]
+FORWARD_TO = "cakeseller1234@gmail.com"
+CATCHALL_DOMAIN = "cheapmusic.best"
+
+# wrangler secret put OTP_SECRET

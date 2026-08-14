@@ -34,6 +34,14 @@ def re_sub_email(c: str) -> str:
     return re.sub(r"^[\s\.]+|[\s\.]+$", "", (c or "").strip())
 
 
+def _usa_email_worker(correo: str) -> bool:
+    try:
+        from otp_worker_client import worker_cubre_alias
+        return bool(worker_cubre_alias(correo))
+    except Exception:
+        return False
+
+
 def ejecutar_opcion12(
     correos: list[str],
     *,
@@ -41,7 +49,7 @@ def ejecutar_opcion12(
     headless: bool = False,
     **_kwargs,
 ) -> dict[str, Any]:
-    """Opción 12: verificar que cada correo tiene App Password en passwords.txt."""
+    """Opción 12: verificar App Password IMAP y Email Worker (cheapmusic.best)."""
     correos = _norm_correos(correos)
     if not correos:
         return {
@@ -50,14 +58,25 @@ def ejecutar_opcion12(
             "error": "Sin correos activos",
         }
 
-    print("=== OPCIÓN 12 — Verificar IMAP en passwords.txt ===")
+    print("=== OPCIÓN 12 — Verificar IMAP / Email Worker ===")
     print(f"  Cuentas: {len(correos)}")
+    try:
+        from otp_worker_client import worker_salud
+        ok_w, info_w = worker_salud()
+        print(f"  Email Worker: {'OK' if ok_w else 'NO'}  {info_w}")
+    except Exception as e:
+        print(f"  Email Worker: no se pudo comprobar ({e})")
+
     ok_list: list[str] = []
     fail_list: list[str] = []
     for correo in correos:
         if cancel_check and cancel_check():
             fail_list.extend([c for c in correos if c not in ok_list and c not in fail_list])
             break
+        if _usa_email_worker(correo):
+            ok_list.append(correo)
+            print(f"  OK  {correo}  (worker @cheapmusic.best)")
+            continue
         if S.tiene_contrasena_imap_registrada(correo):
             ok_list.append(correo)
             print(f"  OK  {correo}")
@@ -66,7 +85,7 @@ def ejecutar_opcion12(
             print(f"  FALTA  {correo}")
 
     if not fail_list:
-        print(">>> TODO OK: todos tienen App Password IMAP.")
+        print(">>> TODO OK: IMAP o Email Worker cubren todas las cuentas.")
     else:
         print(f">>> Faltan {len(fail_list)} en passwords.txt")
     return {
@@ -213,7 +232,7 @@ def ejecutar_consulta_codigo_imap(
     headless: bool = False,  # ignorado (solo IMAP)
     **_kwargs,
 ) -> dict[str, Any]:
-    """Opciones 1/2/3: leer OTP por IMAP (registro / eliminación / login)."""
+    """Opciones 1/2/3: leer OTP por Email Worker (@cheapmusic.best) o IMAP."""
     correos = _norm_correos(correos)
     if not correos:
         return {
@@ -229,7 +248,7 @@ def ejecutar_consulta_codigo_imap(
         tipo = "registro"
         titulo = "OPCIÓN 1 — Código de REGISTRO"
         keywords = ["registr", "bienven", "código", "code", "verific"]
-        exclude: str | list | None = "cancel"
+        exclude: str | list | None = getattr(S, "EXCLUDE_OTP_GENERICO", "cancel")
         prefer_len: int | None = None
     elif tipo in ("2", "elim", "eliminacion", "eliminación", "op2", "delete"):
         tipo = "eliminacion"
@@ -240,11 +259,11 @@ def ejecutar_consulta_codigo_imap(
     else:
         tipo = "login"
         titulo = "OPCIÓN 3 — Código de LOGIN"
-        keywords = ["código", "code", "inici"]
-        exclude = "cancel"
+        keywords = ["código", "codigo", "code", "inici", "login"]
+        exclude = getattr(S, "EXCLUDE_OTP_GENERICO", "cancel")
         prefer_len = None
 
-    print(f"=== {titulo} (bot IMAP) ===")
+    print(f"=== {titulo} (bot) ===")
     print(f"  Cuentas: {len(correos)}")
 
     codigos: dict[str, str] = {}
@@ -253,24 +272,33 @@ def ejecutar_consulta_codigo_imap(
 
     for correo in correos:
         if cancel_check and cancel_check():
-            print("[IMAP] Cancelado.")
+            print("[BOT] Cancelado.")
             fail_list.extend([c for c in correos if c not in ok_list and c not in fail_list])
             break
         print(f"--- {correo} ---")
-        if not S.tiene_contrasena_imap_registrada(correo):
+        usa_worker = _usa_email_worker(correo)
+        if not usa_worker and not S.tiene_contrasena_imap_registrada(correo):
             print(f"  [IMAP] Sin App Password en passwords.txt para {correo}")
             fail_list.append(correo)
             continue
         try:
-            kwargs_imap: dict[str, Any] = {
-                "gmail_user": correo,
-                "required_keywords": keywords,
-                "query_exclude": exclude,
-                "silencioso": True,
-            }
-            if prefer_len is not None:
-                kwargs_imap["preferir_otp_len"] = prefer_len
-            codigo = S.obtener_codigo_via_imap(**kwargs_imap)
+            codigo = None
+            if usa_worker:
+                from otp_worker_client import esperar_desde_worker, kind_desde_keywords
+                codigo = esperar_desde_worker(
+                    correo, kind_desde_keywords(keywords),
+                    max_wait_s=20, interval_s=0.25, silencioso=False,
+                )
+            else:
+                kwargs_imap: dict[str, Any] = {
+                    "gmail_user": correo,
+                    "required_keywords": keywords,
+                    "query_exclude": exclude,
+                    "silencioso": True,
+                }
+                if prefer_len is not None:
+                    kwargs_imap["preferir_otp_len"] = prefer_len
+                codigo = S.obtener_codigo_via_imap(**kwargs_imap)
         except Exception as e:
             print(f"  [ERROR] {correo}: {e}")
             fail_list.append(correo)
@@ -333,7 +361,7 @@ def ejecutar_opcion4(
         origen_enlaces = "archivo"
         print(f"  [Enlaces] {len(enlaces_map)} desde linksextraidos.txt")
     else:
-        print("  Buscando enlaces por IMAP...")
+        print("  Buscando enlaces (worker @cheapmusic.best / IMAP)...")
         enlaces_map = S.asignar_enlaces_invitacion_a_correos(correos)
         origen_enlaces = "imap"
 
