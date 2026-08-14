@@ -1323,66 +1323,100 @@ def _invite_pulsar_continuar_o_login(page) -> bool:
     return False
 
 
-def _invite_arrancar_prefetch_otp(estado: dict, correo: str, *, es_alta: bool) -> None:
-    """Empieza a pedir el OTP al worker en cuanto Tidal manda el mail (no espera a la UI)."""
-    if estado.get("_otp_prefetch_started"):
-        return
+def _invite_escribir_otp(page, codigo: str) -> bool:
+    """Rellena el OTP de invitación por JS (sin waits de Playwright) y verifica lectura."""
+    codigo = re.sub(r"\D", "", str(codigo or ""))
+    if not codigo:
+        return False
     try:
-        from otp_worker_client import worker_cubre_alias, esperar_desde_worker
-        if not worker_cubre_alias(correo):
-            return
+        ok = page.evaluate(
+            """(d) => {
+                const vis = (el) => {
+                    const st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1)
+                        return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 4 && r.height > 4;
+                };
+                const fire = (el, val) => {
+                    const proto = window.HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(el, val);
+                    else el.value = val;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: val, inputType: 'insertText' }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                };
+                const boxes = Array.from(document.querySelectorAll('input')).filter((el) => {
+                    if (!vis(el)) return false;
+                    const ml = (el.getAttribute('maxlength') || '').trim();
+                    const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+                    return ml === '1' || ac === 'one-time-code';
+                });
+                if (boxes.length >= 4) {
+                    const n = Math.min(boxes.length, d.length);
+                    for (let i = 0; i < n; i++) fire(boxes[i], d[i]);
+                    const leido = boxes.slice(0, n).map((el) => (el.value || '').trim()).join('');
+                    return leido === d.slice(0, n);
+                }
+                const one = Array.from(document.querySelectorAll(
+                    'input[autocomplete="one-time-code"], input[name*="code" i], input[inputmode="numeric"]'
+                )).find(vis);
+                if (one) {
+                    fire(one, d);
+                    return (one.value || '').replace(/\\D/g, '') === d;
+                }
+                return false;
+            }""",
+            codigo,
+        )
+        if ok:
+            return True
     except Exception:
-        return
-    estado["_otp_prefetch_started"] = True
-    estado["_otp_prefetch_done"] = False
-    estado["otp_prefetch"] = None
+        pass
+    try:
+        return bool(escribir_codigo_verificacion_inteligente(page, codigo))
+    except Exception:
+        return False
+
+
+def _invite_arrancar_prefetch_otp(estado: dict, correo: str, *, es_alta: bool) -> None:
+    """No-op: sondear /claim antes del PUT cachea KV vacío y retrasa el OTP 20–60 s."""
+    return
+
+
+def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 25.0) -> str | None:
+    """Sondea el worker al instante. Tidal entrega el OTP en <1 s; no hay Resend en este canal."""
     kind = "register" if es_alta else "login"
-    gen = int(estado.get("_otp_gen") or 0)
-
-    def _run():
-        try:
-            val = esperar_desde_worker(
-                correo, kind,
-                max_wait_s=20.0,
-                interval_s=0.18,
-                after_email_id=0,
-                max_age_minutes=12,
-                silencioso=True,
-            )
-            if int(estado.get("_otp_gen") or 0) == gen:
-                estado["otp_prefetch"] = val
-        except Exception:
-            if int(estado.get("_otp_gen") or 0) == gen:
-                estado["otp_prefetch"] = None
-        if int(estado.get("_otp_gen") or 0) == gen:
-            estado["_otp_prefetch_done"] = True
-
-    threading.Thread(target=_run, daemon=True, name=f"otp-prefetch-{correo}").start()
-
-
-def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 8.0) -> str | None:
-    """Usa el prefetch si ya llegó; si no, sondea el worker cada ~0.12 s."""
-    _invite_arrancar_prefetch_otp(estado, correo, es_alta=es_alta)
+    despues = float(estado.get("otp_despues") or 0) or None
     t0 = time.time()
-    while time.time() - t0 < max_wait_s:
-        codigo = estado.get("otp_prefetch")
-        if codigo:
-            return str(codigo)
-        time.sleep(0.12)
-    codigo = estado.get("otp_prefetch")
-    if codigo:
-        return str(codigo)
+    ultimo_hb = 0.0
     try:
         from otp_worker_client import reclamar_desde_worker
-        kind = "register" if es_alta else "login"
-        return reclamar_desde_worker(
-            correo, kind,
-            max_age_minutes=12,
-            after_email_id=0,
-            silencioso=False,
-        )
     except Exception:
-        return None
+        reclamar_desde_worker = None
+    while time.time() - t0 < max_wait_s:
+        claimed = None
+        if reclamar_desde_worker:
+            claimed = reclamar_desde_worker(
+                correo, kind,
+                max_age_minutes=12,
+                after_email_id=0,
+                silencioso=True,
+                consume=True,
+                despues_de=despues,
+            )
+        if claimed:
+            print(f"    [WORKER] [{correo}] Código {kind} en {time.time() - t0:.1f}s", flush=True)
+            return str(claimed)
+        elapsed = time.time() - t0
+        if elapsed >= 3.0 and elapsed - ultimo_hb >= 4.0:
+            print(f"    [WORKER] [{correo}] Esperando código {kind}... ({elapsed:.0f}s/{max_wait_s:.0f}s)",
+                  flush=True)
+            ultimo_hb = elapsed
+        time.sleep(0.22)
+    return None
 
 
 def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dict) -> str:
@@ -1424,7 +1458,18 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 usa_worker = bool(worker_cubre_alias(correo))
             except Exception:
                 pass
-            _cd_otp = 5.0 if usa_worker else 10.0
+            if estado.get("otp_valor"):
+                print(f"    [Invitación] [{correo}] Reutilizando código {estado.get('otp_valor')}...",
+                      flush=True)
+                wrote = _invite_escribir_otp(page, str(estado.get("otp_valor")))
+                if wrote:
+                    estado["otp_escrito"] = True
+                _invite_pulsar_continuar_o_login(page)
+                time.sleep(1.0)
+                if _invite_detectar_exito(page):
+                    return "ok"
+                return "progreso" if wrote or estado.get("otp_escrito") else "esperar"
+            _cd_otp = 1.0 if usa_worker else 10.0
             if estado.get("codigo_intentado") and (
                 time.time() - float(estado.get("codigo_ts") or 0)
             ) < _cd_otp:
@@ -1432,7 +1477,6 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
             if not pwd_cuenta and estado.get("codigo_intentado") and not usa_worker:
                 return "esperar"
             estado["codigo_intentado"] = True
-            estado["codigo_ts"] = time.time()
             print(f"    [Invitación] [{correo}] Sin modo contraseña visible. "
                   f"Obteniendo código de acceso...")
             if not estado.get("baseline_id"):
@@ -1444,29 +1488,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
             print(f"    [Invitación] [{correo}] Obteniendo código por {canal}...")
             codigo = None
             if usa_worker:
-                codigo = _invite_tomar_otp_worker(estado, correo, es_alta=False, max_wait_s=8.0)
-                if not codigo:
-                    try:
-                        btn_resend = esperar_locator_en_frames(
-                            page,
-                            [
-                                "button:has-text('Resend code')", "button:has-text('Resend')",
-                                "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
-                                "a:has-text('Resend')", "a:has-text('Reenviar')",
-                            ],
-                            timeout_s=1.2,
-                        )
-                        if btn_resend:
-                            print(f"    [Invitación] [{correo}] Código no llegó en 8 s; pulsando Resend...")
-                            btn_resend.click(force=True, timeout=2500)
-                            estado["_otp_gen"] = int(estado.get("_otp_gen") or 0) + 1
-                            estado["_otp_prefetch_started"] = False
-                            estado["_otp_prefetch_done"] = False
-                            estado["otp_prefetch"] = None
-                            _invite_arrancar_prefetch_otp(estado, correo, es_alta=False)
-                            codigo = _invite_tomar_otp_worker(estado, correo, es_alta=False, max_wait_s=8.0)
-                    except Exception:
-                        pass
+                codigo = _invite_tomar_otp_worker(estado, correo, es_alta=False, max_wait_s=25.0)
             else:
                 for intento in range(1, 13):
                     codigo = obtener_codigo_via_imap(
@@ -1479,11 +1501,16 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                         break
                     print(f"    [Invitación] [{correo}] Esperando código IMAP ({intento}/12)...")
                     time.sleep(8.0)
+            estado["codigo_ts"] = time.time()
             if not codigo:
+                if usa_worker:
+                    return "esperar"
                 print(f"    {Color.FAIL}[Invitación] [{correo}] No llegó el código de acceso.{Color.ENDC}")
                 return "esperar"
+            estado["otp_valor"] = str(codigo)
             print(f"    [Invitación] [{correo}] Código obtenido: {codigo}. Escribiéndolo...")
-            if escribir_codigo_verificacion_inteligente(page, codigo):
+            if _invite_escribir_otp(page, str(codigo)):
+                estado["otp_escrito"] = True
                 time.sleep(1.0)
                 _invite_pulsar_continuar_o_login(page)
                 time.sleep(2.5)
@@ -1676,7 +1703,7 @@ def abrir_enlace_familia_con_autocierre(url: str, correo: str, proxy_pe: dict | 
             nonlocal context, page
             try:
                 if context:
-                    context.close()
+                    context.close(timeout=4000)
             except Exception:
                 pass
             context = None
@@ -1972,7 +1999,7 @@ def abrir_enlace_restablecimiento_con_autocierre(url: str, correo: str, proxy_pe
             nonlocal context, page
             try:
                 if context:
-                    context.close()
+                    context.close(timeout=4000)
             except Exception:
                 pass
             context = None
@@ -9938,52 +9965,59 @@ class TidalResetPasswordManager:
                 )
 
             manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (Envío)")
-            time.sleep(1.0)
-            
-            # Solo aquí: UI confirmó avance → mensaje fiel y cierre para abrir el enlace limpio
-            print(f"  [Reset Pass] [{self.client_email}] Solicitud de restablecimiento enviada (UI confirmada). Cerrando la ventana actual...")
-            self.cerrar_navegador(liberar_proxy=False)
-            time.sleep(1.5)
-            
-            # Sincronización tras el envío de correo de restablecimiento
-            self.esperar_barrera("post_solicitud")
-            
-            # 5. Enlace de reset: worker (sondeo 0.22 s) o IMAP (Gmail nativo).
-            print("  [Reset Pass] Buscando enlace de restablecimiento enviado por correo...")
-            enlace_reset = None
-            usa_worker_reset = False
-            try:
-                from otp_worker_client import cubre_y_esperar_reset, worker_config, worker_cubre_alias
-                if worker_cubre_alias(self.client_email):
-                    usa_worker_reset = True
-                    _, enlace_reset = cubre_y_esperar_reset(self.client_email, max_wait_s=50.0)
-                    if (not enlace_reset) and worker_config().get("imap_fallback"):
-                        usa_worker_reset = False
-            except Exception as e_wreset:
-                print(f"  [Reset Pass] [WARN] Worker reset: {e_wreset}")
+
+            print(f"  [Reset Pass] [{self.client_email}] Solicitud enviada. Reclamando enlace...")
+            enlace_box: dict = {"val": None, "usa_worker": False}
+
+            def _claim_enlace_reset():
                 try:
-                    from otp_worker_client import worker_cubre_alias
-                    usa_worker_reset = bool(worker_cubre_alias(self.client_email))
+                    from otp_worker_client import cubre_y_esperar_reset, worker_config, worker_cubre_alias
+                    if worker_cubre_alias(self.client_email):
+                        enlace_box["usa_worker"] = True
+                        _, val = cubre_y_esperar_reset(self.client_email, max_wait_s=20.0)
+                        if val and str(val).startswith("http"):
+                            enlace_box["val"] = val
+                            return
+                        if not worker_config().get("imap_fallback"):
+                            return
+                    for intento in range(1, 13):
+                        print(f"  [Reset Pass] Intento IMAP {intento}/12: buscando correo de reset...")
+                        val = obtener_codigo_via_imap(
+                            gmail_user=self.client_email,
+                            required_keywords=KEYWORDS_RESTABLECER_PWD,
+                            query_exclude="invited to a tidal family",
+                            after_email_id=reset_baseline_id,
+                            max_age_minutes=15,
+                            solo_link=True,
+                        )
+                        if val and str(val).startswith("http"):
+                            enlace_box["val"] = val
+                            return
+                        time.sleep(2.0 if intento < 6 else 4.0)
+                except Exception as e_wreset:
+                    print(f"  [Reset Pass] [WARN] Enlace reset: {e_wreset}")
+
+            t_claim = threading.Thread(
+                target=_claim_enlace_reset, daemon=True, name=f"reset-claim-{self.client_email}"
+            )
+            t_claim.start()
+
+            print(f"  [Reset Pass] [{self.client_email}] Cerrando la ventana actual...")
+            self.cerrar_navegador(liberar_proxy=False)
+            t_claim.join(timeout=22.0)
+            enlace_reset = enlace_box["val"]
+            usa_worker_reset = bool(enlace_box["usa_worker"])
+
+            if usa_worker_reset and (not enlace_reset or not str(enlace_reset).startswith("http")):
+                try:
+                    from otp_worker_client import cubre_y_esperar_reset
+                    _, enlace_reset = cubre_y_esperar_reset(self.client_email, max_wait_s=8.0)
                 except Exception:
-                    usa_worker_reset = False
-            if not usa_worker_reset:
-                _max_intentos_imap = 30  # 30 * ~10s ≈ 5 min
-                for intento in range(1, _max_intentos_imap + 1):
-                    print(f"  [Reset Pass] Intento {intento}/{_max_intentos_imap}: Buscando correo de cambio de contraseña...")
-                    enlace_reset = obtener_codigo_via_imap(
-                        gmail_user=self.client_email,
-                        required_keywords=KEYWORDS_RESTABLECER_PWD,
-                        query_exclude="invited to a tidal family",
-                        after_email_id=reset_baseline_id,
-                        max_age_minutes=15,
-                        solo_link=True
-                    )
-                    if enlace_reset and enlace_reset.startswith("http"):
-                        break
-                    if intento < _max_intentos_imap:
-                        time.sleep(8.0 + random.uniform(0.0, 3.0))
-            
-            if not enlace_reset or not enlace_reset.startswith("http"):
+                    pass
+
+            self.esperar_barrera("post_solicitud")
+
+            if not enlace_reset or not str(enlace_reset).startswith("http"):
                 raise RuntimeError("No se pudo extraer el enlace de reinicio automáticamente.")
                 
             # --- PARTE 2: Abrir el enlace de restablecimiento con el mismo proxy de Perú ---
@@ -10019,7 +10053,7 @@ class TidalResetPasswordManager:
                 else:
                     self.page.keyboard.press("Enter")
                     
-                time.sleep(6.0)
+                time.sleep(2.5)
                 print(f"  {Color.GREEN}[OK] Contraseña restablecida con éxito para {self.client_email}.{Color.ENDC}")
                 
                 # Sincronización final antes de terminar

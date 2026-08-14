@@ -29,7 +29,7 @@ export default {
         })
       );
       if (item && alias) {
-        await pushItem(env.OTP, alias, item);
+        await pushItem(env, alias, item);
       }
     } catch (err) {
       console.log("email parse error", String(err));
@@ -61,7 +61,7 @@ export default {
       if (!alias || !KINDS.includes(kind)) {
         return json({ ok: false, error: "alias and kind required" }, 400);
       }
-      const hit = await claimItem(env.OTP, alias, kind, afterTs, maxAge, consume);
+      const hit = await claimItem(env, alias, kind, afterTs, maxAge, consume);
       if (!hit) return json({ ok: false, found: false });
       return json({ ok: true, found: true, value: hit.value, kind: hit.kind, ts: hit.ts, subject: hit.subject });
     }
@@ -70,13 +70,13 @@ export default {
       const kind = (url.searchParams.get("kind") || "invite").trim().toLowerCase();
       const maxAge = Number(url.searchParams.get("max_age") || "86400") || 86400;
       if (!alias) return json({ ok: false, error: "alias required" }, 400);
-      const items = await listItems(env.OTP, alias, kind, maxAge);
+      const items = await listItems(env, alias, kind, maxAge);
       return json({ ok: true, items });
     }
     if (url.pathname === "/peek") {
       const alias = (url.searchParams.get("alias") || "").trim().toLowerCase();
       if (!alias) return json({ ok: false, error: "alias required" }, 400);
-      const items = await readBox(env.OTP, alias);
+      const items = await readBox(env, alias);
       return json({ ok: true, alias, count: items.length, items });
     }
     return json({ ok: false, error: "not found" }, 404);
@@ -86,7 +86,11 @@ export default {
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store, no-cache, must-revalidate",
+      "cdn-cache-control": "no-store",
+    },
   });
 }
 
@@ -282,8 +286,12 @@ function isJunkOtp(n) {
 function extractOtp(text) {
   const cleaned = String(text || "").replace(/#[0-9A-Fa-f]{3,8}\b/g, " ");
   const stripped = stripHtml(cleaned);
+  const bracket = stripped.match(/\[(\d{6})\]/);
+  if (bracket && !isJunkOtp(bracket[1])) return bracket[1];
+  const lead = stripped.match(/(?:^|\n)\s*(\d{6})\s*[-–—]/);
+  if (lead && !isJunkOtp(lead[1])) return lead[1];
   const nearRe =
-    /(?:^|[^a-záéíóúñ])(?:c[oó]digo|code|sign[-\s]?in|verification|one[-\s]?time|introduce|ingresa|enter)[^\d]{0,240}(\d{5,6})/gi;
+    /(?:^|[^a-záéíóúñ])(?:c[oó]digo|code|sign[-\s]?in|sign[-\s]?up|verification|one[-\s]?time|introduce|ingresa|enter)[^\d]{0,240}(\d{5,6})/gi;
   for (const m of stripped.matchAll(nearRe)) {
     if (!isJunkOtp(m[1])) return m[1];
   }
@@ -301,8 +309,12 @@ function extractOtp(text) {
 
 function extractReset(text) {
   const t = unescapeHtml(String(text || ""));
-  const m = t.match(/https?:\/\/login\.tidal\.com\/resetpass\/[A-Za-z0-9._~\-]+/i);
-  return m ? m[0].replace(/[>"']+$/, "") : null;
+  const direct = t.match(/https?:\/\/login\.tidal\.com\/resetpass\/[^\s"'<>]+/i);
+  if (direct) return direct[0].replace(/[>"']+$/, "");
+  const wrapped = t.match(/https?:\/\/[^\s"'<>]*tidal\.com\/[^\s"'<>]*resetpass\/[^\s"'<>]+/i);
+  if (wrapped) return wrapped[0].replace(/[>"']+$/, "");
+  const ab = t.match(/https?:\/\/ablink\.(?:info\.)?tidal\.com\/[^\s"'<>]+/i);
+  return ab ? ab[0].replace(/[>"']+$/, "") : null;
 }
 
 function extractInvite(text) {
@@ -342,8 +354,12 @@ function classifyTidal(decoded, alias) {
     return null;
   }
 
-  const reset = extractReset(full);
-  if (reset || /resetpass|restablecer tu contrase|resetting your tidal password|reset your password/.test(blob)) {
+  if (
+    /resetpass|restablecer tu contrase|resetting your tidal password|reset your password|restaurar su contrase|forgot your password/.test(
+      blob
+    )
+  ) {
+    const reset = extractReset(full);
     if (reset) return { ...base, kind: "reset", value: reset };
   }
 
@@ -375,7 +391,7 @@ function classifyTidal(decoded, alias) {
     return { ...base, kind: "login", value: otp };
   }
   if (
-    /registr|bienven|sign-?up|finish creating|terminar de crear/.test(blob)
+    /registr|bienven|sign[-\s]?up|finish creating|terminar de crear/.test(blob)
   ) {
     return { ...base, kind: "register", value: otp };
   }
@@ -386,26 +402,31 @@ function kvKey(alias) {
   return "box:" + String(alias || "").trim().toLowerCase();
 }
 
-async function readBox(kv, alias) {
-  try {
-    const raw = await kv.get(kvKey(alias));
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
+function itemKey(alias, id) {
+  return "item:" + String(alias || "").trim().toLowerCase() + ":" + String(id || "");
 }
 
-async function writeBox(kv, alias, items) {
-  const trimmed = items.slice(-MAX_ITEMS);
-  await kv.put(kvKey(alias), JSON.stringify(trimmed), { expirationTtl: 60 * 60 * 36 });
+function hitKey(alias, tsSec) {
+  return "hit:" + String(alias || "").trim().toLowerCase() + ":" + String(Math.floor(Number(tsSec) || 0));
 }
 
-async function pushItem(kv, alias, item) {
-  const items = await readBox(kv, alias);
-  items.push(item);
-  await writeBox(kv, alias, items);
+const MEM = new Map();
+
+function memItems(alias) {
+  const a = String(alias || "").trim().toLowerCase();
+  const arr = MEM.get(a);
+  return Array.isArray(arr) ? arr : [];
+}
+
+function memPush(alias, item) {
+  const a = String(alias || "").trim().toLowerCase();
+  const arr = memItems(a);
+  arr.push(item);
+  MEM.set(a, arr.slice(-MAX_ITEMS));
+}
+
+function memReplace(alias, items) {
+  MEM.set(String(alias || "").trim().toLowerCase(), (items || []).slice(-MAX_ITEMS));
 }
 
 function findUnclaimed(items, kinds, afterTs, maxAge, now) {
@@ -421,9 +442,126 @@ function findUnclaimed(items, kinds, afterTs, maxAge, now) {
   return -1;
 }
 
-async function claimItem(kv, alias, kind, afterTs, maxAge, consume) {
+async function cachePut(alias, items) {
+  try {
+    const req = new Request("https://otp.internal/box/" + encodeURIComponent(String(alias).toLowerCase()));
+    await caches.default.put(
+      req,
+      new Response(JSON.stringify(items || []), {
+        headers: { "content-type": "application/json", "Cache-Control": "max-age=180" },
+      })
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+async function cacheGet(alias) {
+  try {
+    const req = new Request("https://otp.internal/box/" + encodeURIComponent(String(alias).toLowerCase()));
+    const hit = await caches.default.match(req);
+    if (!hit) return null;
+    const arr = await hit.json();
+    return Array.isArray(arr) ? arr : null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadHits(kv, alias, now) {
+  const nowSec = Math.floor(now);
+  const gets = [];
+  for (let s = nowSec - 1; s >= nowSec - 12; s--) {
+    gets.push(kv.get(hitKey(alias, s)));
+  }
+  const raws = await Promise.all(gets);
+  const items = [];
+  for (const raw of raws) {
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      for (const it of arr) {
+        if (it && it.value) items.push(it);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  items.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+  return items;
+}
+
+async function listItemKeys(kv, alias) {
+  const prefix = "item:" + String(alias || "").trim().toLowerCase() + ":";
+  const listed = await kv.list({ prefix, limit: 40 });
+  return (listed && listed.keys) || [];
+}
+
+async function loadItemsFromKv(kv, alias) {
+  const keys = await listItemKeys(kv, alias);
+  const items = [];
+  for (const k of keys) {
+    try {
+      const raw = await kv.get(k.name);
+      if (!raw) continue;
+      const it = JSON.parse(raw);
+      if (it && it.value) items.push({ ...it, _key: k.name });
+    } catch {
+      /* ignore */
+    }
+  }
+  items.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+  return items;
+}
+
+async function readBox(env, alias) {
+  const mem = memItems(alias);
+  if (mem.length) return mem;
+  const cached = await cacheGet(alias);
+  if (cached && cached.length) {
+    memReplace(alias, cached);
+    return cached;
+  }
+  if (env && env.OTP) return loadItemsFromKv(env.OTP, alias);
+  return [];
+}
+
+async function pushItem(env, alias, item) {
+  memPush(alias, item);
+  await cachePut(alias, memItems(alias));
+  if (env && env.OTP) {
+    try {
+      const body = JSON.stringify(item);
+      const ttl = { expirationTtl: 60 * 60 * 2 };
+      await Promise.all([
+        env.OTP.put(itemKey(alias, item.id), body, ttl),
+        env.OTP.put(hitKey(alias, item.ts), body, ttl),
+      ]);
+    } catch (err) {
+      console.log("kv push error", String(err));
+    }
+  }
+}
+
+async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
   const now = Date.now() / 1000;
-  const items = await readBox(kv, alias);
+  let items = memItems(alias);
+  if (!items.length) {
+    const cached = await cacheGet(alias);
+    if (cached && cached.length) items = cached;
+  }
+  if (env && env.OTP) {
+    const hits = await loadHits(env.OTP, alias, now);
+    if (hits.length) {
+      const byId = new Map(items.map((it) => [it.id || it.value, it]));
+      for (const it of hits) byId.set(it.id || it.value, it);
+      items = [...byId.values()];
+    }
+  }
+  if (!items.length && env && env.OTP && kind !== "login" && kind !== "register" && kind !== "reset") {
+    items = await loadItemsFromKv(env.OTP, alias);
+  }
   let idx = findUnclaimed(items, [kind], afterTs, maxAge, now);
   if (idx < 0 && (kind === "login" || kind === "register")) {
     const other = kind === "login" ? "register" : "login";
@@ -433,14 +571,29 @@ async function claimItem(kv, alias, kind, afterTs, maxAge, consume) {
   const hit = items[idx];
   if (consume) {
     items[idx] = { ...hit, claimed: true };
-    await writeBox(kv, alias, items);
+    memReplace(alias, items);
+    await cachePut(alias, items);
+    if (env && env.OTP) {
+      const marked = { ...hit, claimed: true };
+      delete marked._key;
+      const body = JSON.stringify(marked);
+      const ttl = { expirationTtl: 60 * 60 * 2 };
+      try {
+        await Promise.all([
+          env.OTP.put(hit._key || itemKey(alias, hit.id), body, ttl),
+          env.OTP.put(hitKey(alias, hit.ts), body, ttl),
+        ]);
+      } catch {
+        /* ignore */
+      }
+    }
   }
   return hit;
 }
 
-async function listItems(kv, alias, kind, maxAge) {
+async function listItems(env, alias, kind, maxAge) {
   const now = Date.now() / 1000;
-  const items = await readBox(kv, alias);
+  const items = await readBox(env, alias);
   return items.filter(
     (it) =>
       it &&

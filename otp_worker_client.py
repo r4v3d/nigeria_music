@@ -8,12 +8,36 @@ import time
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 _CFG_CACHE: dict | None = None
 _CFG_MTIME: float | None = None
 _BASELINE_TS: dict[str, float] = {}
+_SESSION: requests.Session | None = None
+_LAST_NET_ERR = 0.0
+
+
+def _http_session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=2,
+            backoff_factor=0.2,
+            status_forcelist=(502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16)
+        sess = requests.Session()
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _SESSION = sess
+    return _SESSION
 
 
 def _pares_passwords() -> list[tuple[str, str]]:
@@ -43,7 +67,7 @@ def worker_config() -> dict:
         mtime = None
     if _CFG_CACHE is not None and mtime == _CFG_MTIME:
         return _CFG_CACHE
-    cfg = {"url": "", "secret": "", "imap_fallback": False, "timeout": 2.5}
+    cfg = {"url": "", "secret": "", "imap_fallback": False, "timeout": 8.0}
     for key, val in _pares_passwords():
         if key in ("email_worker_url", "otp_worker_url") and val:
             cfg["url"] = val.rstrip("/")
@@ -110,9 +134,13 @@ def _get(path: str, params: dict) -> dict | None:
     if not cfg["url"] or not cfg["secret"]:
         return None
     url = cfg["url"] + path
-    headers = {"X-OTP-Secret": cfg["secret"]}
+    headers = {
+        "X-OTP-Secret": cfg["secret"],
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=cfg["timeout"])
+        r = _http_session().get(url, params=params, headers=headers, timeout=cfg["timeout"])
         if r.status_code == 401:
             print("    [WORKER] Secreto incorrecto (401). Revisa email_worker_secret en passwords.txt")
             return None
@@ -122,7 +150,11 @@ def _get(path: str, params: dict) -> dict | None:
         data = r.json()
         return data if isinstance(data, dict) else None
     except Exception as e:
-        print(f"    [WORKER] Error de red: {e}")
+        global _LAST_NET_ERR
+        now = time.time()
+        if now - _LAST_NET_ERR >= 5.0:
+            print(f"    [WORKER] Error de red: {e}")
+            _LAST_NET_ERR = now
         return None
 
 
@@ -193,6 +225,7 @@ def reclamar_desde_worker(
     after_email_id: int = 0,
     silencioso: bool = False,
     consume: bool = True,
+    despues_de: float | None = None,
 ) -> str | None:
     alias = (alias or "").strip().lower()
     kind = (kind or "").strip().lower()
@@ -200,6 +233,11 @@ def reclamar_desde_worker(
         return None
     max_age = max(60, int((max_age_minutes or 15) * 60))
     after_ts = _after_ts_claim(alias, after_email_id)
+    if despues_de:
+        try:
+            after_ts = max(after_ts, float(despues_de))
+        except Exception:
+            pass
     params = {
         "alias": alias,
         "kind": kind,
@@ -207,11 +245,9 @@ def reclamar_desde_worker(
         "max_age": str(max_age),
         "consume": "1" if consume else "0",
         "secret": worker_config()["secret"],
+        "_": f"{time.time():.3f}",
     }
     data = _get("/claim", params)
-    if (not data or not data.get("ok") or not data.get("value")) and kind in ("login", "register"):
-        params["kind"] = "login" if kind == "register" else "register"
-        data = _get("/claim", params)
     if not data or not data.get("ok") or not data.get("value"):
         return None
     val = str(data.get("value") or "").strip()
@@ -229,32 +265,40 @@ def esperar_desde_worker(
     kind: str,
     *,
     max_wait_s: float = 18.0,
-    interval_s: float = 0.25,
+    interval_s: float = 0.22,
     after_email_id: int = 0,
     max_age_minutes: int = 15,
     silencioso: bool = False,
+    consume: bool = True,
+    despues_de: float | None = None,
 ) -> str | None:
-    """Sondea /claim cada ~250 ms hasta que el correo llegue al worker."""
+    """Sondea /claim cada ~200 ms hasta que el correo llegue al worker."""
     alias = (alias or "").strip().lower()
     if not worker_cubre_alias(alias):
         return None
     t0 = time.time()
     visto = False
-    while time.time() - t0 < max(1.0, float(max_wait_s)):
+    ultimo_hb = 0.0
+    tope = max(1.0, float(max_wait_s))
+    while time.time() - t0 < tope:
         val = reclamar_desde_worker(
             alias, kind,
             max_age_minutes=max_age_minutes,
             after_email_id=after_email_id,
             silencioso=True,
+            consume=consume,
+            despues_de=despues_de,
         )
         if val:
             if not silencioso:
-                print(f"    [WORKER] {kind} para {alias}: {val[:96]} ({time.time() - t0:.1f}s)")
+                print(f"    [WORKER] {kind} para {alias}: {val[:96]} ({time.time() - t0:.1f}s)", flush=True)
             return val
-        if not silencioso and not visto:
-            print(f"    [WORKER] Esperando {kind} para {alias}...")
+        elapsed = time.time() - t0
+        if not silencioso and elapsed >= 2.0 and (not visto or elapsed - ultimo_hb >= 3.0):
+            print(f"    [WORKER] Esperando {kind} para {alias}... ({elapsed:.0f}s/{tope:.0f}s)", flush=True)
             visto = True
-        time.sleep(max(0.12, float(interval_s)))
+            ultimo_hb = elapsed
+        time.sleep(max(0.08, float(interval_s)))
     return None
 
 
@@ -349,13 +393,13 @@ def listar_invites_worker(alias: str, max_age_minutes: int = 1440) -> list[dict]
     return out
 
 
-def cubre_y_esperar_reset(alias: str, max_wait_s: float = 50.0) -> tuple[bool, str | None]:
+def cubre_y_esperar_reset(alias: str, max_wait_s: float = 20.0) -> tuple[bool, str | None]:
     """Si el catch-all va por worker, espera el enlace de reset (sin IMAP)."""
     if not worker_cubre_alias(alias):
         return False, None
     val = esperar_desde_worker(
         alias, "reset",
-        max_wait_s=max(8.0, float(max_wait_s)),
+        max_wait_s=max(6.0, float(max_wait_s)),
         interval_s=0.22,
         after_email_id=0,
         max_age_minutes=20,
