@@ -1063,6 +1063,122 @@ def _invite_eval_modo_contrasena(page, accion: str):
         return None
 
 
+def _invite_detectar_error_otp(page) -> tuple[bool, str]:
+    """Detecta si la pantalla de código OTP mostró un error, rate-limit o código inválido."""
+    try:
+        res = page.evaluate("""() => {
+            const txt = ((document.body ? document.body.innerText : '') + ' ' + (document.title || '')).toLowerCase();
+            
+            // 1. Rate-limit o espera
+            if (/espera\\s*\\d+\\s*segundos|wait\\s*\\d+\\s*seconds|demasiados\\s*intentos|too\\s*many\\s*attempts/i.test(txt)) {
+                return { error: true, tipo: 'rate_limit', msg: 'Rate limit / espera solicitada por Tidal' };
+            }
+            
+            // 2. Código inválido o incorrecto
+            const reInvalido = /c[oó]digo\\s*no\\s*v[aá]lido|c[oó]digo\\s*incorrecto|invalid\\s*code|incorrect\\s*code|wrong\\s*code|code\\s*is\\s*incorrect|el\\s*c[oó]digo\\s*no\\s*es\\s*v[aá]lido|that\\s*code\\s*isn'?t\\s*valid|code\\s*you\\s*entered\\s*is\\s*incorrect|ha\\s*caducado|code\\s*expired/i;
+            if (reInvalido.test(txt)) {
+                return { error: true, tipo: 'invalido', msg: 'Código incorrecto o no válido' };
+            }
+            
+            // 3. Inputs marcados con aria-invalid o error
+            const invalidInputs = Array.from(document.querySelectorAll('input[aria-invalid="true"], input.is-invalid, input[class*="error" i]')).filter(el => {
+                const st = window.getComputedStyle(el);
+                return st.display !== 'none' && st.visibility !== 'hidden';
+            });
+            if (invalidInputs.length > 0) {
+                return { error: true, tipo: 'input_invalido', msg: 'Campos OTP marcados como inválidos' };
+            }
+            
+            // 4. Banners de alerta o error visibles
+            const alerts = Array.from(document.querySelectorAll('[role="alert"], [class*="banner" i], [class*="toast" i], [class*="alert" i], [class*="error" i]')).filter(el => {
+                const st = window.getComputedStyle(el);
+                return st.display !== 'none' && st.visibility !== 'hidden' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+            });
+            for (const a of alerts) {
+                const atxt = (a.innerText || a.textContent || '').toLowerCase();
+                if (reInvalido.test(atxt) || /espera|wait|error|incorrect/i.test(atxt)) {
+                    return { error: true, tipo: 'banner_error', msg: (a.innerText || a.textContent || '').trim().slice(0, 80) };
+                }
+            }
+            
+            return { error: false, tipo: '', msg: '' };
+        }""")
+        if res and isinstance(res, dict) and res.get("error"):
+            return True, str(res.get("msg") or res.get("tipo") or "error")
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _invite_limpiar_cajas_otp(page) -> None:
+    """Limpia las cajas de texto de OTP en pantalla."""
+    try:
+        page.evaluate("""() => {
+            const boxes = Array.from(document.querySelectorAll('input')).filter(el => {
+                const ml = (el.getAttribute('maxlength') || '').trim();
+                const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+                return ml === '1' || ac === 'one-time-code' || (el.inputMode || '').toLowerCase() === 'numeric';
+            });
+            boxes.forEach(b => {
+                const proto = window.HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(b, '');
+                else b.value = '';
+                b.dispatchEvent(new Event('input', { bubbles: true }));
+                b.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        }""")
+    except Exception:
+        pass
+
+
+def _invite_pulsar_reenviar_codigo(page) -> bool:
+    """Pulsa el enlace o botón de 'Reenviar código' / 'Resend code'."""
+    try:
+        clicked = bool(page.evaluate("""() => {
+            const cands = Array.from(document.querySelectorAll('button, a, [role="button"], span, p'));
+            const resendRe = /^reenviar(\\s*el)?\\s*c[oó]digo$|^resend(\\s*code)?$/i;
+            for (const el of cands) {
+                const txt = (el.innerText || el.textContent || '').trim();
+                if (resendRe.test(txt)) {
+                    const st = window.getComputedStyle(el);
+                    if (st.display !== 'none' && st.visibility !== 'hidden' && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+                        try { el.click(); } catch(e) {
+                            try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); } catch(e2) {}
+                        }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }"""))
+        if clicked:
+            return True
+    except Exception:
+        pass
+    btn = esperar_locator_en_frames(
+        page,
+        [
+            "button:has-text('Reenviar el código')", "button:has-text('Reenviar código')",
+            "button:has-text('Resend code')", "button:has-text('Reenviar')", "button:has-text('Resend')",
+            "a:has-text('Reenviar el código')", "a:has-text('Reenviar código')",
+            "a:has-text('Resend code')", "a:has-text('Reenviar')", "a:has-text('Resend')",
+        ],
+        timeout_s=1.5,
+    )
+    if btn:
+        try:
+            btn.click(force=True, timeout=1500)
+            return True
+        except Exception:
+            try:
+                btn.evaluate("b => b.click()")
+                return True
+            except Exception:
+                pass
+    return False
+
+
 def _invite_hay_pantalla_codigo(page) -> bool:
     """True solo con UI OTP real (inputs), no por el enlace 'con un código' del password."""
     try:
@@ -1132,7 +1248,7 @@ def _invite_detectar_exito(page) -> bool:
         u = (page.url or "").lower()
     except Exception:
         u = ""
-    if "/success" in u:
+    if "/success" in u or "account.tidal.com/profile" in u or "listen.tidal.com" in u:
         return True
     if "family" in u and "/accept" not in u and "/login" not in u and "signin" not in u and "authorize" not in u:
         if "tidal.com" in u or "account." in u:
@@ -1158,7 +1274,7 @@ def _invite_detectar_exito(page) -> bool:
         for frag in (
             "ya está todo", "you're all set", "youre all set", "all set",
             "welcome to the family", "te has unido", "you've joined",
-            "joined the family", "formas parte", "you're in",
+            "joined the family", "formas parte", "you're in", "log in details", "hear every note",
         ):
             if frag in txt:
                 return True
@@ -1386,10 +1502,12 @@ def _invite_arrancar_prefetch_otp(estado: dict, correo: str, *, es_alta: bool) -
     return
 
 
-def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 25.0) -> str | None:
-    """Sondea el worker al instante. Tidal entrega el OTP en <1 s; no hay Resend en este canal."""
-    kind = "register" if es_alta else "login"
-    despues = float(estado.get("otp_despues") or 0) or None
+def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 45.0) -> str | None:
+    """Sondea el worker de forma ultra-rápida (cada 100-120 ms) con resolución cruzada register/login."""
+    primary_kind = "register" if es_alta else "login"
+    alt_kind = "login" if es_alta else "register"
+    # Solo aplicar despues_de si es un reintento tras un código rechazado previamente
+    despues = float(estado.get("otp_despues") or 0) if estado.get("intentos_otp") else None
     t0 = time.time()
     ultimo_hb = 0.0
     try:
@@ -1400,22 +1518,53 @@ def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wa
         claimed = None
         if reclamar_desde_worker:
             claimed = reclamar_desde_worker(
-                correo, kind,
-                max_age_minutes=12,
+                correo, primary_kind,
+                max_age_minutes=15,
                 after_email_id=0,
                 silencioso=True,
                 consume=True,
                 despues_de=despues,
             )
+            if not claimed:
+                claimed = reclamar_desde_worker(
+                    correo, alt_kind,
+                    max_age_minutes=15,
+                    after_email_id=0,
+                    silencioso=True,
+                    consume=True,
+                    despues_de=despues,
+                )
         if claimed:
-            print(f"    [WORKER] [{correo}] Código {kind} en {time.time() - t0:.1f}s", flush=True)
+            print(f"    {Color.GREEN}[WORKER] [{correo}] Código {primary_kind} obtenido: {claimed} ({time.time() - t0:.1f}s){Color.ENDC}", flush=True)
             return str(claimed)
         elapsed = time.time() - t0
-        if elapsed >= 3.0 and elapsed - ultimo_hb >= 4.0:
-            print(f"    [WORKER] [{correo}] Esperando código {kind}... ({elapsed:.0f}s/{max_wait_s:.0f}s)",
+        if elapsed >= 2.0 and elapsed - ultimo_hb >= 3.0:
+            print(f"    [WORKER] [{correo}] Esperando código {primary_kind}... ({elapsed:.0f}s/{max_wait_s:.0f}s)",
                   flush=True)
             ultimo_hb = elapsed
-        time.sleep(0.22)
+        time.sleep(0.10)
+
+    print(f"    [Invitación] [{correo}] Worker sin OTP; fallback IMAP (forward a Gmail)...")
+    after_id = estado.get("baseline_id") or 0
+    kw = (
+        ["registr", "bienven", "sign-up", "signup", "código", "codigo", "code"]
+        if es_alta
+        else ["código", "codigo", "code", "inici", "login"]
+    )
+    for intento in range(1, 13):
+        codigo = obtener_codigo_via_imap(
+            gmail_user=correo,
+            required_keywords=kw,
+            query_exclude=EXCLUDE_OTP_GENERICO,
+            after_email_id=after_id,
+            max_age_minutes=25,
+            omitir_worker=True,
+        )
+        if codigo:
+            print(f"    [IMAP] [{correo}] Código {primary_kind} vía Gmail en intento {intento}", flush=True)
+            return str(codigo)
+        print(f"    [Invitación] [{correo}] Esperando código IMAP ({intento}/12)...")
+        time.sleep(2.0 if intento < 6 else 3.5)
     return None
 
 
@@ -1458,17 +1607,72 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 usa_worker = bool(worker_cubre_alias(correo))
             except Exception:
                 pass
-            if estado.get("otp_valor"):
-                print(f"    [Invitación] [{correo}] Reutilizando código {estado.get('otp_valor')}...",
-                      flush=True)
-                wrote = _invite_escribir_otp(page, str(estado.get("otp_valor")))
-                if wrote:
-                    estado["otp_escrito"] = True
-                _invite_pulsar_continuar_o_login(page)
-                time.sleep(1.0)
+
+            # 2.1) ¿Hay un código ya escrito o enviado? Verificar rechazo o éxito
+            if estado.get("otp_escrito") and estado.get("otp_valor"):
+                if _invite_pulsar_aceptar(page):
+                    time.sleep(1.0)
                 if _invite_detectar_exito(page):
                     return "ok"
-                return "progreso" if wrote or estado.get("otp_escrito") else "esperar"
+
+                hay_error, err_msg = _invite_detectar_error_otp(page)
+                tiempo_desde_envio = time.time() - float(estado.get("otp_ts_envio", 0) or 0)
+
+                if hay_error or (tiempo_desde_envio >= 12.0 and not _invite_pulsar_aceptar(page)):
+                    cod_rechazado = estado.get("otp_valor")
+                    intentos_otp = int(estado.get("intentos_otp", 0)) + 1
+                    estado["intentos_otp"] = intentos_otp
+                    print(f"    {Color.WARNING}[Invitación] [{correo}] Código {cod_rechazado} incorrecto o rechazado ({err_msg or 'sin avance'}). "
+                          f"Reintentando OTP ({intentos_otp}/3)...{Color.ENDC}", flush=True)
+
+                    if intentos_otp >= 3:
+                        print(f"    {Color.FAIL}[Invitación] [{correo}] Se superó el límite de 3 intentos OTP fallidos.{Color.ENDC}")
+                        return "fallo_otp"
+
+                    estado["otp_valor"] = None
+                    estado["otp_escrito"] = False
+                    estado["otp_continuar_pulsado"] = False
+                    estado["codigo_intentado"] = False
+                    estado["otp_despues"] = time.time() - 1.0
+                    _invite_limpiar_cajas_otp(page)
+
+                    if "espera" in err_msg.lower() or "wait" in err_msg.lower():
+                        print(f"    [Invitación] [{correo}] Esperando 5s antes de reintentar...")
+                        time.sleep(5.0)
+
+                    if _invite_pulsar_reenviar_codigo(page):
+                        print(f"    [Invitación] [{correo}] Pulsado 'Reenviar código'. Esperando nuevo OTP...")
+                    else:
+                        print(f"    [Invitación] [{correo}] Solicitando nuevo OTP por {('WORKER' if usa_worker else 'IMAP')}...")
+
+                    try:
+                        estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    return "progreso"
+
+                return "progreso"
+
+            # 2.2) Si tenemos otp_valor pero no se ha escrito aún
+            if estado.get("otp_valor") and not estado.get("otp_escrito"):
+                cod = str(estado.get("otp_valor"))
+                print(f"    [Invitación] [{correo}] Código obtenido: {cod}. Escribiéndolo...", flush=True)
+                wrote = _invite_escribir_otp(page, cod)
+                estado["otp_escrito"] = True
+                estado["otp_ts_envio"] = time.time()
+                time.sleep(0.5)
+                if not estado.get("otp_continuar_pulsado"):
+                    _invite_pulsar_continuar_o_login(page)
+                    estado["otp_continuar_pulsado"] = True
+                time.sleep(1.2)
+                if _invite_pulsar_aceptar(page):
+                    time.sleep(1.2)
+                if _invite_detectar_exito(page):
+                    return "ok"
+                return "progreso"
+
+            # 2.3) Obtener código por Worker o IMAP
             _cd_otp = 1.0 if usa_worker else 10.0
             if estado.get("codigo_intentado") and (
                 time.time() - float(estado.get("codigo_ts") or 0)
@@ -1477,8 +1681,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
             if not pwd_cuenta and estado.get("codigo_intentado") and not usa_worker:
                 return "esperar"
             estado["codigo_intentado"] = True
-            print(f"    [Invitación] [{correo}] Sin modo contraseña visible. "
-                  f"Obteniendo código de acceso...")
+            print(f"    [Invitación] [{correo}] Sin modo contraseña visible. Obteniendo código de acceso...")
             if not estado.get("baseline_id"):
                 try:
                     estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
@@ -1499,6 +1702,14 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     )
                     if codigo:
                         break
+                    if intento in (5, 9):
+                        if _invite_pulsar_reenviar_codigo(page):
+                            print(f"    [Invitación] [{correo}] Pulsando Reenviar código...")
+                            time.sleep(1.2)
+                            try:
+                                estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
+                            except Exception:
+                                pass
                     print(f"    [Invitación] [{correo}] Esperando código IMAP ({intento}/12)...")
                     time.sleep(8.0)
             estado["codigo_ts"] = time.time()
@@ -1508,14 +1719,8 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 print(f"    {Color.FAIL}[Invitación] [{correo}] No llegó el código de acceso.{Color.ENDC}")
                 return "esperar"
             estado["otp_valor"] = str(codigo)
-            print(f"    [Invitación] [{correo}] Código obtenido: {codigo}. Escribiéndolo...")
-            if _invite_escribir_otp(page, str(codigo)):
-                estado["otp_escrito"] = True
-                time.sleep(1.0)
-                _invite_pulsar_continuar_o_login(page)
-                time.sleep(2.5)
-                return "progreso"
-            return "esperar"
+            estado["otp_escrito"] = False
+            return "progreso"
 
     # 3) Campo de contraseña → rellenar y enviar
     pwd_inp = encontrar_locator_en_frames(page, pwd_selectors)
@@ -1531,6 +1736,23 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     print(f"    {Color.FAIL}[Invitación] [{correo}] Campo contraseña visible pero "
                           f"no hay entrada en sesiones_imap_cuentas.txt.{Color.ENDC}")
                 return "sin_pwd"
+
+            # Verificar si Tidal ya rechazó la contraseña
+            try:
+                err_pwd = page.evaluate("""() => {
+                    const txt = ((document.body ? document.body.innerText : '') + ' ' + (document.title || '')).toLowerCase();
+                    if (/contrase[ñn]a\\s*incorrecta|invalid\\s*password|incorrect\\s*password|wrong\\s*password/i.test(txt)) {
+                        return true;
+                    }
+                    const bad = document.querySelector('input[type="password"][aria-invalid="true"], input[type="password"].is-invalid');
+                    return Boolean(bad);
+                }""")
+                if err_pwd:
+                    print(f"    {Color.FAIL}[Invitación] [{correo}] Contraseña incorrecta en Tidal. Verifica sesiones_imap_cuentas.txt.{Color.ENDC}")
+                    return "sin_pwd"
+            except Exception:
+                pass
+
             try:
                 val_p = pwd_inp.input_value()
             except Exception:
@@ -1884,6 +2106,9 @@ def abrir_enlace_familia_con_autocierre(url: str, correo: str, proxy_pe: dict | 
                 resultado = _invite_avanzar_login(page, correo, pwd_cuenta, estado_login)
                 if resultado == "ok":
                     success_detected = True
+                    break
+                if resultado == "fallo_otp":
+                    print(f"    {Color.FAIL}[Invitación] [{correo}] Verificación OTP fallida tras múltiples intentos.{Color.ENDC}")
                     break
                 if resultado == "sin_pwd":
                     # Sin contraseña y sin avance: seguir intentando código IMAP si aparece
@@ -3810,7 +4035,8 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                              query_from="tidal", required_keywords=None, query_exclude=None, 
                              max_age_minutes=15, after_email_id=0, solo_link=False,
                              aliases_extra=None, preferir_otp_len: int | None = None,
-                             exigir_destinatario_exacto: bool = False) -> str | None:
+                             exigir_destinatario_exacto: bool = False,
+                             omitir_worker: bool = False) -> str | None:
     """Lee correos de Gmail via IMAP sin necesidad de abrir el navegador.
     Requiere una 'App Password' de Google.
     Busca dinámicamente en passwords.txt la contraseña específica del correo.
@@ -3833,20 +4059,21 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
             aliases_ok.append(a_l)
 
     try:
-        from otp_worker_client import intentar_via_worker
-        alias_hint = aliases_ok[0] if aliases_ok else gmail_user
-        val_w, skip_imap = intentar_via_worker(
-            alias_hint, required_keywords, solo_link,
-            max_age_minutes=max_age_minutes or 15,
-            after_email_id=after_email_id or 0,
-            silencioso=False,
-            aliases=aliases_ok,
-        )
-        if val_w:
-            return val_w
-        if skip_imap:
-            print(f"    {Color.WARNING}[WORKER]{Color.ENDC} Sin resultado aún para {alias_hint}.")
-            return None
+        if not omitir_worker:
+            from otp_worker_client import intentar_via_worker
+            alias_hint = aliases_ok[0] if aliases_ok else gmail_user
+            val_w, skip_imap = intentar_via_worker(
+                alias_hint, required_keywords, solo_link,
+                max_age_minutes=max_age_minutes or 15,
+                after_email_id=after_email_id or 0,
+                silencioso=False,
+                aliases=aliases_ok,
+            )
+            if val_w:
+                return val_w
+            if skip_imap:
+                print(f"    {Color.WARNING}[WORKER]{Color.ENDC} Sin resultado aún para {alias_hint}.")
+                return None
     except Exception:
         pass
     
@@ -9874,45 +10101,56 @@ class TidalResetPasswordManager:
             self.esperar_barrera("inicio")
             
             print(f"\n--- Iniciando restablecimiento de contraseña para: {self.client_email} ---")
-            
+
+            stagger = max(0, (int(getattr(self, "thread_index", 1) or 1) - 1) % 5)
+            if stagger:
+                delay = stagger * random.uniform(1.8, 2.6)
+                print(f"  [Reset Pass] [{self.client_email}] Escalonado +{delay:.1f}s antes de Continuar...")
+                time.sleep(delay)
+
             manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (Email)")
-            
-            # 3. Colocar correo a restablecer
+
             email_input = esperar_locator_en_frames(
-                self.page, 
-                ['input[type="email"]', 'input[type="text"]', 'input[placeholder*="email" i]', 'input[placeholder*="usuario" i]'], 
+                self.page,
+                ['input[type="email"]', 'input[type="text"]', 'input[placeholder*="email" i]', 'input[placeholder*="usuario" i]'],
                 timeout_s=15.0
             )
             if not email_input:
                 raise RuntimeError("No se localizó el campo de correo para iniciar restablecimiento.")
-                
-            # Escribir instantáneamente sin retrasos por latencia y disparar los eventos de React mediante JS
-            email_input.fill(self.client_email)
-            self.page.evaluate("""
-                () => {
-                    const el = document.querySelector('input[type="email"]') || 
-                               document.querySelector('input[type="text"]') || 
-                               document.querySelector('input[placeholder*="email" i]') ||
-                               document.querySelector('input[placeholder*="usuario" i]');
-                    if (el) {
+
+            # Typing real + setter nativo: fill() solo deja Continuar disabled en React/Tidal.
+            try:
+                email_input.click(timeout=3000)
+                email_input.fill("")
+                try:
+                    email_input.press_sequentially(self.client_email, delay=18)
+                except Exception:
+                    email_input.fill(self.client_email)
+                self.page.evaluate(
+                    """(email) => {
+                        const el = document.querySelector('input[type="email"]')
+                            || document.querySelector('input[name="email"]')
+                            || document.querySelector('input[type="text"]');
+                        if (!el) return;
+                        const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                        if (desc && desc.set) desc.set.call(el, email);
+                        else el.value = email;
                         el.dispatchEvent(new Event('input', { bubbles: true }));
                         el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                }
-            """)
-            email_input.press("Tab")
+                    }""",
+                    self.client_email,
+                )
+                email_input.press("Tab")
+            except Exception:
+                email_input.fill(self.client_email)
             time.sleep(0.5)
-            
-            # Cookies ANTES de cualquier verificación de avance (si el banner tapa el input,
-            # is_hidden() mentiría y daríamos el submit por bueno).
+
             self._limpiar_overlays_reset()
             time.sleep(0.3)
 
-            # Baseline justo antes del submit: minimiza la ventana donde el correo de reset
-            # llega a Gmail y queda ≤ baseline (antes se tomaba antes del calentamiento).
             reset_baseline_id = obtener_max_email_id(self.client_email, "tidal")
             print(f"  [Reset Pass] [{self.client_email}] Baseline IMAP antes de Continuar: {reset_baseline_id}")
-            
+
             btn_continue = esperar_locator_en_frames(
                 self.page,
                 ["button:has-text('Continuar')", "button:has-text('Continue')", "button[type='submit']"],
@@ -9924,7 +10162,6 @@ class TidalResetPasswordManager:
             url_antes_submit = self.page.url or ""
             email_antes_visible = self._elemento_interactuable_reset(email_input)
             if not email_antes_visible:
-                # Re-localizar tras limpiar cookies
                 email_input = esperar_locator_en_frames(
                     self.page,
                     ['input[type="email"]', 'input[name="email"]', 'input[placeholder*="email" i]',
@@ -9936,26 +10173,25 @@ class TidalResetPasswordManager:
                         "El campo de correo no es interactuable (posible overlay de cookies/DataDome)."
                     )
                 email_antes_visible = True
-                
+
             print("  [Reset Pass] Pulsando botón 'Continuar'...")
             click_exitoso = False
-            for intento_click in range(1, 4):  # máx 3 intentos, 1 submit actionable cada uno
+            for intento_click in range(1, 5):
                 if self._reset_solicitud_confirmada_ui(url_antes_submit, email_antes_visible):
                     click_exitoso = True
                     break
 
                 if not self._pulsar_continuar_reset(btn_continue):
-                    print(f"  [Reset Pass] [WARN] No se pudo pulsar Continuar (intento {intento_click}/3).")
+                    print(f"  [Reset Pass] [WARN] No se pudo pulsar Continuar (intento {intento_click}/4).")
 
-                # Esperar propagación UI antes de decidir reintento
-                for _ in range(10):
-                    time.sleep(0.45)
+                for _ in range(14):
+                    time.sleep(0.4)
                     if self._reset_solicitud_confirmada_ui(url_antes_submit, email_antes_visible):
                         click_exitoso = True
                         break
                 if click_exitoso:
                     break
-                print(f"  [Reset Pass] [WARN] Continuar no avanzó el formulario (intento {intento_click}/3).")
+                print(f"  [Reset Pass] [WARN] Continuar no avanzó el formulario (intento {intento_click}/4).")
 
             if not click_exitoso:
                 raise RuntimeError(
@@ -9971,29 +10207,30 @@ class TidalResetPasswordManager:
 
             def _claim_enlace_reset():
                 try:
-                    from otp_worker_client import cubre_y_esperar_reset, worker_config, worker_cubre_alias
+                    from otp_worker_client import cubre_y_esperar_reset, worker_cubre_alias
                     if worker_cubre_alias(self.client_email):
                         enlace_box["usa_worker"] = True
-                        _, val = cubre_y_esperar_reset(self.client_email, max_wait_s=20.0)
+                        _, val = cubre_y_esperar_reset(self.client_email, max_wait_s=75.0)
                         if val and str(val).startswith("http"):
                             enlace_box["val"] = val
                             return
-                        if not worker_config().get("imap_fallback"):
-                            return
-                    for intento in range(1, 13):
-                        print(f"  [Reset Pass] Intento IMAP {intento}/12: buscando correo de reset...")
+                        print(f"  [Reset Pass] [{self.client_email}] Worker sin enlace; "
+                              f"fallback IMAP (forward a Gmail)...")
+                    for intento in range(1, 21):
+                        print(f"  [Reset Pass] Intento IMAP {intento}/20: buscando correo de reset...")
                         val = obtener_codigo_via_imap(
                             gmail_user=self.client_email,
                             required_keywords=KEYWORDS_RESTABLECER_PWD,
                             query_exclude="invited to a tidal family",
                             after_email_id=reset_baseline_id,
-                            max_age_minutes=15,
+                            max_age_minutes=20,
                             solo_link=True,
+                            omitir_worker=True,
                         )
                         if val and str(val).startswith("http"):
                             enlace_box["val"] = val
                             return
-                        time.sleep(2.0 if intento < 6 else 4.0)
+                        time.sleep(2.5 if intento < 10 else 4.0)
                 except Exception as e_wreset:
                     print(f"  [Reset Pass] [WARN] Enlace reset: {e_wreset}")
 
@@ -10004,16 +10241,8 @@ class TidalResetPasswordManager:
 
             print(f"  [Reset Pass] [{self.client_email}] Cerrando la ventana actual...")
             self.cerrar_navegador(liberar_proxy=False)
-            t_claim.join(timeout=22.0)
-            enlace_reset = enlace_box["val"]
-            usa_worker_reset = bool(enlace_box["usa_worker"])
-
-            if usa_worker_reset and (not enlace_reset or not str(enlace_reset).startswith("http")):
-                try:
-                    from otp_worker_client import cubre_y_esperar_reset
-                    _, enlace_reset = cubre_y_esperar_reset(self.client_email, max_wait_s=8.0)
-                except Exception:
-                    pass
+            t_claim.join(timeout=140.0)
+            enlace_reset = enlace_box.get("val")
 
             self.esperar_barrera("post_solicitud")
 

@@ -766,6 +766,8 @@ def _invite_limpiar_cookies_agresivo(page) -> None:
 
     En la opción 4 el OneTrust tapa Continuar / contraseña / Aceptar invitación.
     aceptar_cookies_con_espera() a veces se salta por _chequeo_reciente_limpio.
+    Solo frame principal: evaluar todos los iframes (DataDome/ads) colgaba 30s+ y
+    Chrome quedaba abierto sin pulsar Continuar.
     """
     if not page:
         return
@@ -775,42 +777,38 @@ def _invite_limpiar_cookies_agresivo(page) -> None:
     except Exception:
         return
 
-    # 1) Click directo en botones OneTrust (sin el 'Aceptar' genérico que puede confundirse)
+    # 1) Click directo en botones OneTrust (solo main frame)
     try:
-        for frame in page.frames:
-            try:
-                frame.evaluate("""() => {
-                    const sels = [
-                        '#onetrust-accept-btn-handler',
-                        '#onetrust-reject-all-handler',
-                        '.onetrust-close-btn-handler',
-                        '#onetrust-close-btn-container button',
-                        '#accept-recommended-btn-handler',
-                        'button[id*="accept" i][id*="cookie" i]',
-                        'button[class*="accept" i][class*="cookie" i]',
-                    ];
-                    for (const sel of sels) {
-                        const btn = document.querySelector(sel);
-                        if (btn && (btn.offsetWidth || btn.offsetHeight || btn.getClientRects().length)) {
-                            try { btn.click(); } catch(e) {}
-                            return true;
-                        }
-                    }
-                    // Texto explícito de cookies (no 'Aceptar' suelto del CTA de invitación)
-                    const re = /aceptar todas|aceptar todo|accept all|reject all|rechazar todas|confirmar mis preferencias/i;
-                    for (const btn of document.querySelectorAll('button, a, [role="button"]')) {
-                        const t = (btn.textContent || '').trim();
-                        if (!t || t.length > 60) continue;
-                        if (!re.test(t)) continue;
-                        if (btn.offsetWidth || btn.offsetHeight || btn.getClientRects().length) {
-                            try { btn.click(); } catch(e) {}
-                            return true;
-                        }
-                    }
-                    return false;
-                }""")
-            except Exception:
-                continue
+        page.evaluate("""() => {
+            const sels = [
+                '#onetrust-accept-btn-handler',
+                '#onetrust-reject-all-handler',
+                '.onetrust-close-btn-handler',
+                '#onetrust-close-btn-container button',
+                '#accept-recommended-btn-handler',
+                'button[id*="accept" i][id*="cookie" i]',
+                'button[class*="accept" i][class*="cookie" i]',
+            ];
+            for (const sel of sels) {
+                const btn = document.querySelector(sel);
+                if (btn && (btn.offsetWidth || btn.offsetHeight || btn.getClientRects().length)) {
+                    try { btn.click(); } catch(e) {}
+                    return true;
+                }
+            }
+            // Texto explícito de cookies (no 'Aceptar' suelto del CTA de invitación)
+            const re = /aceptar todas|aceptar todo|accept all|reject all|rechazar todas|confirmar mis preferencias/i;
+            for (const btn of document.querySelectorAll('button, a, [role="button"]')) {
+                const t = (btn.textContent || '').trim();
+                if (!t || t.length > 60) continue;
+                if (!re.test(t)) continue;
+                if (btn.offsetWidth || btn.offsetHeight || btn.getClientRects().length) {
+                    try { btn.click(); } catch(e) {}
+                    return true;
+                }
+            }
+            return false;
+        }""")
     except Exception:
         pass
 
@@ -948,19 +946,129 @@ def _invite_eval_modo_contrasena(page, accion: str):
         return None
 
 
+def _invite_detectar_error_otp(page) -> tuple[bool, str]:
+    """Detecta si la pantalla de código OTP mostró un error, rate-limit o código inválido."""
+    try:
+        res = page.evaluate("""() => {
+            const txt = ((document.body ? document.body.innerText : '') + ' ' + (document.title || '')).toLowerCase();
+            
+            // 1. Rate-limit o espera
+            if (/espera\\s*\\d+\\s*segundos|wait\\s*\\d+\\s*seconds|demasiados\\s*intentos|too\\s*many\\s*attempts/i.test(txt)) {
+                return { error: true, tipo: 'rate_limit', msg: 'Rate limit / espera solicitada por Tidal' };
+            }
+            
+            // 2. Código inválido o incorrecto
+            const reInvalido = /c[oó]digo\\s*no\\s*v[aá]lido|c[oó]digo\\s*incorrecto|invalid\\s*code|incorrect\\s*code|wrong\\s*code|code\\s*is\\s*incorrect|el\\s*c[oó]digo\\s*no\\s*es\\s*v[aá]lido|that\\s*code\\s*isn'?t\\s*valid|code\\s*you\\s*entered\\s*is\\s*incorrect|ha\\s*caducado|code\\s*expired/i;
+            if (reInvalido.test(txt)) {
+                return { error: true, tipo: 'invalido', msg: 'Código incorrecto o no válido' };
+            }
+            
+            // 3. Inputs marcados con aria-invalid o error
+            const invalidInputs = Array.from(document.querySelectorAll('input[aria-invalid="true"], input.is-invalid, input[class*="error" i]')).filter(el => {
+                const st = window.getComputedStyle(el);
+                return st.display !== 'none' && st.visibility !== 'hidden';
+            });
+            if (invalidInputs.length > 0) {
+                return { error: true, tipo: 'input_invalido', msg: 'Campos OTP marcados como inválidos' };
+            }
+            
+            // 4. Banners de alerta o error visibles
+            const alerts = Array.from(document.querySelectorAll('[role="alert"], [class*="banner" i], [class*="toast" i], [class*="alert" i], [class*="error" i]')).filter(el => {
+                const st = window.getComputedStyle(el);
+                return st.display !== 'none' && st.visibility !== 'hidden' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+            });
+            for (const a of alerts) {
+                const atxt = (a.innerText || a.textContent || '').toLowerCase();
+                if (reInvalido.test(atxt) || /espera|wait|error|incorrect/i.test(atxt)) {
+                    return { error: true, tipo: 'banner_error', msg: (a.innerText || a.textContent || '').trim().slice(0, 80) };
+                }
+            }
+            
+            return { error: false, tipo: '', msg: '' };
+        }""")
+        if res and isinstance(res, dict) and res.get("error"):
+            return True, str(res.get("msg") or res.get("tipo") or "error")
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _invite_limpiar_cajas_otp(page) -> None:
+    """Limpia las cajas de texto de OTP en pantalla."""
+    try:
+        page.evaluate("""() => {
+            const boxes = Array.from(document.querySelectorAll('input')).filter(el => {
+                const ml = (el.getAttribute('maxlength') || '').trim();
+                const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+                return ml === '1' || ac === 'one-time-code' || (el.inputMode || '').toLowerCase() === 'numeric';
+            });
+            boxes.forEach(b => {
+                const proto = window.HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(b, '');
+                else b.value = '';
+                b.dispatchEvent(new Event('input', { bubbles: true }));
+                b.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        }""")
+    except Exception:
+        pass
+
+
+def _invite_pulsar_reenviar_codigo(page) -> bool:
+    """Pulsa el enlace o botón de 'Reenviar código' / 'Resend code'."""
+    try:
+        clicked = bool(page.evaluate("""() => {
+            const cands = Array.from(document.querySelectorAll('button, a, [role="button"], span, p'));
+            const resendRe = /^reenviar(\\s*el)?\\s*c[oó]digo$|^resend(\\s*code)?$/i;
+            for (const el of cands) {
+                const txt = (el.innerText || el.textContent || '').trim();
+                if (resendRe.test(txt)) {
+                    const st = window.getComputedStyle(el);
+                    if (st.display !== 'none' && st.visibility !== 'hidden' && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+                        try { el.click(); } catch(e) {
+                            try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); } catch(e2) {}
+                        }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }"""))
+        if clicked:
+            return True
+    except Exception:
+        pass
+    btn = esperar_locator_en_frames(
+        page,
+        [
+            "button:has-text('Reenviar el código')", "button:has-text('Reenviar código')",
+            "button:has-text('Resend code')", "button:has-text('Reenviar')", "button:has-text('Resend')",
+            "a:has-text('Reenviar el código')", "a:has-text('Reenviar código')",
+            "a:has-text('Resend code')", "a:has-text('Reenviar')", "a:has-text('Resend')",
+        ],
+        timeout_s=1.5,
+    )
+    if btn:
+        try:
+            btn.click(force=True, timeout=1500)
+            return True
+        except Exception:
+            try:
+                btn.evaluate("b => b.click()")
+                return True
+            except Exception:
+                pass
+    return False
+
+
 def _invite_hay_pantalla_codigo(page) -> bool:
     try:
         return bool(page.evaluate("""() => {
-            const txt = document.body ? document.body.innerText.toLowerCase() : '';
-            const frases = ['revisa tu correo', 'check your email', 'te hemos enviado un código',
-                            'te hemos enviado un codigo', "we've sent", 'we have sent',
-                            'reenviar código', 'reenviar codigo', 'resend code',
-                            'código de acceso', 'access code', 'one-time',
-                            'verify your email', 'verifica tu correo', 'verifica tu email',
-                            'finish creating your account', 'terminar de crear',
-                            '6-digit', '6 digit', '6-dígitos', '6 digitos'];
-            if (frases.some(f => txt.includes(f))) return true;
-            return document.querySelectorAll('input[maxlength="1"], input[autocomplete="one-time-code"]').length >= 4;
+            const boxes = document.querySelectorAll('input[maxlength="1"], input[autocomplete="one-time-code"], input[data-test*="otp" i]');
+            if (boxes.length >= 4) return true;
+            const txt = (document.body ? document.body.innerText : '').toLowerCase();
+            return /verifica tu correo|verify your email|introduce el c[oó]digo|c[oó]digo de 6 d[ií]gitos|6-digit code|reenviar el c[oó]digo|resend code/i.test(txt);
         }"""))
     except Exception:
         return False
@@ -1124,16 +1232,21 @@ def _invite_enlace_ya_aceptado_o_caducado(page) -> bool:
     try:
         return bool(page.evaluate("""() => {
             try {
-                const txt = (document.body && (document.body.innerText || '') || '').toLowerCase();
-                if (!txt) return false;
+                const txt = (
+                    (document.body ? (document.body.innerText || document.body.textContent || '') : '') + ' ' +
+                    (document.documentElement ? (document.documentElement.innerText || document.documentElement.textContent || '') : '')
+                ).toLowerCase();
+                if (!txt.trim()) return false;
                 // ES: "Este enlace de invitación ya se ha aceptado o ha caducado."
-                if (txt.includes('ya se ha aceptado') || txt.includes('ya se aceptó')) return true;
-                if (txt.includes('ha caducado') && (txt.includes('invit') || txt.includes('enlace'))) return true;
-                if (txt.includes('enlace de invitación') && (txt.includes('aceptado') || txt.includes('caducad'))) return true;
+                if (txt.includes('ya se ha aceptado') || txt.includes('ya se aceptó') || txt.includes('ya ha sido aceptado')) return true;
+                if (txt.includes('ha caducado') || txt.includes('ha expirado') || txt.includes('enlace caducado') || txt.includes('enlace expirado')) return true;
+                if (txt.includes('enlace de invitación') && (txt.includes('aceptado') || txt.includes('caducad') || txt.includes('expirad'))) return true;
+                if (txt.includes('este enlace') && (txt.includes('aceptado') || txt.includes('caducad') || txt.includes('expirad'))) return true;
                 // EN
-                if (txt.includes('already been accepted') || txt.includes('already accepted')) return true;
-                if (txt.includes('invitation') && (txt.includes('expired') || txt.includes('has expired'))) return true;
+                if (txt.includes('already been accepted') || txt.includes('already accepted') || txt.includes('has already been accepted')) return true;
+                if (txt.includes('expired') || txt.includes('has expired') || txt.includes('link has expired') || txt.includes('invitation has expired')) return true;
                 if (txt.includes('invite link') && (txt.includes('accepted') || txt.includes('expired'))) return true;
+                if (txt.includes('invitation link') && (txt.includes('accepted') || txt.includes('expired'))) return true;
                 return false;
             } catch (e) {
                 return false;
@@ -1141,14 +1254,16 @@ def _invite_enlace_ya_aceptado_o_caducado(page) -> bool:
         }"""))
     except Exception:
         try:
-            txt = ((page.inner_text("body", timeout=1500) or "") if page else "").lower()
+            txt = ((page.inner_text("body", timeout=1200) or "") if page else "").lower()
         except Exception:
             return False
         return (
             "ya se ha aceptado" in txt
             or "already been accepted" in txt
-            or ("ha caducado" in txt and "invit" in txt)
-            or ("expired" in txt and "invitation" in txt)
+            or "ha caducado" in txt
+            or "has expired" in txt
+            or "expired" in txt
+            or "caducado" in txt
         )
 
 
@@ -1171,6 +1286,9 @@ def _invite_detectar_exito(page) -> bool:
             try {
                 const u = (location.href || '').toLowerCase();
                 if (u.includes('/success')) return true;
+                if (u.includes('account.tidal.com/profile') || u.includes('account.tidal.com/subscription') || u.includes('listen.tidal.com')) {
+                    return true;
+                }
                 if (u.includes('family')
                     && !u.includes('/accept')
                     && !u.includes('/login')
@@ -1184,7 +1302,7 @@ def _invite_detectar_exito(page) -> bool:
                     'ya está todo', "you're all set", 'youre all set', 'all set',
                     'welcome to the family', 'te has unido', "you've joined",
                     'joined the family', 'formas parte', "you're in", 'preparado',
-                    'bienvenido a la familia', 'has joined',
+                    'bienvenido a la familia', 'has joined', 'log in details', 'hear every note',
                 ];
                 return frags.some(f => txt.includes(f));
             } catch (e) {
@@ -1195,7 +1313,7 @@ def _invite_detectar_exito(page) -> bool:
         # Durante navegación post-aceptar, evaluate puede fallar: no bloquear
         try:
             u = (page.url or "").lower()
-            if "/success" in u:
+            if "/success" in u or "account.tidal.com/profile" in u or "listen.tidal.com" in u:
                 return True
             if (
                 "family" in u
@@ -1291,9 +1409,49 @@ def _invite_pulsar_aceptar(page) -> bool:
         return False
 
 
+def _invite_pantalla_correo_con_continuar(page) -> bool:
+    """True en login.tidal.com con Continuar y sin campo contraseña aún (p. ej. disableEmailInput)."""
+    try:
+        return bool(page.evaluate("""() => {
+            const url = (location.href || '').toLowerCase();
+            const enLogin = /login\\.tidal\\.com|\\/authorize|\\/signin|\\/sign-in/.test(url);
+            if (!enLogin) return false;
+
+            // Si hay casillas de código OTP o texto de verificación de correo, NO es la pantalla de correo
+            const boxes = document.querySelectorAll('input[maxlength="1"], input[autocomplete="one-time-code"], input[data-test*="otp" i]');
+            if (boxes.length >= 4) return false;
+            const txt = (document.body ? document.body.innerText : '').toLowerCase();
+            if (/verifica tu correo|verify your email|introduce el c[oó]digo|c[oó]digo de 6 d[ií]gitos|6-digit code|reenviar el c[oó]digo|resend code/i.test(txt)) {
+                return false;
+            }
+
+            const pwd = document.querySelector('input[type="password"]');
+            if (pwd) {
+                const r = pwd.getBoundingClientRect();
+                const st = window.getComputedStyle(pwd);
+                if (r.width > 2 && r.height > 2 && st.display !== 'none' && st.visibility !== 'hidden') {
+                    return false;
+                }
+            }
+            const visible = (el) => {
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 2 && r.height > 2;
+            };
+            return Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+                .some(el => visible(el) && /^continuar$|^continue$/i.test((el.innerText || el.textContent || el.value || '').trim()));
+        }"""))
+    except Exception:
+        return False
+
+
 def _invite_pulsar_continuar_o_login(page) -> bool:
     """Pulsa Continuar / Inicia Sesión. NUNCA 'Iniciar sesión con código'."""
-    _invite_limpiar_cookies_agresivo(page)
+    try:
+        _invite_limpiar_cookies_agresivo(page)
+    except Exception:
+        pass
 
     # Preferir el CTA principal por JS: excluye explícitamente el enlace de código
     # (has-text('Iniciar sesión') coincidía con "Iniciar sesión con código").
@@ -1323,7 +1481,12 @@ def _invite_pulsar_continuar_o_login(page) -> bool:
             ];
             for (const re of exactos) {
                 const hit = candidatos.find(x => re.test(x.t));
-                if (hit) { hit.el.click(); return hit.t; }
+                if (hit) {
+                    try { hit.el.click(); } catch (e) {
+                        try { hit.el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window})); } catch (e2) {}
+                    }
+                    return hit.t;
+                }
             }
 
             // 2) type=submit visible sin texto de código
@@ -1332,21 +1495,30 @@ def _invite_pulsar_continuar_o_login(page) -> bool:
                 ((x.el.getAttribute('type') || '').toLowerCase() === 'submit' ||
                  x.el.closest('form'))
             );
+            if (submit && (submit.el.disabled || submit.el.getAttribute('aria-disabled') === 'true' || submit.el.querySelector('[class*="spinner" i], [class*="dot" i], [class*="loader" i]'))) {
+                return null;
+            }
             // Preferir submit con texto de login/continuar
             const submitLogin = candidatos.find(x =>
                 (x.el.getAttribute('type') || '').toLowerCase() === 'submit' &&
                 /sesi[oó]n|log\\s*in|sign\\s*in|continuar|continue/i.test(x.t)
             );
-            if (submitLogin) { submitLogin.el.click(); return submitLogin.t; }
+            if (submitLogin && !(submitLogin.el.disabled || submitLogin.el.getAttribute('aria-disabled') === 'true')) {
+                submitLogin.el.click(); return submitLogin.t;
+            }
 
             // 3) Botón blanco/primario grande con texto corto de login
             const primario = candidatos.find(x =>
                 x.t.length <= 24 &&
                 /inicia\\s*sesi[oó]n|iniciar\\s*sesi[oó]n|log\\s*in|sign\\s*in|continuar|continue/i.test(x.t)
             );
-            if (primario) { primario.el.click(); return primario.t; }
+            if (primario && !(primario.el.disabled || primario.el.getAttribute('aria-disabled') === 'true')) {
+                primario.el.click(); return primario.t;
+            }
 
-            if (submit && submit.t.length <= 30) { submit.el.click(); return submit.t || 'submit'; }
+            if (submit && submit.t.length <= 30 && !(submit.el.disabled || submit.el.getAttribute('aria-disabled') === 'true')) {
+                submit.el.click(); return submit.t || 'submit';
+            }
             return null;
         }""")
         if clicked:
@@ -1449,36 +1621,105 @@ def _invite_arrancar_prefetch_otp(estado: dict, correo: str, *, es_alta: bool) -
     return
 
 
-def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 25.0) -> str | None:
-    """Sondea el worker al instante. Tidal entrega el OTP en <1 s; no hay Resend en este canal."""
-    kind = "register" if es_alta else "login"
-    despues = float(estado.get("otp_despues") or 0) or None
+def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 45.0) -> str | None:
+    """Sondea el worker de forma ultra-rápida (cada 100-120 ms) con resolución cruzada register/login."""
+    primary_kind = "register" if es_alta else "login"
+    alt_kind = "login" if es_alta else "register"
+    # Solo aplicar despues_de si es un reintento tras un código rechazado previamente
+    despues = float(estado.get("otp_despues") or 0) if estado.get("intentos_otp") else None
     t0 = time.time()
     ultimo_hb = 0.0
+    ultimo_imap = 0.0
     try:
         from otp_worker_client import reclamar_desde_worker
     except Exception:
         reclamar_desde_worker = None
+
+    after_id = estado.get("baseline_id") or 0
+
     while time.time() - t0 < max_wait_s:
-        claimed = None
+        # 1. Probar con worker kind principal
         if reclamar_desde_worker:
             claimed = reclamar_desde_worker(
-                correo, kind,
-                max_age_minutes=12,
+                correo, primary_kind,
+                max_age_minutes=15,
                 after_email_id=0,
                 silencioso=True,
                 consume=True,
                 despues_de=despues,
             )
-        if claimed:
-            print(f"    [WORKER] [{correo}] Código {kind} en {time.time() - t0:.1f}s", flush=True)
-            return str(claimed)
+            # 2. Si no hay, probar inmediatamente con kind alternativo
+            if not claimed:
+                claimed = reclamar_desde_worker(
+                    correo, alt_kind,
+                    max_age_minutes=15,
+                    after_email_id=0,
+                    silencioso=True,
+                    consume=True,
+                    despues_de=despues,
+                )
+            if claimed:
+                print(f"    {Color.GREEN}[WORKER] [{correo}] Código de {primary_kind} obtenido: {claimed} ({time.time() - t0:.1f}s){Color.ENDC}", flush=True)
+                return str(claimed)
+
         elapsed = time.time() - t0
-        if elapsed >= 3.0 and elapsed - ultimo_hb >= 4.0:
-            print(f"    [WORKER] [{correo}] Esperando código {kind}... ({elapsed:.0f}s/{max_wait_s:.0f}s)",
+        # 3. Tras 4 segundos de espera en worker, consultar también IMAP (Gmail forward) en paralelo
+        if elapsed >= 4.0 and (elapsed - ultimo_imap) >= 2.0:
+            ultimo_imap = elapsed
+            try:
+                if es_alta:
+                    codigo_imap = reclamar_otp_registro_para_alias(
+                        correo,
+                        after_email_id=after_id,
+                        max_age_minutes=25,
+                        silencioso=True,
+                        omitir_worker=True,
+                    )
+                else:
+                    codigo_imap = reclamar_otp_login_para_alias(
+                        correo,
+                        after_email_id=after_id,
+                        max_age_minutes=20,
+                        silencioso=True,
+                        omitir_worker=True,
+                    )
+                if codigo_imap:
+                    print(f"    {Color.GREEN}[IMAP/Gmail] [{correo}] Código de {primary_kind} obtenido: {codigo_imap} ({elapsed:.1f}s){Color.ENDC}", flush=True)
+                    return str(codigo_imap)
+            except Exception:
+                pass
+
+        if elapsed >= 2.0 and elapsed - ultimo_hb >= 3.0:
+            print(f"    [WORKER] [{correo}] Esperando código {primary_kind}... ({elapsed:.0f}s/{max_wait_s:.0f}s)",
                   flush=True)
             ultimo_hb = elapsed
-        time.sleep(0.22)
+        time.sleep(0.10)
+
+    print(f"    [Invitación] [{correo}] Sondeo final de fallback IMAP en Gmail...")
+    for intento in range(1, 6):
+        try:
+            if es_alta:
+                codigo = reclamar_otp_registro_para_alias(
+                    correo,
+                    after_email_id=after_id,
+                    max_age_minutes=25,
+                    silencioso=(intento > 1),
+                    omitir_worker=True,
+                )
+            else:
+                codigo = reclamar_otp_login_para_alias(
+                    correo,
+                    after_email_id=after_id,
+                    max_age_minutes=20,
+                    silencioso=(intento > 1),
+                    omitir_worker=True,
+                )
+            if codigo:
+                print(f"    {Color.GREEN}[IMAP] [{correo}] Código {primary_kind} vía Gmail en intento {intento}{Color.ENDC}", flush=True)
+                return str(codigo)
+        except Exception:
+            pass
+        time.sleep(1.2)
     return None
 
 
@@ -1500,7 +1741,26 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
 
     Devuelve: 'ok' | 'progreso' | 'esperar' | 'sin_pwd'.
     """
-    _invite_limpiar_cookies_agresivo(page)
+    # 0) Ruta rápida: correo + Continuar (disableEmailInput).
+    if (
+        not estado.get("otp_escrito")
+        and not estado.get("otp_valor")
+        and _invite_pantalla_correo_con_continuar(page)
+    ):
+        print(f"    [Invitación] [{correo}] Correo ya presente. Pulsando Continuar...")
+        estado["otp_despues"] = time.time() - 2.0
+        if not _invite_pulsar_continuar_o_login(page):
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+        time.sleep(1.0)
+        return "progreso"
+
+    try:
+        _invite_limpiar_cookies_agresivo(page)
+    except Exception:
+        pass
 
     # 1) ¿Ya hay botón de aceptar? (sesión lista). No pulsar Aceptar en la pantalla OTP.
     if not _invite_hay_pantalla_codigo(page) and _invite_pulsar_aceptar(page):
@@ -1523,6 +1783,9 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
     email_selectors = [
         'input[type="email"]', 'input[name="email"]',
         'input[autocomplete="email"]', '#email',
+        'input[name="username"]', 'input[autocomplete="username"]',
+        'input[id*="email" i]', 'input[placeholder*="correo" i]',
+        'input[placeholder*="email" i]', 'input[placeholder*="acceso" i]',
     ]
     pwd_selectors = ['input[type="password"]', 'input[name="password"]']
 
@@ -1552,6 +1815,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 estado["suscribete_pulsado"] = True
                 estado["reintentar_suscribete"] = False
                 estado["codigo_intentado"] = False  # permitir OTP de registro
+                estado["otp_despues"] = time.time() - 2.0  # Timestamp exacto de envío de código
                 _invite_arrancar_prefetch_otp(estado, correo, es_alta=True)
                 if _invite_esperar_pantalla_otp(page, 4.0):
                     print(f"    [Invitación] [{correo}] Pantalla OTP al instante; reclamando código...")
@@ -1570,16 +1834,14 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 return "progreso"
 
     # 2) Pantalla de código OTP (registro o login)
-    if _invite_hay_pantalla_codigo(page) or (
-        not estado.get("registro_nuevo") and _invite_eval_modo_contrasena(page, "existe")
-    ):
+    if _invite_hay_pantalla_codigo(page):
         es_alta = bool(estado.get("registro_nuevo"))
         # En alta nueva NO forzar modo contraseña: no existe aún
         if (not es_alta) and _invite_eval_modo_contrasena(page, "existe"):
-            if estado.get("intentos_modo_pwd", 0) < 5:
+            if estado.get("intentos_modo_pwd", 0) < 3:
                 estado["intentos_modo_pwd"] = estado.get("intentos_modo_pwd", 0) + 1
                 print(f"    [Invitación] [{correo}] Pantalla de código detectada. "
-                      f"Cambiando a modo contraseña ({estado['intentos_modo_pwd']}/5)...")
+                      f"Cambiando a modo contraseña ({estado['intentos_modo_pwd']}/3)...")
                 _invite_clic_modo_contrasena(page)
                 time.sleep(1.5)
                 return "progreso"
@@ -1592,47 +1854,80 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
             except Exception:
                 pass
 
-            def _aplicar_otp_guardado(cod: str) -> str:
-                print(f"    [Invitación] [{correo}] Código de {tipo} obtenido: {cod}. Escribiéndolo...",
-                      flush=True)
-                wrote = False
-                for _fill in range(1, 4):
-                    wrote = _invite_escribir_otp(page, cod)
-                    time.sleep(0.45)
-                    if wrote:
-                        break
-                if wrote:
-                    estado["otp_escrito"] = True
-                    estado["otp_valor"] = cod
-                _invite_pulsar_continuar_o_login(page)
+            tipo = "registro" if es_alta else "acceso"
+
+            # 2.1) ¿Hay un código ya escrito o enviado? Verificar si Tidal lo rechazó o si está procesando
+            if estado.get("otp_escrito") and estado.get("otp_valor"):
+                # Verificar éxito primero
+                if _invite_pulsar_aceptar(page):
+                    time.sleep(1.0)
+                if _invite_detectar_exito(page):
+                    return "ok"
+
+                hay_error, err_msg = _invite_detectar_error_otp(page)
+                tiempo_desde_envio = time.time() - float(estado.get("otp_ts_envio", 0) or 0)
+
+                # Si Tidal rechazó el código o dio error, o si pasaron más de 12s sin avance
+                if hay_error or (tiempo_desde_envio >= 12.0 and not _invite_pulsar_aceptar(page)):
+                    cod_rechazado = estado.get("otp_valor")
+                    intentos_otp = int(estado.get("intentos_otp", 0)) + 1
+                    estado["intentos_otp"] = intentos_otp
+                    print(f"    {Color.WARNING}[Invitación] [{correo}] Código {cod_rechazado} incorrecto o rechazado ({err_msg or 'sin avance'}). "
+                          f"Reintentando OTP ({intentos_otp}/3)...{Color.ENDC}", flush=True)
+
+                    if intentos_otp >= 3:
+                        print(f"    {Color.FAIL}[Invitación] [{correo}] Se superó el límite de 3 intentos OTP fallidos.{Color.ENDC}")
+                        return "fallo_otp"
+
+                    # Limpiar estado del código para pedir uno nuevo
+                    estado["otp_valor"] = None
+                    estado["otp_escrito"] = False
+                    estado["otp_continuar_pulsado"] = False
+                    estado["codigo_intentado"] = False
+                    estado["otp_despues"] = time.time() - 1.0
+                    _invite_limpiar_cajas_otp(page)
+
+                    # Si hay toast de espera (30 segundos), pausar brevemente
+                    if "espera" in err_msg.lower() or "wait" in err_msg.lower():
+                        print(f"    [Invitación] [{correo}] Esperando 5s antes de reintentar...")
+                        time.sleep(5.0)
+
+                    # Intentar pulsar 'Reenviar código'
+                    if _invite_pulsar_reenviar_codigo(page):
+                        print(f"    [Invitación] [{correo}] Pulsado 'Reenviar código'. Esperando nuevo OTP...")
+                    else:
+                        print(f"    [Invitación] [{correo}] Solicitando nuevo OTP por {('WORKER' if usa_worker else 'IMAP')}...")
+
+                    try:
+                        estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    return "progreso"
+
+                # Si aún está dentro del tiempo de espera de verificación, no spamear clics
+                return "progreso"
+
+            # 2.2) Si tenemos otp_valor pero no se ha escrito aún en los inputs
+            if estado.get("otp_valor") and not estado.get("otp_escrito"):
+                cod = str(estado.get("otp_valor"))
+                print(f"    [Invitación] [{correo}] Código de {tipo} obtenido: {cod}. Escribiéndolo...", flush=True)
+                wrote = _invite_escribir_otp(page, cod)
+                estado["otp_escrito"] = True  # Marcar como intentado para no repetir en bucle
+                estado["otp_ts_envio"] = time.time()
+                time.sleep(0.5)
+                # En registro, Tidal autovalida al ingresar el 6to dígito. Solo pulsar continuar si no se dispara.
+                if not estado.get("otp_continuar_pulsado"):
+                    _invite_pulsar_continuar_o_login(page)
+                    estado["otp_continuar_pulsado"] = True
                 time.sleep(1.2)
                 if _invite_pulsar_aceptar(page):
                     time.sleep(1.2)
                 if _invite_detectar_exito(page):
                     return "ok"
-                return "progreso" if wrote else "esperar"
+                return "progreso"
 
-            tipo = "registro" if es_alta else "acceso"
-            # Ya tenemos código (o ya se escribió): reutilizarlo. NUNCA Resend después.
-            if estado.get("otp_valor"):
-                if estado.get("otp_escrito"):
-                    try:
-                        leido = leer_otp_cajas_visibles(page)
-                    except Exception:
-                        leido = ""
-                    if leido != str(estado.get("otp_valor") or ""):
-                        _invite_escribir_otp(page, str(estado.get("otp_valor")))
-                    if not estado.get("otp_continuar_post"):
-                        _invite_pulsar_continuar_o_login(page)
-                        estado["otp_continuar_post"] = True
-                    if _invite_pulsar_aceptar(page):
-                        time.sleep(0.8)
-                    if _invite_detectar_exito(page):
-                        return "ok"
-                    return "progreso"
-                return _aplicar_otp_guardado(str(estado.get("otp_valor")))
-
-            # IMAP: cooldown 10 s. Worker: reintento rápido sin Resend (el código ya está en el worker).
+            # 2.3) No tenemos otp_valor: obtener código por Worker o IMAP
             _cd_otp = 1.0 if usa_worker else 10.0
             if estado.get("codigo_intentado") and (
                 time.time() - float(estado.get("codigo_ts") or 0)
@@ -1646,11 +1941,10 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     estado["baseline_id"] = 0
 
             canal = "WORKER" if usa_worker else "IMAP"
-            print(f"    [Invitación] [{correo}] Obteniendo código de {tipo} por {canal} "
-                  f"(alias exacto)...")
+            print(f"    [Invitación] [{correo}] Obteniendo código de {tipo} por {canal} (alias exacto)...")
             codigo = None
             if usa_worker:
-                codigo = _invite_tomar_otp_worker(estado, correo, es_alta=es_alta, max_wait_s=25.0)
+                codigo = _invite_tomar_otp_worker(estado, correo, es_alta=es_alta, max_wait_s=45.0)
             else:
                 n_intentos = 10
                 for intento in range(1, n_intentos + 1):
@@ -1671,26 +1965,13 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     if codigo:
                         break
                     if intento in (5, 9):
-                        try:
-                            btn_resend = esperar_locator_en_frames(
-                                page,
-                                [
-                                    "button:has-text('Resend code')", "button:has-text('Resend')",
-                                    "button:has-text('Reenviar código')", "button:has-text('Reenviar')",
-                                    "a:has-text('Resend')", "a:has-text('Reenviar')",
-                                ],
-                                timeout_s=1.5,
-                            )
-                            if btn_resend:
-                                print(f"    [Invitación] [{correo}] Pulsando Resend code...")
-                                btn_resend.click(force=True)
-                                time.sleep(1.2)
-                                try:
-                                    estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                        if _invite_pulsar_reenviar_codigo(page):
+                            print(f"    [Invitación] [{correo}] Pulsando Reenviar código...")
+                            time.sleep(1.2)
+                            try:
+                                estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
+                            except Exception:
+                                pass
                     print(f"    [Invitación] [{correo}] Esperando código IMAP ({intento}/{n_intentos})...")
                     time.sleep(1.8)
             estado["codigo_ts"] = time.time()
@@ -1699,8 +1980,10 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     return "esperar"
                 print(f"    {Color.FAIL}[Invitación] [{correo}] No llegó el código de {tipo}.{Color.ENDC}")
                 return "esperar"
+
             estado["otp_valor"] = str(codigo)
-            return _aplicar_otp_guardado(str(codigo))
+            estado["otp_escrito"] = False  # Se escribirá en el siguiente paso
+            return "progreso"
 
     # 3) Campo de contraseña → rellenar y enviar (solo cuentas ya existentes)
     pwd_inp = encontrar_locator_en_frames(page, pwd_selectors)
@@ -1723,6 +2006,23 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     print(f"    {Color.FAIL}[Invitación] [{correo}] Campo contraseña visible pero "
                           f"no hay entrada en sesiones_imap_cuentas.txt.{Color.ENDC}")
                 return "sin_pwd"
+
+            # Verificar si Tidal ya rechazó la contraseña
+            try:
+                err_pwd = page.evaluate("""() => {
+                    const txt = ((document.body ? document.body.innerText : '') + ' ' + (document.title || '')).toLowerCase();
+                    if (/contrase[ñn]a\\s*incorrecta|invalid\\s*password|incorrect\\s*password|wrong\\s*password/i.test(txt)) {
+                        return true;
+                    }
+                    const bad = document.querySelector('input[type="password"][aria-invalid="true"], input[type="password"].is-invalid');
+                    return Boolean(bad);
+                }""")
+                if err_pwd:
+                    print(f"    {Color.FAIL}[Invitación] [{correo}] Contraseña incorrecta en Tidal. Verifica sesiones_imap_cuentas.txt.{Color.ENDC}")
+                    return "sin_pwd"
+            except Exception:
+                pass
+
             try:
                 val_p = pwd_inp.input_value()
             except Exception:
@@ -1777,19 +2077,21 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     except Exception:
                         pass
                 time.sleep(0.3)
-            if not estado.get("baseline_id"):
-                try:
-                    estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
-                except Exception:
-                    estado["baseline_id"] = 0
             if not estado.get("continuar_correo_pulsado"):
                 print(f"    [Invitación] [{correo}] Correo ya presente. Pulsando Continuar...")
                 estado["continuar_correo_pulsado"] = True
+            estado["otp_despues"] = time.time() - 2.0
             if not _invite_pulsar_continuar_o_login(page):
                 try:
                     email_inp.press("Enter")
                 except Exception:
                     pass
+            # Baseline IMAP/worker DESPUÉS de Continuar (antes bloqueaba el clic)
+            if not estado.get("baseline_id"):
+                try:
+                    estado["baseline_id"] = obtener_max_email_id(correo, "tidal")
+                except Exception:
+                    estado["baseline_id"] = 0
             _invite_arrancar_prefetch_otp(
                 estado, correo, es_alta=bool(estado.get("registro_nuevo")),
             )
@@ -1822,11 +2124,13 @@ def abrir_enlace_familia_con_autocierre(
     proxy_pe: dict | None = None,
     proxy_ng: dict | None = None,
     headless: bool = False,
+    forzar_proxy_ng: bool = False,
 ) -> bool:
     """Abre el enlace de invitación, completa login/alta + aceptación y cierra Chrome al éxito.
 
-    - Cuenta ya existente (hay pwd o login): proxy PE.
+    - Cuenta ya existente (hay pwd o login): proxy PE (salvo forzar_proxy_ng).
     - Cuenta aún no registrada (alta DOB/Suscríbete): proxy NG (Nigeria), obligatorio.
+    - Links desde linksextraidos.txt: forzar_proxy_ng=True → siempre NG (una sola ventana).
     Devuelve True si la invitación quedó aceptada.
     """
     try:
@@ -1843,10 +2147,13 @@ def abrir_enlace_familia_con_autocierre(
         print(f"    {Color.CYAN}[Invitación] [{correo}] Usando URL directa (sin ablink).{Color.ENDC}")
 
     pwd_cuenta = buscar_contrasena_cuenta(correo)
-    # Sin contraseña → se asume alta nueva → Nigeria desde el inicio.
-    # Con contraseña → Perú (login). Si luego aparece formulario de alta, se cambia a NG.
-    usar_ng_inicial = not bool(pwd_cuenta)
+    # Sin contraseña → alta nueva → Nigeria. Con forzar_proxy_ng (archivo .txt) → siempre NG.
+    # Con contraseña (IMAP/manual) → Perú; si aparece alta, se cambia a NG (cerrando la 1ª ventana).
+    usar_ng_inicial = bool(forzar_proxy_ng) or not bool(pwd_cuenta)
     if usar_ng_inicial:
+        if forzar_proxy_ng and pwd_cuenta:
+            print(f"    {Color.CYAN}[Invitación] [{correo}] Link desde archivo .txt → "
+                  f"proxy NG desde el inicio (no se abre ventana PE).{Color.ENDC}")
         if not proxy_ng or not proxy_ng.get("server"):
             try:
                 proxy_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico(espera_s=45.0)
@@ -1854,11 +2161,11 @@ def abrir_enlace_familia_con_autocierre(
                 proxy_ng = None
         if not proxy_ng or not proxy_ng.get("server"):
             print(f"    {Color.FAIL}[Navegador] [{correo}] Sin proxy de Nigeria disponible. "
-                  f"El alta de cuentas nuevas exige NG. Se omite.{Color.ENDC}")
+                  f"El alta / links de archivo exigen NG. Se omite.{Color.ENDC}")
             return False
         current_proxy = proxy_ng
         proxy_tipo = "NG"
-        # Devolver PE si se reservó de más
+        # Devolver PE si se reservó de más (no se usará)
         if proxy_pe and proxy_pe.get("server"):
             try:
                 GLOBAL_PE_PROXY_POOL.liberar_proxy(proxy_pe.get("server"))
@@ -1918,22 +2225,18 @@ def abrir_enlace_familia_con_autocierre(
         _max_intentos_inv = 5
 
         def _cerrar_contexto():
-            """Cierre rápido en EL MISMO hilo (Playwright sync no admite close desde otro thread).
-
-            Cerrar pestañas primero hace que la ventana desaparezca al momento; luego
-            context.close() suele ser breve. Nunca usar threading aquí → greenlet.error.
-            """
+            """Cierre rápido en EL MISMO hilo (Playwright sync no admite close desde otro thread)."""
             nonlocal context, page
             pages = []
             try:
                 if context:
                     pages = list(context.pages)
             except Exception:
-                pass
+                pages = []
             for pg in pages:
                 try:
                     if not pg.is_closed():
-                        pg.close(timeout=2500)
+                        pg.close()
                 except Exception:
                     pass
             page = None
@@ -1943,9 +2246,15 @@ def abrir_enlace_familia_con_autocierre(
             if not ctx:
                 return
             try:
-                ctx.close(timeout=4000)
+                ctx.close()
             except Exception:
-                # TargetClosedError / ya cerrado tras pg.close(): ignorar
+                pass
+            # Si el proceso Chrome quedó zombie tras close fallido, matarlo
+            try:
+                browser = getattr(ctx, "browser", None)
+                if browser is not None:
+                    browser.close()
+            except Exception:
                 pass
 
         def _liberar_proxy_actual():
@@ -1985,14 +2294,21 @@ def abrir_enlace_familia_con_autocierre(
             return True
 
         def _cambiar_a_nigeria_para_alta(razon: str) -> bool:
-            """Cambia de PE → NG cuando aparece el formulario de registro."""
+            """Cambia de PE → NG cuando aparece el formulario de registro.
+
+            Siempre cierra la ventana PE antes de abrir la NG (una sola ventana por correo).
+            """
             nonlocal current_proxy, proxy_tipo, profile_dir, proxy_ng
             if proxy_tipo == "NG":
                 return True
             print(f"    {Color.CYAN}[Invitación] [{correo}] {razon}. "
-                  f"Cambiando a proxy de NIGERIA para el alta...{Color.ENDC}")
+                  f"Cerrando ventana PE y abriendo solo proxy NIGERIA...{Color.ENDC}")
             pe_srv = (current_proxy or {}).get("server")
-            _cerrar_contexto()
+            try:
+                _cerrar_contexto()
+            except Exception:
+                pass
+            time.sleep(0.35)
             if pe_srv:
                 try:
                     GLOBAL_PE_PROXY_POOL.liberar_proxy(pe_srv)
@@ -2036,9 +2352,15 @@ def abrir_enlace_familia_con_autocierre(
             ultimo_err = ""
             for intento in range(1, max_intentos + 1):
                 try:
-                    if context is None:
-                        context = abrir_contexto(current_proxy, profile_dir, proxy_tipo)
-                        page = context.pages[0] if context.pages else context.new_page()
+                    # Nunca dejar 2 Chromes: si quedó un contexto previo, cerrarlo primero
+                    if context is not None:
+                        try:
+                            _cerrar_contexto()
+                        except Exception:
+                            pass
+                        time.sleep(0.2)
+                    context = abrir_contexto(current_proxy, profile_dir, proxy_tipo)
+                    page = context.pages[0] if context.pages else context.new_page()
 
                     print(f"    [Invitación] [{correo}] Calentando reputación "
                           f"(proxy {proxy_tipo}, intento reopen {intento}/{max_intentos})...")
@@ -2286,16 +2608,16 @@ def abrir_enlace_familia_con_autocierre(
         aceptar_cookies_con_espera(page)
         _invite_limpiar_cookies_agresivo(page)
 
-        # Enlace ya aceptado/caducado → OK inmediato, cerrar Chrome sin login/OTP
+        # Enlace ya aceptado/caducado → Detección ultra-rápida inmediata, cerrar Chrome y devolver 'ya_usado'
         if _invite_enlace_ya_aceptado_o_caducado(page):
-            print(f"    {Color.GREEN}[OK] [{correo}] Invitación ya aceptada o caducada. "
-                  f"Cerrando Chrome...{Color.ENDC}")
+            print(f"    {Color.CYAN}[INFO] [{correo}] Enlace previamente utilizado (ya se ha aceptado o ha caducado). "
+                  f"Cerrando Chrome rápidamente...{Color.ENDC}")
             _cerrar_contexto()
             try:
                 prof = profile_dir
 
                 def _rm_async_ya(p_dir):
-                    time.sleep(0.5)
+                    time.sleep(0.4)
                     try:
                         shutil.rmtree(p_dir, ignore_errors=True)
                     except Exception:
@@ -2305,7 +2627,7 @@ def abrir_enlace_familia_con_autocierre(
             except Exception:
                 pass
             _liberar_proxy_actual()
-            return True
+            return "ya_usado"
 
         if pwd_cuenta:
             print(f"    [Invitación] [{correo}] Contraseña cargada desde sesiones_imap_cuentas.txt.")
@@ -2340,8 +2662,8 @@ def abrir_enlace_familia_con_autocierre(
         max_rotaciones_antibot_loop = 5
         estado_login = {}
         print(f"    [Invitación] [{correo}] Completando aceptación automática "
-              f"(login PE o alta NG, hasta 5 minutos)...")
-        t_limite = time.time() + 300.0
+              f"(login PE o alta NG, hasta 4 minutos)...")
+        t_limite = time.time() + 240.0
         check_sec = 0
         while time.time() < t_limite:
             check_sec += 1
@@ -2352,6 +2674,34 @@ def abrir_enlace_familia_con_autocierre(
                     url_actual = (page.url or "").lower()
                 except Exception:
                     url_actual = ""
+
+                # 0. Detección prioritaria ultra-rápida: Enlace ya aceptado / caducado
+                if _invite_enlace_ya_aceptado_o_caducado(page):
+                    print(f"    {Color.CYAN}[INFO] [{correo}] Enlace previamente utilizado (ya se ha aceptado o ha caducado). "
+                          f"Cerrando Chrome rápidamente...{Color.ENDC}")
+                    _cerrar_contexto()
+                    try:
+                        prof = profile_dir
+
+                        def _rm_async_ya2(p_dir):
+                            time.sleep(0.4)
+                            try:
+                                shutil.rmtree(p_dir, ignore_errors=True)
+                            except Exception:
+                                pass
+
+                        threading.Thread(target=_rm_async_ya2, args=(Path(prof),), daemon=True).start()
+                    except Exception:
+                        pass
+                    _liberar_proxy_actual()
+                    return "ya_usado"
+
+                if check_sec == 1 or check_sec % 10 == 0:
+                    try:
+                        print(f"    [Invitación] [{correo}] Paso UI {check_sec}… "
+                              f"url={url_actual[:90]}", flush=True)
+                    except Exception:
+                        print(f"    [Invitación] [{correo}] Paso UI {check_sec}…", flush=True)
 
                 # chrome-error / ERR_TUNNEL mid-flujo: ir a URL directa (nunca insistir en ablink)
                 if "chrome-error" in url_actual or "chromewebdata" in url_actual:
@@ -2401,31 +2751,63 @@ def abrir_enlace_familia_con_autocierre(
                     continue
 
                 # Antibot a mitad de flujo (p. ej. tras Suscríbete / accept-invite): ROTAR IP
-                if check_sec % 2 == 0 or check_sec < 3:
+                # En pantalla correo+Continuar no barrer antibot: esa UI es usable y el barrido
+                # de iframes retrasaba el clic hasta parecer que Chrome no hacía nada.
+                en_continuar_email = False
+                try:
+                    en_continuar_email = (
+                        not estado_login.get("continuar_correo_pulsado")
+                        and _invite_pantalla_correo_con_continuar(page)
+                    )
+                except Exception:
+                    en_continuar_email = False
+                if en_continuar_email:
+                    resultado = _invite_avanzar_login(page, correo, pwd_cuenta, estado_login)
+                    if resultado == "ok":
+                        success_detected = True
+                        break
+                    if resultado in ("progreso", "sin_pwd", "esperar"):
+                        time.sleep(0.4 if resultado == "progreso" else 0.55)
+                        continue
+
+                if not en_continuar_email:
+                    hay_antibot = False
                     try:
                         hay_antibot = detectar_pantalla_antirobot(page)
                     except Exception:
                         hay_antibot = False
+
                     if hay_antibot:
                         if rotaciones_antibot_loop >= max_rotaciones_antibot_loop:
                             print(f"    {Color.FAIL}[Invitación] [{correo}] Antibot persistente tras "
                                   f"{max_rotaciones_antibot_loop} rotaciones. Se omite.{Color.ENDC}")
                             break
                         rotaciones_antibot_loop += 1
-                        print(f"    {Color.WARNING}[Invitación] [{correo}] Antibot en accept/login "
-                              f"(rotación {rotaciones_antibot_loop}/{max_rotaciones_antibot_loop})..."
-                              f"{Color.ENDC}")
-                        # Intento corto de slider antes de quemar IP
+                        print(f"    {Color.WARNING}[Invitación] [{correo}] Bloqueo de IP / Antibot en enlace de invitación "
+                              f"(rotando a proxy de {proxy_tipo} limpio {rotaciones_antibot_loop}/{max_rotaciones_antibot_loop})...{Color.ENDC}")
+
+                        # Si es bloqueo de IP / acceso restringido WAF, rotar inmediatamente sin perder tiempo en sliders inexistentes
+                        es_bloqueo_ip_directo = False
                         try:
-                            if resolver_slider_captcha_playwright(page):
-                                time.sleep(2.0)
-                                if not detectar_pantalla_antirobot(page):
-                                    print(f"    [Invitación] [{correo}] Slider resuelto; se continúa.")
-                                    continue
+                            es_bloqueo_ip_directo = bool(page.evaluate("""() => {
+                                const t = ((document.body ? document.body.innerText : '') + ' ' + (document.title || '')).toLowerCase();
+                                return t.includes('restringido') || t.includes('restricted') || t.includes('comportamiento del navegador') || t.includes('mismo red') || t.includes('misma red');
+                            }"""))
                         except Exception:
-                            pass
+                            es_bloqueo_ip_directo = False
+
+                        if not es_bloqueo_ip_directo:
+                            try:
+                                if resolver_slider_captcha_playwright(page):
+                                    time.sleep(1.2)
+                                    if not detectar_pantalla_antirobot(page):
+                                        print(f"    [Invitación] [{correo}] Slider resuelto; se continúa.")
+                                        continue
+                            except Exception:
+                                pass
+
                         if not _rotar_proxy_y_perfil(
-                            f"Antibot en bucle de aceptación ({proxy_tipo})"
+                            f"Bloqueo de IP ({proxy_tipo})"
                         ):
                             break
                         if not _reabrir_invitacion_con_proxy_actual():
@@ -2436,7 +2818,7 @@ def abrir_enlace_familia_con_autocierre(
                         if estado_login.get("otp_escrito"):
                             keep = keep + ("otp_escrito", "otp_valor", "dob_ok", "suscribete_pulsado", "baseline_id")
                         estado_login = {k: v for k, v in estado_login.items() if k in keep}
-                        time.sleep(0.8)
+                        time.sleep(0.5)
                         continue
 
                 if url_es_pagina_marketing(url_actual):
@@ -2492,9 +2874,24 @@ def abrir_enlace_familia_con_autocierre(
                     continue
 
                 if _invite_enlace_ya_aceptado_o_caducado(page):
-                    print(f"    {Color.GREEN}[OK] [{correo}] Invitación ya aceptada o caducada.{Color.ENDC}")
-                    success_detected = True
-                    break
+                    print(f"    {Color.CYAN}[INFO] [{correo}] Enlace previamente utilizado (ya se ha aceptado o ha caducado). "
+                          f"Cerrando Chrome rápidamente...{Color.ENDC}")
+                    _cerrar_contexto()
+                    try:
+                        prof = profile_dir
+
+                        def _rm_async_ya3(p_dir):
+                            time.sleep(0.4)
+                            try:
+                                shutil.rmtree(p_dir, ignore_errors=True)
+                            except Exception:
+                                pass
+
+                        threading.Thread(target=_rm_async_ya3, args=(Path(prof),), daemon=True).start()
+                    except Exception:
+                        pass
+                    _liberar_proxy_actual()
+                    return "ya_usado"
 
                 if _invite_detectar_exito(page):
                     success_detected = True
@@ -2503,6 +2900,9 @@ def abrir_enlace_familia_con_autocierre(
                 resultado = _invite_avanzar_login(page, correo, pwd_cuenta, estado_login)
                 if resultado == "ok":
                     success_detected = True
+                    break
+                if resultado == "fallo_otp":
+                    print(f"    {Color.FAIL}[Invitación] [{correo}] Verificación OTP fallida tras múltiples intentos.{Color.ENDC}")
                     break
                 if resultado == "sin_pwd":
                     time.sleep(0.6)
@@ -2533,12 +2933,28 @@ def abrir_enlace_familia_con_autocierre(
                 threading.Thread(target=_rm_async, args=(Path(prof),), daemon=True).start()
             except Exception:
                 pass
+            _liberar_proxy_actual()
+            return "ok"
         else:
             print(f"    {Color.WARNING}[WARN] No se completó la aceptación automática para {correo} "
-                  f"en el tiempo límite. La ventana permanece abierta para revisión.{Color.ENDC}")
+                  f"en el tiempo límite. Cerrando ventana...{Color.ENDC}")
+            _cerrar_contexto()
+            try:
+                prof = profile_dir
+
+                def _rm_async_fail(p_dir):
+                    time.sleep(0.5)
+                    try:
+                        shutil.rmtree(p_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_rm_async_fail, args=(Path(prof),), daemon=True).start()
+            except Exception:
+                pass
 
         _liberar_proxy_actual()
-        return bool(success_detected)
+        return False
 
 
 def _norm_correo_simple(c: str) -> str:
@@ -2807,8 +3223,9 @@ def _imprimir_resumen_opcion4(
     ok_list: list[str],
     fail_list: list[str],
     sin_enlace: list[str] | None = None,
+    ya_usados_list: list[str] | None = None,
 ) -> None:
-    """Resumen visual de la opción 4: aceptadas vs pendientes/fallidas."""
+    """Resumen visual de la opción 4: aceptadas vs previamente utilizadas vs pendientes/fallidas."""
     def _norm(c: str) -> str:
         return (c or "").strip().lower()
 
@@ -2820,18 +3237,26 @@ def _imprimir_resumen_opcion4(
             vistos_ok.add(k)
             ok_unique.append(c.strip())
 
+    vistos_ya_usados: set[str] = set()
+    ya_usados_unique: list[str] = []
+    for c in (ya_usados_list or []):
+        k = _norm(c)
+        if k and k not in vistos_ok and k not in vistos_ya_usados:
+            vistos_ya_usados.add(k)
+            ya_usados_unique.append(c.strip())
+
     vistos_fail: set[str] = set()
     fail_unique: list[str] = []
     for c in fail_list:
         k = _norm(c)
-        if k and k not in vistos_ok and k not in vistos_fail:
+        if k and k not in vistos_ok and k not in vistos_ya_usados and k not in vistos_fail:
             vistos_fail.add(k)
             fail_unique.append(c.strip())
 
-    # Cualquier correo del menú que no esté en OK ni FAIL
+    # Cualquier correo del menú que no esté en OK, Ya usados, ni FAIL
     for c in correos_menu or []:
         k = _norm(c)
-        if k and k not in vistos_ok and k not in vistos_fail:
+        if k and k not in vistos_ok and k not in vistos_ya_usados and k not in vistos_fail:
             fail_unique.append(c.strip())
             vistos_fail.add(k)
 
@@ -2843,21 +3268,26 @@ def _imprimir_resumen_opcion4(
     print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
     print(f" Total en menú: {len(correos_menu or [])}")
     print(f" {Color.GREEN}Aceptadas OK: {len(ok_unique)}{Color.ENDC}")
+    if ya_usados_unique:
+        print(f" {Color.CYAN}Enlace previamente utilizado (ya aceptado o caducado): {len(ya_usados_unique)}{Color.ENDC}")
     print(f" {Color.FAIL}Pendientes / fallidas: {len(fail_unique)}{Color.ENDC}")
 
     if ok_unique:
         print(f"\n{Color.GREEN}{Color.BOLD}✓ Procesadas correctamente:{Color.ENDC}")
         for i, c in enumerate(ok_unique, 1):
             print(f"  {Color.GREEN}{i:2d}. {c}{Color.ENDC}")
-    else:
-        print(f"\n{Color.WARNING}✓ Ninguna cuenta quedó aceptada en esta corrida.{Color.ENDC}")
+
+    if ya_usados_unique:
+        print(f"\n{Color.CYAN}{Color.BOLD}ℹ Enlace previamente utilizado (ya aceptado o caducado):{Color.ENDC}")
+        for i, c in enumerate(ya_usados_unique, 1):
+            print(f"  {Color.CYAN}{i:2d}. {c}{Color.ENDC}")
 
     if fail_unique:
         print(f"\n{Color.FAIL}{Color.BOLD}✗ Faltan / fallaron:{Color.ENDC}")
         for i, c in enumerate(fail_unique, 1):
             motivo = "sin enlace IMAP" if _norm(c) in sin_enlace_set else "no aceptada / error"
             print(f"  {Color.FAIL}{i:2d}. {c}{Color.ENDC}  ({motivo})")
-    else:
+    elif not ya_usados_unique:
         print(f"\n{Color.GREEN}✗ No quedan pendientes.{Color.ENDC}")
 
     print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
@@ -3783,7 +4213,7 @@ def _extraer_codigos_otp(texto: str, preferir_len: int | None = None) -> list[st
     vistos: set[str] = set()
 
     def _es_basura(codigo: str, estricto_anio: bool) -> bool:
-        if codigo in {"00000", "000000", "11111", "111111"}:
+        if codigo in {"00000", "000000", "11111", "111111", "10001", "10002", "10003", "10004", "10005", "10010", "10011", "10012", "10013"}:
             return True
         # Fechas YYYYMM sueltas en HTML (202401…) no son OTP; si viene junto a 'code', sí se acepta.
         if estricto_anio and len(codigo) == 6 and codigo.startswith("20"):
@@ -3806,10 +4236,19 @@ def _extraer_codigos_otp(texto: str, preferir_len: int | None = None) -> list[st
         vistos.add(codigo)
         (prioritarios if prioritario else normales).append(codigo)
 
-    # 1) Junto a palabras de código (máxima prioridad)
+    # 1) Junto a palabras de código (máxima prioridad, 6 dígitos primero)
     for m in re.finditer(
         r"(?:c[oó]digo|code|sign[-\s]?up\s*code|verification\s*code|one[-\s]?time|"
-        r"introduce|ingresa|enter|confirma|is)[^\d]{0,40}(\d{5,6})",
+        r"introduce|ingresa|enter|confirma|use\s*this\s*code)[^\d]{0,120}(\d{6})",
+        texto,
+        flags=re.I,
+    ):
+        _add(m.group(1), prioritario=True)
+
+    # 1b) 5 dígitos cerca de palabras clave de código
+    for m in re.finditer(
+        r"(?:c[oó]digo|code|sign[-\s]?up\s*code|verification\s*code|one[-\s]?time|"
+        r"introduce|ingresa|enter|confirma)[^\d]{0,60}(\d{5})",
         texto,
         flags=re.I,
     ):
@@ -3827,8 +4266,10 @@ def _extraer_codigos_otp(texto: str, preferir_len: int | None = None) -> list[st
     ):
         _add(re.sub(r"\D", "", m.group(0)), prioritario=True)
 
-    # 3) Cualquier 5–6 dígitos suelto (menor prioridad)
-    for m in re.findall(r"\b(\d{5,6})\b", texto):
+    # 3) Cualquier 6 dígitos suelto (bloques grandes de número)
+    for m in re.findall(r"\b(\d{6})\b", texto):
+        _add(m, prioritario=False)
+    for m in re.findall(r"\b(\d{5})\b", texto):
         _add(m, prioritario=False)
 
     # Preferir longitud pedida (6 en eliminación) y luego 6 dígitos genéricos
@@ -4826,21 +5267,14 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
                 aliases_unicos.append(a.strip())
 
         try:
-            from otp_worker_client import reclamar_invites_para_aliases, worker_cubre_alias, worker_config
+            from otp_worker_client import reclamar_invites_para_aliases
             w_ok, aliases_unicos = reclamar_invites_para_aliases(aliases_unicos, max_age)
             asignados.update(w_ok)
             if not aliases_unicos:
                 continue
         except Exception as e_w:
             print(f"    {Color.WARNING}[WORKER]{Color.ENDC} Asignación de invitaciones: {e_w}")
-            try:
-                from otp_worker_client import worker_cubre_alias, worker_config
-                if not worker_config().get("imap_fallback"):
-                    aliases_unicos = [a for a in aliases_unicos if not worker_cubre_alias(a)]
-            except Exception:
-                pass
-            if not aliases_unicos:
-                continue
+            # Seguir con IMAP para todos (FORWARD_TO); no descartar catch-all.
 
         if len(aliases_unicos) == 1:
             solo = aliases_unicos[0]
@@ -4994,6 +5428,7 @@ def reclamar_otp_registro_para_alias(
     after_email_id: int = 0,
     max_age_minutes: int = 20,
     silencioso: bool = True,
+    omitir_worker: bool = False,
 ) -> str | None:
     """OTP de registro para UN alias (con puntos), bajo candado corto del buzón.
 
@@ -5014,6 +5449,7 @@ def reclamar_otp_registro_para_alias(
             preferir_otp_len=6,
             exigir_destinatario_exacto=True,
             silencioso=silencioso,
+            omitir_worker=omitir_worker,
         )
 
 
@@ -5034,6 +5470,7 @@ def reclamar_otp_login_para_alias(
     after_email_id: int = 0,
     max_age_minutes: int = 20,
     silencioso: bool = True,
+    omitir_worker: bool = False,
 ) -> str | None:
     """OTP de inicio de sesión para UN alias exacto (opción 4 / login)."""
     alias = (alias or "").strip().lower()
@@ -5050,6 +5487,7 @@ def reclamar_otp_login_para_alias(
             preferir_otp_len=6,
             exigir_destinatario_exacto=True,
             silencioso=silencioso,
+            omitir_worker=omitir_worker,
         )
 
 
@@ -5523,23 +5961,44 @@ def _imap_otp_rapido_asunto(
             _destinatario_es_para_alias(a, rec, subj, exigir_exacto=False)
             for a in (aliases_ok or [])
         )
-        if not match_alias and not en_etiqueta and not catch_all:
-            continue
-        if not silencioso:
-            print(f"    {Color.CYAN}[IMAP]{Color.ENDC} #{seq} {(subj or '')[:72]!r}", flush=True)
-        codigos = _extraer_codigos_otp(subj or "", preferir_len=preferir_otp_len)
-        if not codigos:
-            if not silencioso:
-                print(f"    {Color.CYAN}[IMAP]{Color.ENDC} El código no está en el asunto; leyendo cuerpo #{seq}...",
-                      flush=True)
+        full = None
+        texto = ""
+        if not match_alias:
             full = _imap_fetch_seq_rfc822(mail, seq)
             texto = _imap_cuerpo_texto(full) if full else ""
             if full:
                 rec2 = _headers_destinatario(full)
-                match_alias = match_alias or any(
+                match_alias = any(
                     _destinatario_es_para_alias(a, rec2, texto, exigir_exacto=False)
                     for a in (aliases_ok or [])
                 )
+            if not match_alias and catch_all:
+                texto_todo = f"{rec} {texto} {subj}".lower()
+                try:
+                    destinos = set(_mapa_dominios_forward_imap())
+                    objetivos = {(a or "").strip().lower() for a in aliases_ok}
+                    otro_alias = False
+                    for addr in re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+", texto_todo):
+                        if addr.split("@")[-1] in destinos and addr not in objetivos:
+                            otro_alias = True
+                            break
+                    if otro_alias:
+                        continue
+                except Exception:
+                    pass
+            if not match_alias and not en_etiqueta:
+                continue
+
+        if not silencioso:
+            print(f"    {Color.CYAN}[IMAP]{Color.ENDC} #{seq} {(subj or '')[:72]!r}", flush=True)
+        codigos = _extraer_codigos_otp(subj or "", preferir_len=preferir_otp_len)
+        if not codigos:
+            if full is None:
+                if not silencioso:
+                    print(f"    {Color.CYAN}[IMAP]{Color.ENDC} El código no está en el asunto; leyendo cuerpo #{seq}...",
+                          flush=True)
+                full = _imap_fetch_seq_rfc822(mail, seq)
+                texto = _imap_cuerpo_texto(full) if full else ""
             codigos = _extraer_codigos_otp(f"{subj} {texto}", preferir_len=preferir_otp_len)
         if codigos:
             if not silencioso:
@@ -5585,7 +6044,8 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                              aliases_extra=None, preferir_otp_len: int | None = None,
                              exigir_destinatario_exacto: bool = False,
                              aliases_solo: list | None = None,
-                             silencioso: bool = False) -> str | None:
+                             silencioso: bool = False,
+                             omitir_worker: bool = False) -> str | None:
     """Lee correos de Gmail via IMAP sin necesidad de abrir el navegador.
     Requiere una 'App Password' de Google.
     Busca dinámicamente en passwords.txt la contraseña específica del correo.
@@ -5614,20 +6074,21 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
         aliases_ok = [(gmail_user or "").strip().lower()]
 
     try:
-        from otp_worker_client import intentar_via_worker
-        val_w, skip_imap = intentar_via_worker(
-            aliases_ok[0], required_keywords, solo_link,
-            max_age_minutes=max_age_minutes or 15,
-            after_email_id=after_email_id or 0,
-            silencioso=silencioso,
-            aliases=aliases_ok,
-        )
-        if val_w:
-            return val_w
-        if skip_imap:
-            if not silencioso:
-                print(f"    {Color.WARNING}[WORKER]{Color.ENDC} Sin resultado aún para {aliases_ok[0]}.")
-            return None
+        if not omitir_worker:
+            from otp_worker_client import intentar_via_worker
+            val_w, skip_imap = intentar_via_worker(
+                aliases_ok[0], required_keywords, solo_link,
+                max_age_minutes=max_age_minutes or 15,
+                after_email_id=after_email_id or 0,
+                silencioso=silencioso,
+                aliases=aliases_ok,
+            )
+            if val_w:
+                return val_w
+            if skip_imap:
+                if not silencioso:
+                    print(f"    {Color.WARNING}[WORKER]{Color.ENDC} Sin resultado aún para {aliases_ok[0]}.")
+                return None
     except Exception:
         pass
     
@@ -6755,67 +7216,95 @@ def _esperar_estado_login_estable(page, timeout_s: float = 8.0) -> str:
 
 
 def detectar_pantalla_antirobot(page) -> bool:
-    """Detecta si la página actual presenta un captcha o bloqueo real (Cloudflare, Datadome, Slider)."""
+    """Detecta si la página actual presenta un captcha o bloqueo real (Cloudflare, Datadome, Slider, Restricción IP)."""
     try:
-        if not page or page.is_closed():
+        if not page:
+            return False
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
             return False
 
-        patrones = [
-            "nos aseguramos de que", "nos dirigimos a usted", "no a un robot",
-            "desliza hacia la derecha",
-            "making sure you are not a robot", "not a robot", "slide to right",
-            "verify you are human", "confirmar que eres humano",
-            "access denied", "error code 1020", "unusual activity",
-            "bot detection", "acceso está restringido", "acceso restringido", "restringido temporalmente",
-            "comportamiento del navegador nos ha intrigado",
-            "something about your browser", "triggered this security",
-            "datadome", "cf-challenge", "just a moment",
-        ]
-
-        # PRIMERO el texto antibot: el interstitial de Tidal a veces deja inputs en el DOM
-        # y el early-return por formulario ocultaba el bloqueo (opción 4 no rotaba IP).
-        for frame in page.frames:
-            try:
-                body_text = frame.evaluate("() => document.body ? document.body.innerText : ''")
-                if body_text:
-                    body_text_lower = body_text.lower()
-                    for pat in patrones:
-                        if pat in body_text_lower:
-                            print(f"  [Anti-bot DEBUG] Detectado bloqueo/error de IP por patrón: '{pat}'")
-                            return True
-
-                    if re.search(
-                        r"403\s*ERROR|generated by cloudfront|request blocked|access denied|"
-                        r"error code 1020|ray id|not a robot|no a un robot",
-                        body_text,
-                        re.I,
-                    ):
-                        print("  [Anti-bot DEBUG] Detectado bloqueo por body text en frame")
-                        return True
-            except Exception:
-                continue
-
+        # 1) Evaluación directa en JS del frame principal (instantánea)
         try:
-            titulo = page.title()
-            if re.search(
-                r"403|request could not be satisfied|access denied|attention required|"
-                r"security|blocked|datadome|robot",
-                titulo,
-                re.I,
-            ):
+            bloqueo = page.evaluate("""() => {
+                try {
+                    const txt = (
+                        (document.body ? (document.body.innerText || document.body.textContent || '') : '') + ' ' +
+                        (document.documentElement ? (document.documentElement.innerText || document.documentElement.textContent || '') : '') + ' ' +
+                        (document.title || '')
+                    ).toLowerCase();
+                    if (!txt.trim()) return false;
+
+                    const patrones = [
+                        'el acceso está restringido', 'el acceso esta restringido',
+                        'acceso está restringido', 'acceso esta restringido',
+                        'restringido temporalmente', 'acceso restringido temporalmente',
+                        'comportamiento del navegador nos ha intrigado', 'velocidad sobrehumana',
+                        'un robot se encuentra en la misma red', '¿por qué este bloqueo?', 'por que este bloqueo',
+                        'access is temporarily restricted', 'access is restricted', 'temporarily restricted',
+                        'why this block', 'browser behavior', 'unusual activity', 'something about your browser',
+                        'nos aseguramos de que', 'nos dirigimos a usted', 'no a un robot',
+                        'making sure you are not a robot', 'not a robot', 'slide to right',
+                        'desliza hacia la derecha', 'verify you are human', 'confirmar que eres humano',
+                        'access denied', 'error code 1020', 'ray id', 'datadome', 'cf-challenge',
+                        'just a moment', 'attention required', '403 forbidden', 'request blocked',
+                        'request could not be satisfied', 'generated by cloudfront'
+                    ];
+
+                    for (const p of patrones) {
+                        if (txt.includes(p)) return p;
+                    }
+                    return false;
+                } catch(e) {
+                    return false;
+                }
+            }""")
+            if bloqueo:
+                print(f"  [Anti-bot DEBUG] Detectado bloqueo de IP por patrón: '{bloqueo}'")
+                return True
+        except Exception:
+            pass
+
+        # 2) Iframes secundarios (máximo 4)
+        try:
+            for frame in (page.frames or [])[1:5]:
+                try:
+                    if frame.is_detached():
+                        continue
+                    b_txt = frame.evaluate("""() => {
+                        try {
+                            return ((document.body ? (document.body.innerText || document.body.textContent) : '') + ' ' + (document.title || '')).toLowerCase();
+                        } catch(e) { return ''; }
+                    }""")
+                    if b_txt:
+                        if any(k in b_txt for k in (
+                            "restringido temporalmente", "un robot se encuentra", "datadome",
+                            "not a robot", "no a un robot", "access denied", "slide to right",
+                            "comportamiento del navegador"
+                        )):
+                            print("  [Anti-bot DEBUG] Detectado bloqueo en iframe")
+                            return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 3) Título de la página
+        try:
+            titulo = (page.title() or "").lower()
+            if any(k in titulo for k in ("403", "access denied", "security", "blocked", "datadome", "robot", "restringido")):
                 print(f"  [Anti-bot DEBUG] Detectado por TITULO: '{titulo}'")
                 return True
         except Exception:
             pass
 
-        # Error genérico de login: también bloquea el avance, pero se recupera distinto
+        # Error genérico de login
         if es_pantalla_error_login_tidal(page):
             print("  [Anti-bot DEBUG] Detectado error genérico de login.tidal.com ('Algo salió mal')")
             return True
 
-        # Solo si NO hay señales de antibot: formulario visible ⇒ página usable
-        if _formulario_login_visible(page):
-            return False
     except Exception:
         pass
     return False
@@ -7695,7 +8184,22 @@ def encontrar_locator_en_frames(page, selectors: list, label_regex=None, text_re
     selectores amplios como 'button' devolvían la flecha atrás del login de Tidal y el
     flujo volvía a la pantalla del correo justo después de enviar la contraseña.
     """
-    for frame in page.frames:
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = []
+    # Frame principal primero: iframes de tracking/antibot retrasaban opción 4 (Continuar).
+    try:
+        main = page.main_frame
+        if main is not None:
+            frames = [main] + [f for f in frames if f != main]
+    except Exception:
+        pass
+    # Limitar frames secundarios para no barrer 15+ iframes en cada tick del bucle.
+    if len(frames) > 5:
+        frames = frames[:5]
+
+    for frame in frames:
         for sel in selectors:
             try:
                 loc = frame.locator(sel)
@@ -8165,6 +8669,10 @@ class ThreadSafeProxyPool:
             return
         with self.lock:
             self.in_use_servers.discard(current_server)
+
+    def liberar_todos_los_en_uso(self):
+        with self.lock:
+            self.in_use_servers.clear()
 
 GLOBAL_PE_PROXY_POOL = ThreadSafeProxyPool(etiqueta="PE")
 GLOBAL_NG_PROXY_POOL = ThreadSafeProxyPool(etiqueta="NG")
@@ -11011,7 +11519,8 @@ class TidalResetPasswordManager:
                         '#onetrust-consent-sdk', '.ot-sdk-container', '#onetrust-banner-sdk',
                         '[id*="onetrust" i]', '.ot-cookie-policy',
                         '[class*="cookie-banner" i]', '[id*="cookie-banner" i]',
-                        '[class*="consent" i][class*="banner" i]'
+                        '[class*="consent" i][class*="banner" i]',
+                        '[id*="datadome" i]', '[class*="datadome" i]'
                     ];
                     selectors.forEach(sel => {
                         document.querySelectorAll(sel).forEach(el => { try { el.remove(); } catch(e) {} });
@@ -11020,6 +11529,111 @@ class TidalResetPasswordManager:
             """)
         except Exception:
             pass
+
+    def _rellenar_email_reset_react(self, email_input) -> bool:
+        """Rellena el email de forma que React/Tidal habilite Continuar (setter nativo + typing)."""
+        correo = self.client_email
+        try:
+            email_input.click(timeout=3000)
+            time.sleep(0.1)
+            email_input.fill("")
+            time.sleep(0.05)
+            # press_sequentially dispara input real; fill() a veces deja Continuar disabled.
+            try:
+                email_input.press_sequentially(correo, delay=18)
+            except Exception:
+                email_input.fill(correo)
+            time.sleep(0.2)
+            self.page.evaluate(
+                """(email) => {
+                    const el = document.querySelector('input[type="email"]')
+                        || document.querySelector('input[name="email"]')
+                        || document.querySelector('input[placeholder*="email" i]')
+                        || document.querySelector('input[placeholder*="usuario" i]')
+                        || document.querySelector('input[type="text"]');
+                    if (!el) return false;
+                    const proto = window.HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(el, email);
+                    else el.value = email;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
+                    return true;
+                }""",
+                correo,
+            )
+            try:
+                email_input.press("Tab")
+            except Exception:
+                pass
+            time.sleep(0.35)
+            try:
+                leido = (email_input.input_value() or "").strip().lower()
+            except Exception:
+                leido = ""
+            return leido == correo.strip().lower() or correo.strip().lower() in leido
+        except Exception as e:
+            print(f"  [Reset Pass] [{self.client_email}] [WARN] Relleno email: {e}")
+            try:
+                email_input.fill(correo)
+                return True
+            except Exception:
+                return False
+
+    def _continuar_reset_habilitado(self) -> bool:
+        """True si el CTA Continuar está visible y no disabled."""
+        try:
+            return bool(self.page.evaluate("""() => {
+                const esCta = (t) => /^(continuar|continue|enviar|send|reset)$/i.test((t || '').trim());
+                const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+                for (const b of btns) {
+                    const t = (b.innerText || b.textContent || b.value || '').trim();
+                    if (!esCta(t) && (b.getAttribute('type') || '').toLowerCase() !== 'submit') continue;
+                    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+                    const st = window.getComputedStyle(b);
+                    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1) continue;
+                    const r = b.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) continue;
+                    return true;
+                }
+                return false;
+            }"""))
+        except Exception:
+            return False
+
+    def _esperar_continuar_habilitado(self, max_s: float = 6.0) -> bool:
+        t0 = time.time()
+        while time.time() - t0 < max_s:
+            if self._continuar_reset_habilitado():
+                return True
+            time.sleep(0.2)
+        return self._continuar_reset_habilitado()
+
+    def _texto_exito_reset_solicitud(self) -> bool:
+        """Frases de éxito que Tidal muestra *después* de enviar (no el copy estático del form)."""
+        try:
+            return bool(self.page.evaluate("""() => {
+                const t = (document.body && document.body.innerText || '').toLowerCase();
+                // Exigir combinación: mensaje de envío + ausencia de campo usable, o frases inequívocas.
+                const ok = [
+                    'te hemos enviado un correo',
+                    'te hemos enviado un enlace',
+                    'we\\'ve sent you an email',
+                    'we have sent you an email',
+                    'check your inbox',
+                    'revisa tu bandeja',
+                    'correo electrónico enviado',
+                    'email sent',
+                    'link has been sent',
+                    'enlace ha sido enviado',
+                    'si existe una cuenta',
+                    'if an account exists',
+                ];
+                return ok.some(p => t.includes(p));
+            }"""))
+        except Exception:
+            return False
 
     def _elemento_interactuable_reset(self, locator) -> bool:
         """True si el locator es visible y no está tapado por un overlay (cookies/DataDome)."""
@@ -11051,12 +11665,12 @@ class TidalResetPasswordManager:
             self.page,
             ['input[type="email"]', 'input[name="email"]', 'input[placeholder*="email" i]',
              'input[placeholder*="usuario" i]', 'input[type="text"]'],
-            timeout_s=1.5
+            timeout_s=1.2
         )
         btn = esperar_locator_en_frames(
             self.page,
             ["button:has-text('Continuar')", "button:has-text('Continue')", "button[type='submit']"],
-            timeout_s=1.5
+            timeout_s=1.2
         )
         return self._elemento_interactuable_reset(email) and self._elemento_interactuable_reset(btn)
 
@@ -11078,21 +11692,36 @@ class TidalResetPasswordManager:
             if any(k in url_ahora for k in ("/sent", "check-email", "link-sent", "email-sent", "/verify")):
                 return True
             if "resetpass" not in url_ahora and "login.tidal.com" in url_ahora:
-                # Redirigió fuera de resetpass (p. ej. confirmación en otra ruta)
                 if not self._formulario_reset_sigue_activo():
                     return True
 
+        form_activo = self._formulario_reset_sigue_activo()
         # Misma URL (SPA): el formulario debe haber desaparecido de verdad
-        if email_antes_visible and not self._formulario_reset_sigue_activo():
-            # Confirmar que no es solo un overlay: tras limpiar cookies, sin email+Continuar
+        if email_antes_visible and not form_activo:
             return True
+        # Misma URL pero copy de éxito + botón ya no habilitado / email no interactuable
+        if self._texto_exito_reset_solicitud() and not form_activo:
+            return True
+        if self._texto_exito_reset_solicitud() and not self._continuar_reset_habilitado():
+            # Tidal a veces deja el input visible pero deshabilita el CTA tras enviar
+            try:
+                email = esperar_locator_en_frames(
+                    self.page,
+                    ['input[type="email"]', 'input[name="email"]'],
+                    timeout_s=0.8,
+                )
+                if email:
+                    dis = email.evaluate(
+                        "(el) => !!(el.disabled || el.readOnly || el.getAttribute('aria-disabled')==='true')"
+                    )
+                    if dis:
+                        return True
+            except Exception:
+                pass
         return False
 
     def _pulsar_continuar_reset(self, btn_continue) -> bool:
-        """Click actionable en Continuar: limpia overlays, evita force=True salvo último recurso.
-
-        force=True atraviesa iframes/overlays de DataDome: el evento no llega a React/Tidal.
-        """
+        """Click actionable en Continuar: limpia overlays, habilita CTA si React lo dejó disabled."""
         self._limpiar_overlays_reset()
         try:
             manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (antes de Continuar)")
@@ -11103,6 +11732,35 @@ class TidalResetPasswordManager:
         self.page = pagina_vigente(self.page)
         self._limpiar_overlays_reset()
 
+        if not self._esperar_continuar_habilitado(4.0):
+            # Forzar habilitación visual + re-disparar input (último recurso antes del click)
+            try:
+                self.page.evaluate(
+                    """(email) => {
+                        const el = document.querySelector('input[type="email"]')
+                            || document.querySelector('input[name="email"]')
+                            || document.querySelector('input[type="text"]');
+                        if (el) {
+                            const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                            if (desc && desc.set) desc.set.call(el, email);
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        for (const b of document.querySelectorAll('button, [role="button"], input[type="submit"]')) {
+                            const t = (b.innerText || b.textContent || b.value || '').toLowerCase();
+                            if (t.includes('continuar') || t.includes('continue') || (b.type || '').toLowerCase() === 'submit') {
+                                b.disabled = false;
+                                b.removeAttribute('disabled');
+                                b.removeAttribute('aria-disabled');
+                            }
+                        }
+                    }""",
+                    self.client_email,
+                )
+            except Exception:
+                pass
+            time.sleep(0.35)
+
         btn = esperar_locator_en_frames(
             self.page,
             ["button:has-text('Continuar')", "button:has-text('Continue')", "button[type='submit']"],
@@ -11111,13 +11769,12 @@ class TidalResetPasswordManager:
         if not btn:
             return False
 
-        # 1) Click normal (Playwright comprueba visibilidad/cobertura)
         try:
             btn.scroll_into_view_if_needed(timeout=2000)
             btn.click(timeout=3500)
             return True
         except Exception as e1:
-            print(f"  [Reset Pass] [{self.client_email}] Click normal falló ({e1}). Reintentando tras limpiar overlay...")
+            print(f"  [Reset Pass] [{self.client_email}] Click normal falló ({e1}). Reintentando...")
 
         self._limpiar_overlays_reset()
         try:
@@ -11126,6 +11783,35 @@ class TidalResetPasswordManager:
                 self.page = pagina_vigente(self.page)
         except RuntimeError:
             raise
+        except Exception:
+            pass
+
+        # JS click + requestSubmit (sin force Playwright sobre overlays)
+        try:
+            clicked = self.page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+                const hit = btns.find(b => {
+                    const t = (b.innerText || b.textContent || b.value || '').toLowerCase();
+                    return t.includes('continuar') || t.includes('continue')
+                        || (b.getAttribute('type') || '').toLowerCase() === 'submit';
+                });
+                if (hit) {
+                    hit.disabled = false;
+                    hit.removeAttribute('disabled');
+                    hit.click();
+                    return 'btn';
+                }
+                const form = document.querySelector('form');
+                if (form) {
+                    try { form.requestSubmit(); return 'form'; } catch (e) {
+                        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                        return 'form-evt';
+                    }
+                }
+                return null;
+            }""")
+            if clicked:
+                return True
         except Exception:
             pass
 
@@ -11138,9 +11824,8 @@ class TidalResetPasswordManager:
             btn.click(timeout=3500)
             return True
         except Exception as e2:
-            print(f"  [Reset Pass] [{self.client_email}] Click aún bloqueado ({e2}). Último recurso: Enter en el campo.")
+            print(f"  [Reset Pass] [{self.client_email}] Click aún bloqueado ({e2}). Enter en el campo.")
 
-        # 2) Enter en el input (sin force sobre el botón tapado)
         try:
             email = esperar_locator_en_frames(
                 self.page,
@@ -11231,6 +11916,86 @@ class TidalResetPasswordManager:
                     time.sleep(2.0)
         return False
 
+    def _asegurar_campo_email_reset(self, max_intentos: int = 3):
+        """Localiza de forma robusta y garantizada el campo de email en /resetpass, limpiando overlays y navegando si es necesario."""
+        selectores = [
+            'input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]',
+            '#email', 'input[placeholder*="email" i]', 'input[placeholder*="correo" i]',
+            'input[placeholder*="usuario" i]', 'input[placeholder*="username" i]',
+            'input[type="text"]'
+        ]
+        for intento in range(1, max_intentos + 1):
+            self._limpiar_overlays_reset()
+            try:
+                _invite_limpiar_cookies_agresivo(self.page)
+            except Exception:
+                pass
+
+            url_act = (self.page.url or "").lower() if self.page else ""
+            if "resetpass" not in url_act or "login.tidal.com" not in url_act:
+                print(f"  [Reset Pass] [{self.client_email}] URL actual '{url_act[:60]}' no es /resetpass; re-navegando...")
+                try:
+                    navegar_tidal_tolerante(
+                        self.page,
+                        "https://login.tidal.com/resetpass",
+                        referer="https://tidal.com/pricing",
+                        timeout_ms=30000,
+                    )
+                    time.sleep(0.4)
+                    self._limpiar_overlays_reset()
+                except Exception as e_nav:
+                    print(f"  [Reset Pass] [{self.client_email}] [WARN] Navegación a resetpass: {e_nav}")
+
+            if detectar_pantalla_antirobot(self.page):
+                print(f"  [Reset Pass] [{self.client_email}] Anti-bot detectado; rotando proxy...")
+                try:
+                    self.rotar_proxy_contexto()
+                    navegar_tidal_tolerante(self.page, "https://tidal.com/pricing", timeout_ms=25000)
+                    time.sleep(0.4)
+                    navegar_tidal_tolerante(
+                        self.page,
+                        "https://login.tidal.com/resetpass",
+                        referer="https://tidal.com/pricing",
+                        timeout_ms=35000,
+                    )
+                    self._limpiar_overlays_reset()
+                except Exception:
+                    pass
+
+            email_inp = esperar_locator_en_frames(self.page, selectores, timeout_s=3.5)
+            if email_inp:
+                try:
+                    if email_inp.is_visible():
+                        return email_inp
+                except Exception:
+                    return email_inp
+
+            # Búsqueda directa en DOM vía evaluate JS
+            try:
+                found_js = self.page.evaluate("""() => {
+                    const el = document.querySelector('input[type="email"], input[name="email"], input[type="text"], input[id*="email" i], input[placeholder*="email" i], input[placeholder*="correo" i]');
+                    if (el) {
+                        el.scrollIntoView({block: 'center'});
+                        return true;
+                    }
+                    return false;
+                }""")
+                if found_js:
+                    email_inp = self.page.locator('input[type="email"], input[name="email"], input[type="text"]').first
+                    return email_inp
+            except Exception:
+                pass
+
+            if intento < max_intentos:
+                print(f"  [Reset Pass] [{self.client_email}] Campo de correo no visible ({intento}/{max_intentos}); refrescando página...")
+                try:
+                    self.page.reload(timeout=20000)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+
+        return None
+
     def run_password_reset(self) -> bool:
         try:
             self.asegurar_navegador_abierto()
@@ -11243,41 +12008,51 @@ class TidalResetPasswordManager:
             
             print(f"  [Navegador] [{self.client_email}] Abriendo ventana de Chrome y cargando página de restablecimiento...")
             
-            # Baseline IMAP se toma JUSTO antes del Continuar (más abajo). Tomarlo aquí, antes del
-            # calentamiento/carga/escritura, permite que el correo de reset llegue en el intervalo
-            # y quede por debajo del baseline → descartado por after_email_id.
             reset_baseline_id = 0
             
-            # 2. Navegar a la página de restablecimiento con reintentos y rotación de proxy autónoma.
-            #    Igual que la opción 10: primero se "calienta" la reputación de la IP visitando una
-            #    página pública (tidal.com/pricing) y luego se entra a /resetpass con referer orgánico.
-            #    Ir en frío a /resetpass con un proxy de datacenter dispara el antirobot casi siempre.
-            _max_intentos_nav = 3
+            # 2. Navegar a la página de restablecimiento con bypass y validación de carga
+            _max_intentos_nav = 5
             nav_reset_ok = False
+            email_input = None
             for _intento_nav in range(1, _max_intentos_nav + 1):
                 try:
                     print(f"  [Bypass] [{self.client_email}] Calentando reputación en tidal.com/pricing (intento {_intento_nav}/{_max_intentos_nav})...")
-                    self.page.goto("https://tidal.com/pricing", wait_until="domcontentloaded", timeout=30000)
+                    navegar_tidal_tolerante(self.page, "https://tidal.com/pricing", timeout_ms=35000)
                     manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (Calentamiento)")
-                    time.sleep(random.uniform(2.0, 3.5))
+                    time.sleep(random.uniform(1.0, 1.8))
                     aceptar_cookies_con_espera(self.page)
-                    time.sleep(random.uniform(0.5, 1.0))
+                    _invite_limpiar_cookies_agresivo(self.page)
 
                     print(f"  [Bypass] [{self.client_email}] Entrando a /resetpass con referer orgánico...")
-                    self.page.goto("https://login.tidal.com/resetpass", wait_until="domcontentloaded", timeout=30000, referer="https://tidal.com/pricing")
+                    navegar_tidal_tolerante(
+                        self.page,
+                        "https://login.tidal.com/resetpass",
+                        referer="https://tidal.com/pricing",
+                        timeout_ms=45000,
+                    )
                     aceptar_cookies_con_espera(self.page)
-                    nav_reset_ok = True
-                    break
+                    _invite_limpiar_cookies_agresivo(self.page)
+
+                    email_input = self._asegurar_campo_email_reset(max_intentos=2)
+                    if email_input:
+                        nav_reset_ok = True
+                        break
+                    time.sleep(1.0)
                 except Exception as _nav_err:
                     err_txt = str(_nav_err).lower()
                     print(f"  [Reset Pass] {Color.WARNING}[WARN] [{self.client_email}] Intento {_intento_nav}/{_max_intentos_nav} de navegación falló ({_nav_err})...{Color.ENDC}")
-                    if "tunnel" in err_txt or "proxy" in err_txt or "connection" in err_txt or "err_" in err_txt or "failed" in err_txt:
-                        # Nunca random.choice(valid_pe_list): puede devolver el proxy de otro hilo.
+                    solo_abort = es_error_navegacion_abortada(_nav_err) and not es_error_proxy_o_red(_nav_err)
+                    if solo_abort:
+                        email_input = self._asegurar_campo_email_reset(max_intentos=2)
+                        if email_input:
+                            nav_reset_ok = True
+                            break
+                        time.sleep(1.0)
+                        continue
+                    if es_error_proxy_o_red(_nav_err) or "tunnel" in err_txt or "timeout" in err_txt:
                         p_pe = GLOBAL_PE_PROXY_POOL.rotar_y_marcar_bloqueado(self.proxy_pe_server)
                         nuevo = (p_pe or {}).get("server") if p_pe else None
                         if not nuevo:
-                            # Dejar proxy_pe_server intacto si la rotación no entregó nada usable;
-                            # no poner None (eso tumba asegurar_navegador_abierto del resto del flujo).
                             raise RuntimeError(
                                 f"No quedan proxies PE limpios para {self.client_email} tras fallo de red."
                             )
@@ -11293,148 +12068,158 @@ class TidalResetPasswordManager:
                             pass
                         self.context = None
                         self.page = None
-                        time.sleep(1.5)
+                        time.sleep(1.0)
                         self.asegurar_navegador_abierto()
                     else:
-                        time.sleep(2.0)
+                        time.sleep(1.5)
             
-            if not nav_reset_ok:
-                raise RuntimeError(f"No se pudo cargar la página de restablecimiento para {self.client_email} tras 3 intentos.")
+            if not email_input:
+                email_input = self._asegurar_campo_email_reset(max_intentos=3)
+            if not email_input:
+                raise RuntimeError(f"No se pudo cargar la página de restablecimiento para {self.client_email} tras {_max_intentos_nav} intentos.")
 
-            # Esperar a que el campo de correo esté renderizado antes de sincronizar
-            esperar_locator_en_frames(
-                self.page, 
-                ['input[type="email"]', 'input[type="text"]', 'input[placeholder*="email" i]', 'input[placeholder*="usuario" i]'], 
-                timeout_s=15.0
-            )
-            time.sleep(1.0)
             print(f"  [Navegador] {Color.GREEN}[Cargado] Ventana de restablecimiento lista para: {self.client_email}{Color.ENDC}")
 
             # Sincronización inicial: Esperar a que TODAS las ventanas estén cargadas
             self.esperar_barrera("inicio")
             
             print(f"\n--- Iniciando restablecimiento de contraseña para: {self.client_email} ---")
-            
+
+            # Micro-stagger de solo 150ms para evitar colisiones sin alargar el proceso
+            stagger_idx = max(0, (int(getattr(self, "thread_index", 1) or 1) - 1) % 5)
+            if stagger_idx:
+                time.sleep(stagger_idx * 0.15)
+
             manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (Email)")
-            
-            # 3. Colocar correo a restablecer
-            email_input = esperar_locator_en_frames(
-                self.page, 
-                ['input[type="email"]', 'input[type="text"]', 'input[placeholder*="email" i]', 'input[placeholder*="usuario" i]'], 
-                timeout_s=15.0
-            )
+
+            # 3. Colocar correo a restablecer (con auto-recuperación garantizada)
+            email_input = self._asegurar_campo_email_reset(max_intentos=3)
             if not email_input:
                 raise RuntimeError("No se localizó el campo de correo para iniciar restablecimiento.")
-                
-            # Escribir instantáneamente sin retrasos por latencia y disparar los eventos de React mediante JS
-            email_input.fill(self.client_email)
-            self.page.evaluate("""
-                () => {
-                    const el = document.querySelector('input[type="email"]') || 
-                               document.querySelector('input[type="text"]') || 
-                               document.querySelector('input[placeholder*="email" i]') ||
-                               document.querySelector('input[placeholder*="usuario" i]');
-                    if (el) {
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                }
-            """)
-            email_input.press("Tab")
-            time.sleep(0.5)
-            
-            # Cookies ANTES de cualquier verificación de avance (si el banner tapa el input,
-            # is_hidden() mentiría y daríamos el submit por bueno).
-            self._limpiar_overlays_reset()
-            time.sleep(0.3)
 
-            # Baseline justo antes del submit: minimiza la ventana donde el correo de reset
-            # llega a Gmail y queda ≤ baseline (antes se tomaba antes del calentamiento).
+            if not self._rellenar_email_reset_react(email_input):
+                print(f"  [Reset Pass] [{self.client_email}] [WARN] Email no validó tras escritura; reintento...")
+                email_input = self._asegurar_campo_email_reset(max_intentos=2) or email_input
+                self._rellenar_email_reset_react(email_input)
+
+            self._limpiar_overlays_reset()
+            time.sleep(0.15)
+
+            if not self._esperar_continuar_habilitado(4.0):
+                print(f"  [Reset Pass] [{self.client_email}] [WARN] Continuar sigue disabled; re-disparando input React...")
+                self._rellenar_email_reset_react(email_input)
+                self._esperar_continuar_habilitado(3.0)
+
+            # Baseline justo antes del submit
             reset_baseline_id = obtener_max_email_id(self.client_email, "tidal")
             print(f"  [Reset Pass] [{self.client_email}] Baseline IMAP antes de Continuar: {reset_baseline_id}")
-            
+
             btn_continue = esperar_locator_en_frames(
                 self.page,
                 ["button:has-text('Continuar')", "button:has-text('Continue')", "button[type='submit']"],
-                timeout_s=8.0
+                timeout_s=6.0
             )
-            if not btn_continue:
-                raise RuntimeError("No se encontró el botón 'Continuar' en resetpass.")
 
             url_antes_submit = self.page.url or ""
             email_antes_visible = self._elemento_interactuable_reset(email_input)
-            if not email_antes_visible:
-                # Re-localizar tras limpiar cookies
-                email_input = esperar_locator_en_frames(
-                    self.page,
-                    ['input[type="email"]', 'input[name="email"]', 'input[placeholder*="email" i]',
-                     'input[placeholder*="usuario" i]', 'input[type="text"]'],
-                    timeout_s=5.0
-                )
-                if not email_input or not self._elemento_interactuable_reset(email_input):
-                    raise RuntimeError(
-                        "El campo de correo no es interactuable (posible overlay de cookies/DataDome)."
-                    )
-                email_antes_visible = True
-                
+
             print("  [Reset Pass] Pulsando botón 'Continuar'...")
             click_exitoso = False
-            for intento_click in range(1, 4):  # máx 3 intentos, 1 submit actionable cada uno
+            for intento_click in range(1, 5):
                 if self._reset_solicitud_confirmada_ui(url_antes_submit, email_antes_visible):
                     click_exitoso = True
                     break
 
-                if not self._pulsar_continuar_reset(btn_continue):
-                    print(f"  [Reset Pass] [WARN] No se pudo pulsar Continuar (intento {intento_click}/3).")
+                if detectar_pantalla_antirobot(self.page):
+                    print(f"  [Reset Pass] [{self.client_email}] Anti-bot al pulsar Continuar; rotando proxy ({intento_click}/4)...")
+                    try:
+                        self.rotar_proxy_contexto()
+                    except Exception as e_rot:
+                        print(f"  [Reset Pass] [WARN] Rotación falló: {e_rot}")
+                    try:
+                        navegar_tidal_tolerante(self.page, "https://tidal.com/pricing", timeout_ms=25000)
+                        time.sleep(0.5)
+                        navegar_tidal_tolerante(
+                            self.page,
+                            "https://login.tidal.com/resetpass",
+                            referer="https://tidal.com/pricing",
+                            timeout_ms=35000,
+                        )
+                        self._limpiar_overlays_reset()
+                        email_input = self._asegurar_campo_email_reset(max_intentos=2)
+                        if email_input:
+                            self._rellenar_email_reset_react(email_input)
+                            self._esperar_continuar_habilitado(4.0)
+                            url_antes_submit = self.page.url or ""
+                            email_antes_visible = True
+                            reset_baseline_id = obtener_max_email_id(self.client_email, "tidal")
+                            btn_continue = esperar_locator_en_frames(
+                                self.page,
+                                ["button:has-text('Continuar')", "button:has-text('Continue')", "button[type='submit']"],
+                                timeout_s=4.0
+                            )
+                    except Exception as e_re:
+                        print(f"  [Reset Pass] [WARN] Reapertura tras antibot: {e_re}")
+                    continue
 
-                # Esperar propagación UI antes de decidir reintento
-                for _ in range(10):
-                    time.sleep(0.45)
+                if not self._pulsar_continuar_reset(btn_continue):
+                    print(f"  [Reset Pass] [WARN] No se pudo pulsar Continuar (intento {intento_click}/4).")
+
+                for _ in range(12):
+                    time.sleep(0.3)
                     if self._reset_solicitud_confirmada_ui(url_antes_submit, email_antes_visible):
                         click_exitoso = True
                         break
                 if click_exitoso:
                     break
-                print(f"  [Reset Pass] [WARN] Continuar no avanzó el formulario (intento {intento_click}/3).")
+
+                print(f"  [Reset Pass] [WARN] Continuar no avanzó el formulario ({intento_click}/4). Reintentando submit...")
+                try:
+                    email_input = self._asegurar_campo_email_reset(max_intentos=1) or email_input
+                    if email_input:
+                        self._rellenar_email_reset_react(email_input)
+                except Exception:
+                    pass
 
             if not click_exitoso:
                 raise RuntimeError(
                     "No se confirmó el envío del formulario de restablecimiento "
-                    "(el formulario sigue activo o hay overlay/DataDome). "
-                    "No se cerrará el navegador ni se hará polling IMAP."
+                    "(el formulario sigue activo o hay overlay/DataDome)."
                 )
 
             manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (Envío)")
 
-            # Reclamar el enlace YA: Tidal lo envía al instante. Cerrar Chrome en paralelo.
+            # Reclamar el enlace YA. Los reset de Tidal suelen tardar 15–40 s (no como el OTP).
+            # Si el worker no lo trae, caer a IMAP: FORWARD_TO reenvía copia a Gmail.
             print(f"  [Reset Pass] [{self.client_email}] Solicitud enviada. Reclamando enlace...")
             enlace_box: dict = {"val": None, "usa_worker": False}
 
             def _claim_enlace_reset():
                 try:
-                    from otp_worker_client import cubre_y_esperar_reset, worker_config, worker_cubre_alias
+                    from otp_worker_client import cubre_y_esperar_reset, worker_cubre_alias
                     if worker_cubre_alias(self.client_email):
                         enlace_box["usa_worker"] = True
-                        _, val = cubre_y_esperar_reset(self.client_email, max_wait_s=20.0)
+                        _, val = cubre_y_esperar_reset(self.client_email, max_wait_s=75.0)
                         if val and str(val).startswith("http"):
                             enlace_box["val"] = val
                             return
-                        if not worker_config().get("imap_fallback"):
-                            return
-                    for intento in range(1, 13):
-                        print(f"  [Reset Pass] Intento IMAP {intento}/12: buscando correo de reset...")
+                        print(f"  [Reset Pass] [{self.client_email}] Worker sin enlace; "
+                              f"fallback IMAP (forward a Gmail)...")
+                    for intento in range(1, 21):
+                        print(f"  [Reset Pass] Intento IMAP {intento}/20: buscando correo de reset...")
                         val = obtener_codigo_via_imap(
                             gmail_user=self.client_email,
                             required_keywords=KEYWORDS_RESTABLECER_PWD,
                             query_exclude="invited to a tidal family",
                             after_email_id=reset_baseline_id,
-                            max_age_minutes=15,
+                            max_age_minutes=20,
                             solo_link=True,
+                            omitir_worker=True,
                         )
                         if val and str(val).startswith("http"):
                             enlace_box["val"] = val
                             return
-                        time.sleep(2.0 if intento < 6 else 4.0)
+                        time.sleep(2.5 if intento < 10 else 4.0)
                 except Exception as e_wreset:
                     print(f"  [Reset Pass] [WARN] Enlace reset: {e_wreset}")
 
@@ -11445,16 +12230,8 @@ class TidalResetPasswordManager:
 
             print(f"  [Reset Pass] [{self.client_email}] Cerrando la ventana actual...")
             self.cerrar_navegador(liberar_proxy=False)
-            t_claim.join(timeout=22.0)
-            enlace_reset = enlace_box["val"]
-            usa_worker_reset = bool(enlace_box["usa_worker"])
-
-            if usa_worker_reset and (not enlace_reset or not str(enlace_reset).startswith("http")):
-                try:
-                    from otp_worker_client import cubre_y_esperar_reset
-                    _, enlace_reset = cubre_y_esperar_reset(self.client_email, max_wait_s=8.0)
-                except Exception:
-                    pass
+            t_claim.join(timeout=140.0)
+            enlace_reset = enlace_box.get("val")
 
             # Sincronización tras tener (o no) el enlace; el sondeo ya no espera esta barrera.
             self.esperar_barrera("post_solicitud")
@@ -18363,9 +19140,11 @@ def menu_principal():
             print(f"\n{Color.CYAN}{Color.BOLD}=== PROCESANDO INVITACIONES FAMILIARES SIMULTÁNEAMENTE ==={Color.ENDC}")
             print("  Cuentas ya registradas: login con proxy PE (sesiones_imap_cuentas.txt o código IMAP).")
             print("  Cuentas aún sin registrar: alta automática con proxy NG (DOB + Suscríbete + OTP IMAP).")
+            print(f"  Links desde {LINKS_EXTRAIDOS_PATH.name}: siempre proxy NG (una ventana por correo).")
             print("  Hasta 5 alias del mismo Gmail en paralelo sin mezclar códigos.")
 
             enlaces_manual, origen_enlaces = pedir_fuente_enlaces_opcion4(correos)
+            forzar_ng_archivo = origen_enlaces == "archivo"
             if origen_enlaces == "imap":
                 # Asignación coordinada por buzón: N alias con puntos del mismo Gmail ya no
                 # compiten por el mismo UID (To: canónico) dejando 4/5 sin enlace.
@@ -18373,6 +19152,9 @@ def menu_principal():
                 enlaces_map = asignar_enlaces_invitacion_a_correos(correos)
             else:
                 enlaces_map = dict(enlaces_manual or {})
+                if forzar_ng_archivo:
+                    print(f"  {Color.CYAN}[Opción 4] Fuente archivo → todas las invitaciones con "
+                          f"proxy NIGERIA (sin ventana PE intermedia).{Color.ENDC}")
 
             for c in correos:
                 e = enlaces_map.get(c)
@@ -18391,7 +19173,9 @@ def menu_principal():
                         "Archivo" if origen_enlaces == "archivo" else "Manual"
                     )
                     print(f"    {Color.GREEN}[{etiqueta}] Enlace para {c}: {preview}{Color.ENDC}")
-                    if buscar_contrasena_cuenta(c):
+                    if forzar_ng_archivo:
+                        print(f"    {Color.CYAN}[Proxy] {c} → NG (linksextraidos.txt){Color.ENDC}")
+                    elif buscar_contrasena_cuenta(c):
                         print(f"    {Color.GREEN}[Cuentas] Contraseña lista para auto-login de {c}.{Color.ENDC}")
                     else:
                         print(f"    {Color.CYAN}[Cuentas] Sin contraseña en sesiones_imap_cuentas.txt "
@@ -18413,21 +19197,14 @@ def menu_principal():
 
             sin_enlace = [c for c in correos if not enlaces_map.get(c)]
             ok_list: list[str] = []
+            ya_usados_list: list[str] = []
             fail_list: list[str] = list(sin_enlace)  # sin invitación = pendiente/fallo
 
             if enlaces_map:
                 global valid_pe_list, CACHE_PROXIES_PE, valid_ng_list, CACHE_PROXIES_NG
-                # Alta de cuentas nuevas → Nigeria. Login de cuentas existentes → Perú.
-                sin_pwd = [c for c in enlaces_map if not buscar_contrasena_cuenta(c)]
-                con_pwd = [c for c in enlaces_map if buscar_contrasena_cuenta(c)]
-                print(f"\n{Color.CYAN}[Opción 4] {len(sin_pwd)} cuenta(s) sin pwd → alta con proxy NG; "
-                      f"{len(con_pwd)} con pwd → login/aceptar con proxy PE.{Color.ENDC}")
-
-                proxies_ng = []
-                # Siempre alimentar NG: si una cuenta "con pwd" resulta no registrada,
-                # el flujo cambia a Nigeria en caliente.
-                print(f"\n{Color.CYAN}[Proxies NG] Habilitando proxies de Nigeria para altas "
-                      f"desde invitación...{Color.ENDC}")
+                # Para invitaciones familiares y registros en Tidal Nigeria, se utiliza
+                # directamente proxy de NIGERIA (NG) para garantizar la creación/registro en la región correcta.
+                print(f"\n{Color.CYAN}[Proxies NG] Habilitando proxies de Nigeria para invitaciones y altas...{Color.ENDC}")
                 cargar_cache_proxies_validos_desde_disco()
                 if CACHE_PROXIES_NG:
                     valid_ng_list = list(CACHE_PROXIES_NG)
@@ -18449,64 +19226,43 @@ def menu_principal():
                 alimentar_pool_proxies_nigeria(valid_ng_list)
                 GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
                 proxies_ng = list(valid_ng_list or [])
-                if sin_pwd and not proxies_ng:
-                    print(f"\n{Color.FAIL}[Error]{Color.ENDC} Hay cuentas sin registrar y no hay "
-                          f"proxies de Nigeria. Valida con la opción 13.")
+                if not proxies_ng:
+                    print(f"\n{Color.FAIL}[Error]{Color.ENDC} Se requiere proxy de Nigeria y no hay "
+                          f"proxies NG disponibles. Valida con la opción 13.")
                     fail_list.extend(list(enlaces_map.keys()))
-                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
-                    print()
-                    continue
-
-                print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para login/aceptar "
-                      f"invitaciones...{Color.ENDC}")
-                proxies_pe = asegurar_proxies_peru(cantidad_necesaria=len(enlaces_map))
-                if con_pwd and not proxies_pe:
-                    print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y hay "
-                          f"cuentas con login. Valida la lista con la opción 13.")
-                    fail_list.extend(list(enlaces_map.keys()))
-                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
-                    print()
-                    continue
-                if not proxies_pe and not proxies_ng:
-                    print(f"\n{Color.FAIL}[Error]{Color.ENDC} Sin proxies PE ni NG. Abortando opción 4.")
-                    fail_list.extend(list(enlaces_map.keys()))
-                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
+                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace, ya_usados_list)
                     print()
                     continue
 
                 items = list(enlaces_map.items())
                 tam_oleada = 5
-                if len(items) > 10:
-                    oleadas = [items[i:i + tam_oleada] for i in range(0, len(items), tam_oleada)]
-                    print(f"\n{Color.CYAN}[Opción 4] {len(items)} invitaciones → "
-                          f"{len(oleadas)} oleadas de hasta {tam_oleada}.{Color.ENDC}")
-                else:
-                    oleadas = [items]
-                    print(f"\nAbriendo {len(items)} invitaciones familiares "
-                          f"(alta NG / login PE + aceptar + cerrar, hasta "
-                          f"{min(tam_oleada, len(items))} en paralelo)...")
+                oleadas = [items[i:i + tam_oleada] for i in range(0, len(items), tam_oleada)]
+                print(f"\n{Color.CYAN}[Opción 4] {len(items)} invitaciones → "
+                      f"{len(oleadas)} oleada(s) de hasta {tam_oleada} en paralelo con Proxy Nigeria.{Color.ENDC}")
 
                 def procesar_invitacion_hilo(idx, item):
                     correo, enlace = item
-                    # Más separación en altas NG: 5 ablink simultáneos → ERR_TUNNEL frecuente
-                    if buscar_contrasena_cuenta(correo):
-                        if idx > 1:
-                            time.sleep((idx - 1) * random.uniform(1.5, 3.0))
-                    else:
-                        time.sleep((idx - 1) * random.uniform(2.8, 4.5))
-                    p_pe = None
+                    if idx > 1:
+                        time.sleep((idx - 1) * 0.2)  # Micro-stagger de 200ms para evitar colisión de sockets
                     p_ng = None
-                    if buscar_contrasena_cuenta(correo):
-                        p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico(espera_s=60.0)
-                        if not p_pe and proxies_pe:
-                            p_pe = proxies_pe[(idx - 1) % len(proxies_pe)]
-                    else:
-                        p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico(espera_s=60.0)
+                    try:
+                        p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico(espera_s=30.0)
                         if not p_ng and proxies_ng:
                             p_ng = proxies_ng[(idx - 1) % len(proxies_ng)]
-                    return correo, bool(abrir_enlace_familia_con_autocierre(
-                        enlace, correo, proxy_pe=p_pe, proxy_ng=p_ng
-                    ))
+                        res = abrir_enlace_familia_con_autocierre(
+                            enlace, correo, proxy_pe=None, proxy_ng=p_ng,
+                            forzar_proxy_ng=True,
+                        )
+                        return correo, res
+                    except Exception as e_th:
+                        print(f"    {Color.FAIL}[ERROR] [{correo}] Excepción en hilo de invitación: {e_th}{Color.ENDC}")
+                        return correo, False
+                    finally:
+                        if p_ng and p_ng.get("server"):
+                            try:
+                                GLOBAL_NG_PROXY_POOL.liberar_proxy(p_ng.get("server"))
+                            except Exception:
+                                pass
 
                 for n_oleada, oleada in enumerate(oleadas, 1):
                     if len(oleadas) > 1:
@@ -18514,32 +19270,44 @@ def menu_principal():
                               f"{len(oleada)} invitación(es) ==={Color.ENDC}")
                         for correo_o, _ in oleada:
                             print(f"    • {correo_o}")
-                    workers = min(tam_oleada, len(oleada))
+                    workers = len(oleada)
                     with ThreadPoolExecutor(max_workers=workers) as executor:
                         futures = {
                             executor.submit(procesar_invitacion_hilo, idx + 1, item): item[0]
                             for idx, item in enumerate(oleada)
                         }
-                        for future in as_completed(futures):
-                            correo_f = futures[future]
-                            try:
-                                c_res, exito = future.result()
-                                if exito:
-                                    ok_list.append(c_res)
-                                else:
-                                    fail_list.append(c_res)
-                            except Exception as ex_h:
-                                fail_list.append(correo_f)
-                                print(f"    {Color.FAIL}[ERROR] Excepción en invitación "
-                                      f"de {correo_f}: {ex_h}{Color.ENDC}")
+                        try:
+                            for future in as_completed(futures, timeout=300.0):
+                                correo_f = futures[future]
+                                try:
+                                    c_res, res_status = future.result()
+                                    if res_status in ("ok", True):
+                                        ok_list.append(c_res)
+                                    elif res_status in ("ya_usado", "previamente_utilizado", "caducado"):
+                                        ya_usados_list.append(c_res)
+                                    else:
+                                        fail_list.append(c_res)
+                                except Exception as ex_h:
+                                    fail_list.append(correo_f)
+                                    print(f"    {Color.FAIL}[ERROR] Excepción en invitación "
+                                          f"de {correo_f}: {ex_h}{Color.ENDC}")
+                        except TimeoutError:
+                            print(f"\n    {Color.FAIL}[TIMEOUT] La oleada {n_oleada} superó el tiempo máximo (5 min). Continuando...{Color.ENDC}")
+                            for fut, corr in futures.items():
+                                if not fut.done():
+                                    fail_list.append(corr)
+                                    print(f"    {Color.FAIL}[TIMEOUT] {corr} no respondió a tiempo.{Color.ENDC}")
+
+                    # Limpieza preventiva del pool de proxies entre oleadas
+                    GLOBAL_NG_PROXY_POOL.liberar_todos_los_en_uso()
                     if n_oleada < len(oleadas):
                         print(f"  {Color.CYAN}[Opción 4] Oleada {n_oleada} terminada. "
                               f"Pasando a la siguiente...{Color.ENDC}")
-                        time.sleep(1.5)
+                        time.sleep(1.0)
             else:
                 print(f"\n{Color.FAIL}>>> No se encontró ningún enlace de invitación en las cuentas activas. <<<\n")
 
-            _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
+            _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace, ya_usados_list)
             print()
             
         elif opcion == "6":

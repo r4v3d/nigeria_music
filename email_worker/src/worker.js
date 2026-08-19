@@ -61,9 +61,21 @@ export default {
       if (!alias || !KINDS.includes(kind)) {
         return json({ ok: false, error: "alias and kind required" }, 400);
       }
-      const hit = await claimItem(env, alias, kind, afterTs, maxAge, consume);
-      if (!hit) return json({ ok: false, found: false });
-      return json({ ok: true, found: true, value: hit.value, kind: hit.kind, ts: hit.ts, subject: hit.subject });
+      try {
+        const hit = await claimItem(env, alias, kind, afterTs, maxAge, consume);
+        if (!hit) return json({ ok: false, found: false });
+        return json({
+          ok: true,
+          found: true,
+          value: hit.value,
+          kind: hit.kind,
+          ts: hit.ts,
+          subject: hit.subject,
+        });
+      } catch (err) {
+        console.log("claim error", String(err));
+        return json({ ok: false, found: false, error: "claim_failed" }, 200);
+      }
     }
     if (url.pathname === "/list") {
       const alias = (url.searchParams.get("alias") || "").trim().toLowerCase();
@@ -308,13 +320,19 @@ function extractOtp(text) {
 }
 
 function extractReset(text) {
-  const t = unescapeHtml(String(text || ""));
+  // QP soft wraps / HTML entities often split "resetpass" across lines.
+  const t = unescapeHtml(String(text || ""))
+    .replace(/=\r?\n/g, "")
+    .replace(/&#x2[fF];/g, "/")
+    .replace(/&#47;/g, "/");
   const direct = t.match(/https?:\/\/login\.tidal\.com\/resetpass\/[^\s"'<>]+/i);
   if (direct) return direct[0].replace(/[>"']+$/, "");
   const wrapped = t.match(/https?:\/\/[^\s"'<>]*tidal\.com\/[^\s"'<>]*resetpass\/[^\s"'<>]+/i);
   if (wrapped) return wrapped[0].replace(/[>"']+$/, "");
   const ab = t.match(/https?:\/\/ablink\.(?:info\.)?tidal\.com\/[^\s"'<>]+/i);
-  return ab ? ab[0].replace(/[>"']+$/, "") : null;
+  if (ab) return ab[0].replace(/[>"']+$/, "");
+  const click = t.match(/https?:\/\/[^\s"'<>]*(?:click|email|info)\.tidal\.com\/[^\s"'<>]+/i);
+  return click ? click[0].replace(/[>"']+$/, "") : null;
 }
 
 function extractInvite(text) {
@@ -354,13 +372,17 @@ function classifyTidal(decoded, alias) {
     return null;
   }
 
-  if (
-    /resetpass|restablecer tu contrase|resetting your tidal password|reset your password|restaurar su contrase|forgot your password/.test(
+  const esResetMail =
+    /resetpass|restablecer tu contrase|resetting your tidal password|reset your password|restaurar su contrase|forgot your password|link to reset/.test(
       blob
-    )
-  ) {
+    );
+  if (esResetMail) {
     const reset = extractReset(full);
     if (reset) return { ...base, kind: "reset", value: reset };
+    // No degradar a invite: un ablink de reset sin "resetpass" en la URL
+    // se guardaba como invite y /claim?kind=reset nunca lo encontraba.
+    console.log("reset mail without extractable link", (subject || "").slice(0, 80));
+    return null;
   }
 
   const invite = extractInvite(full);
@@ -406,6 +428,10 @@ function itemKey(alias, id) {
   return "item:" + String(alias || "").trim().toLowerCase() + ":" + String(id || "");
 }
 
+function recentKey(alias) {
+  return "recent:" + String(alias || "").trim().toLowerCase();
+}
+
 function hitKey(alias, tsSec) {
   return "hit:" + String(alias || "").trim().toLowerCase() + ":" + String(Math.floor(Number(tsSec) || 0));
 }
@@ -439,63 +465,40 @@ function findUnclaimed(items, kinds, afterTs, maxAge, now) {
     if (now - Number(it.ts) > maxAge) continue;
     return i;
   }
+  // Si se busca login/register o OTP genérico, aceptar cualquier OTP numérico no reclamado
+  if (kinds.some(k => k === "login" || k === "register" || k === "delete")) {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (!it || !it.value || it.claimed) continue;
+      if (typeof it.value === "string" && /^\d{5,6}$/.test(it.value.trim())) {
+        if (afterTs && Number(it.ts) <= afterTs) continue;
+        if (now - Number(it.ts) > maxAge) continue;
+        return i;
+      }
+    }
+  }
   return -1;
 }
 
-async function cachePut(alias, items) {
+async function loadRecent(kv, alias) {
   try {
-    const req = new Request("https://otp.internal/box/" + encodeURIComponent(String(alias).toLowerCase()));
-    await caches.default.put(
-      req,
-      new Response(JSON.stringify(items || []), {
-        headers: { "content-type": "application/json", "Cache-Control": "max-age=180" },
-      })
-    );
+    const raw = await kv.get(recentKey(alias));
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((it) => it && it.value) : [];
   } catch {
-    /* ignore */
+    return [];
   }
-}
-
-async function cacheGet(alias) {
-  try {
-    const req = new Request("https://otp.internal/box/" + encodeURIComponent(String(alias).toLowerCase()));
-    const hit = await caches.default.match(req);
-    if (!hit) return null;
-    const arr = await hit.json();
-    return Array.isArray(arr) ? arr : null;
-  } catch {
-    return null;
-  }
-}
-
-async function loadHits(kv, alias, now) {
-  const nowSec = Math.floor(now);
-  const gets = [];
-  for (let s = nowSec - 1; s >= nowSec - 12; s--) {
-    gets.push(kv.get(hitKey(alias, s)));
-  }
-  const raws = await Promise.all(gets);
-  const items = [];
-  for (const raw of raws) {
-    if (!raw) continue;
-    try {
-      const parsed = JSON.parse(raw);
-      const arr = Array.isArray(parsed) ? parsed : [parsed];
-      for (const it of arr) {
-        if (it && it.value) items.push(it);
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  items.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
-  return items;
 }
 
 async function listItemKeys(kv, alias) {
-  const prefix = "item:" + String(alias || "").trim().toLowerCase() + ":";
-  const listed = await kv.list({ prefix, limit: 40 });
-  return (listed && listed.keys) || [];
+  try {
+    const prefix = "item:" + String(alias || "").trim().toLowerCase() + ":";
+    const listed = await kv.list({ prefix, limit: 30 });
+    return (listed && listed.keys) || [];
+  } catch {
+    return [];
+  }
 }
 
 async function loadItemsFromKv(kv, alias) {
@@ -518,25 +521,27 @@ async function loadItemsFromKv(kv, alias) {
 async function readBox(env, alias) {
   const mem = memItems(alias);
   if (mem.length) return mem;
-  const cached = await cacheGet(alias);
-  if (cached && cached.length) {
-    memReplace(alias, cached);
-    return cached;
+  if (env && env.OTP) {
+    const fromRecent = await loadRecent(env.OTP, alias);
+    if (fromRecent.length) {
+      memReplace(alias, fromRecent);
+      return fromRecent;
+    }
+    return loadItemsFromKv(env.OTP, alias);
   }
-  if (env && env.OTP) return loadItemsFromKv(env.OTP, alias);
   return [];
 }
 
 async function pushItem(env, alias, item) {
   memPush(alias, item);
-  await cachePut(alias, memItems(alias));
+  const snap = memItems(alias);
   if (env && env.OTP) {
     try {
       const body = JSON.stringify(item);
       const ttl = { expirationTtl: 60 * 60 * 2 };
       await Promise.all([
         env.OTP.put(itemKey(alias, item.id), body, ttl),
-        env.OTP.put(hitKey(alias, item.ts), body, ttl),
+        env.OTP.put(recentKey(alias), JSON.stringify(snap.slice(-15)), ttl),
       ]);
     } catch (err) {
       console.log("kv push error", String(err));
@@ -547,20 +552,25 @@ async function pushItem(env, alias, item) {
 async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
   const now = Date.now() / 1000;
   let items = memItems(alias);
-  if (!items.length) {
-    const cached = await cacheGet(alias);
-    if (cached && cached.length) items = cached;
-  }
   if (env && env.OTP) {
-    const hits = await loadHits(env.OTP, alias, now);
-    if (hits.length) {
-      const byId = new Map(items.map((it) => [it.id || it.value, it]));
-      for (const it of hits) byId.set(it.id || it.value, it);
-      items = [...byId.values()];
+    try {
+      const rec = await loadRecent(env.OTP, alias);
+      if (rec.length) {
+        const byId = new Map(items.map((it) => [it.id || `${it.kind}:${it.value}`, it]));
+        for (const it of rec) byId.set(it.id || `${it.kind}:${it.value}`, it);
+        items = [...byId.values()];
+      }
+      if (!items.length) {
+        const fromKv = await loadItemsFromKv(env.OTP, alias);
+        if (fromKv.length) {
+          const byId = new Map(items.map((it) => [it.id || `${it.kind}:${it.value}`, it]));
+          for (const it of fromKv) byId.set(it.id || `${it.kind}:${it.value}`, it);
+          items = [...byId.values()];
+        }
+      }
+    } catch (err) {
+      console.log("kv claim read error", String(err));
     }
-  }
-  if (!items.length && env && env.OTP && kind !== "login" && kind !== "register" && kind !== "reset") {
-    items = await loadItemsFromKv(env.OTP, alias);
   }
   let idx = findUnclaimed(items, [kind], afterTs, maxAge, now);
   if (idx < 0 && (kind === "login" || kind === "register")) {
@@ -572,7 +582,6 @@ async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
   if (consume) {
     items[idx] = { ...hit, claimed: true };
     memReplace(alias, items);
-    await cachePut(alias, items);
     if (env && env.OTP) {
       const marked = { ...hit, claimed: true };
       delete marked._key;
@@ -581,7 +590,7 @@ async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
       try {
         await Promise.all([
           env.OTP.put(hit._key || itemKey(alias, hit.id), body, ttl),
-          env.OTP.put(hitKey(alias, hit.ts), body, ttl),
+          env.OTP.put(recentKey(alias), JSON.stringify(items.slice(-15)), ttl),
         ]);
       } catch {
         /* ignore */

@@ -130,6 +130,7 @@ def kind_desde_keywords(required_keywords, solo_link: bool = False) -> str:
 
 
 def _get(path: str, params: dict) -> dict | None:
+    global _LAST_NET_ERR
     cfg = worker_config()
     if not cfg["url"] or not cfg["secret"]:
         return None
@@ -145,12 +146,14 @@ def _get(path: str, params: dict) -> dict | None:
             print("    [WORKER] Secreto incorrecto (401). Revisa email_worker_secret en passwords.txt")
             return None
         if r.status_code != 200:
-            print(f"    [WORKER] HTTP {r.status_code} en {path}")
+            now = time.time()
+            if now - _LAST_NET_ERR >= 8.0:
+                print(f"    [WORKER] HTTP {r.status_code} en {path}")
+                _LAST_NET_ERR = now
             return None
         data = r.json()
         return data if isinstance(data, dict) else None
     except Exception as e:
-        global _LAST_NET_ERR
         now = time.time()
         if now - _LAST_NET_ERR >= 5.0:
             print(f"    [WORKER] Error de red: {e}")
@@ -235,7 +238,8 @@ def reclamar_desde_worker(
     after_ts = _after_ts_claim(alias, after_email_id)
     if despues_de:
         try:
-            after_ts = max(after_ts, float(despues_de))
+            # Margen de seguridad de 90s para evitar que diferencias de reloj local vs Cloudflare descarten el OTP recién llegado
+            after_ts = max(after_ts, max(0.0, float(despues_de) - 90.0))
         except Exception:
             pass
     params = {
@@ -264,15 +268,15 @@ def esperar_desde_worker(
     alias: str,
     kind: str,
     *,
-    max_wait_s: float = 18.0,
-    interval_s: float = 0.22,
+    max_wait_s: float = 20.0,
+    interval_s: float = 0.15,
     after_email_id: int = 0,
     max_age_minutes: int = 15,
     silencioso: bool = False,
     consume: bool = True,
     despues_de: float | None = None,
 ) -> str | None:
-    """Sondea /claim cada ~200 ms hasta que el correo llegue al worker."""
+    """Sondea /claim cada ~150 ms hasta que el correo llegue al worker."""
     alias = (alias or "").strip().lower()
     if not worker_cubre_alias(alias):
         return None
@@ -280,6 +284,12 @@ def esperar_desde_worker(
     visto = False
     ultimo_hb = 0.0
     tope = max(1.0, float(max_wait_s))
+    alt_kind = None
+    if kind == "register":
+        alt_kind = "login"
+    elif kind == "login":
+        alt_kind = "register"
+
     while time.time() - t0 < tope:
         val = reclamar_desde_worker(
             alias, kind,
@@ -289,6 +299,15 @@ def esperar_desde_worker(
             consume=consume,
             despues_de=despues_de,
         )
+        if not val and alt_kind:
+            val = reclamar_desde_worker(
+                alias, alt_kind,
+                max_age_minutes=max_age_minutes,
+                after_email_id=after_email_id,
+                silencioso=True,
+                consume=consume,
+                despues_de=despues_de,
+            )
         if val:
             if not silencioso:
                 print(f"    [WORKER] {kind} para {alias}: {val[:96]} ({time.time() - t0:.1f}s)", flush=True)
@@ -339,10 +358,13 @@ def reclamar_invites_para_aliases(
     aliases: list[str],
     max_age_minutes: int = 1440,
 ) -> tuple[dict[str, str], list[str]]:
-    """Reclama invitaciones del worker. Devuelve (asignados, aliases para IMAP)."""
+    """Reclama invitaciones del worker. Devuelve (asignados, aliases para IMAP).
+
+    Si el worker no tiene el enlace, el alias pasa a IMAP (FORWARD_TO → Gmail).
+    Antes, con imap_fallback=False, se perdían en silencio y la opción 4 no abría nada.
+    """
     asignados: dict[str, str] = {}
     restantes: list[str] = []
-    skip_imap = not worker_config().get("imap_fallback")
     for a in aliases or []:
         al = (a or "").strip()
         if not al:
@@ -355,8 +377,6 @@ def reclamar_invites_para_aliases(
         )
         if enlace and "resetpass" not in enlace.lower():
             asignados[al] = enlace
-            continue
-        if skip_imap:
             continue
         restantes.append(al)
     return asignados, restantes
@@ -393,16 +413,16 @@ def listar_invites_worker(alias: str, max_age_minutes: int = 1440) -> list[dict]
     return out
 
 
-def cubre_y_esperar_reset(alias: str, max_wait_s: float = 20.0) -> tuple[bool, str | None]:
+def cubre_y_esperar_reset(alias: str, max_wait_s: float = 75.0) -> tuple[bool, str | None]:
     """Si el catch-all va por worker, espera el enlace de reset (sin IMAP)."""
     if not worker_cubre_alias(alias):
         return False, None
     val = esperar_desde_worker(
         alias, "reset",
-        max_wait_s=max(6.0, float(max_wait_s)),
-        interval_s=0.22,
+        max_wait_s=max(20.0, float(max_wait_s)),
+        interval_s=0.35,
         after_email_id=0,
-        max_age_minutes=20,
+        max_age_minutes=30,
         silencioso=False,
     )
     return True, val
