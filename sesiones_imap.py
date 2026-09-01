@@ -1146,23 +1146,24 @@ def _forzar_matar_chrome_perfil(profile_dir) -> None:
 
 
 def _limpiar_perfiles_chrome_invitacion_huerfanos(max_age_s: float = 900.0) -> int:
-    """Borra carpetas tidal_chrome_profile_* viejas en temp (estabilidad en oleadas largas)."""
+    """Borra carpetas tidal_chrome_profile_* y tidal_reg_* viejas (oleadas largas)."""
     borrados = 0
     try:
         base = Path(tempfile.gettempdir())
         ahora = time.time()
-        for p in base.glob("tidal_chrome_profile_*"):
-            try:
-                if not p.is_dir():
+        for patron in ("tidal_chrome_profile_*", "tidal_reg_*"):
+            for p in base.glob(patron):
+                try:
+                    if not p.is_dir():
+                        continue
+                    age = ahora - p.stat().st_mtime
+                    if age < max_age_s:
+                        continue
+                    _forzar_matar_chrome_perfil(p)
+                    shutil.rmtree(p, ignore_errors=True)
+                    borrados += 1
+                except Exception:
                     continue
-                age = ahora - p.stat().st_mtime
-                if age < max_age_s:
-                    continue
-                _forzar_matar_chrome_perfil(p)
-                shutil.rmtree(p, ignore_errors=True)
-                borrados += 1
-            except Exception:
-                continue
     except Exception:
         pass
     return borrados
@@ -2302,11 +2303,22 @@ def _invite_arrancar_prefetch_otp(estado: dict, correo: str, *, es_alta: bool) -
 
 
 def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 45.0) -> str | None:
-    """Sondea el worker de forma ultra-rápida (cada ~80 ms) con resolución cruzada register/login."""
+    """Sondea el worker de forma ultra-rápida (cada ~80 ms) con resolución cruzada register/login.
+
+    Siempre filtra por alias exacto y por otp_despues (clic Suscríbete de ESTA ventana)
+    para no tomar el código de otra cuenta de la misma oleada.
+    """
     primary_kind = "register" if es_alta else "login"
     alt_kind = "login" if es_alta else "register"
-    # Solo aplicar despues_de si es un reintento tras un código rechazado previamente
-    despues = float(estado.get("otp_despues") or 0) if estado.get("intentos_otp") else None
+    despues = None
+    raw_despues = estado.get("otp_despues")
+    if raw_despues:
+        try:
+            despues = float(raw_despues)
+        except Exception:
+            despues = None
+    if not despues:
+        despues = time.time() - 8.0
     t0 = time.time()
     ultimo_hb = 0.0
     ultimo_imap = 0.0
@@ -2318,6 +2330,12 @@ def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wa
     after_id = estado.get("baseline_id") or 0
 
     while time.time() - t0 < max_wait_s:
+        ev = estado.get("cancel_event")
+        try:
+            if ev is not None and ev.is_set():
+                return None
+        except Exception:
+            pass
         # 1. Probar con worker kind principal (after_email_id=0: no filtrar OTP fresco)
         if reclamar_desde_worker:
             claimed = reclamar_desde_worker(
@@ -6568,8 +6586,14 @@ def _peek_otp_registro_cuenta(
     correo: str,
     after_email_id: int = 0,
     silencioso: bool = True,
+    consume: bool = False,
+    despues_de: float | None = None,
 ) -> str | None:
-    """Un disparo: worker register/login para catch-all, IMAP si no cubre o hay fallback."""
+    """Un disparo: worker register/login para catch-all, IMAP si no cubre o hay fallback.
+
+    consume=False por defecto: no se come el OTP de otra ventana ni el de esta
+    hasta que Tidal muestre Verify y se escriba el código.
+    """
     correo = (correo or "").strip().lower()
     if not correo or "@" not in correo:
         return None
@@ -6582,7 +6606,8 @@ def _peek_otp_registro_cuenta(
                     max_age_minutes=20,
                     after_email_id=0,
                     silencioso=silencioso,
-                    consume=True,
+                    consume=consume,
+                    despues_de=despues_de,
                 )
                 if val and not str(val).startswith("http"):
                     if not silencioso:
@@ -10190,7 +10215,8 @@ stdin_lock = threading.Lock()
 
 class TidalRegisterManager:
     def __init__(self, client_email, client_pwd, proxy_ng_server=None, proxy_ng_user=None, proxy_ng_pass=None,
-                 proxy_pe_server=None, proxy_pe_user=None, proxy_pe_pass=None, headless=False):
+                 proxy_pe_server=None, proxy_pe_user=None, proxy_pe_pass=None, headless=False,
+                 cancel_event=None):
         self.client_email = client_email
         self.client_pwd = client_pwd
         self.use_proxy = proxy_ng_server is not None
@@ -10203,6 +10229,7 @@ class TidalRegisterManager:
         # El proceso arranca siempre en la fase de Nigeria; cambiar_a_proxy_peru() conmuta después a PE
         self.current_proxy_type = "NG"
         self.headless = headless
+        self.cancel_event = cancel_event
         self.playwright = None
         self.context = None
         self.page = None
@@ -10219,6 +10246,17 @@ class TidalRegisterManager:
         
         email_safe = re.sub(r'[^a-zA-Z0-9]', '_', client_email)
         self.main_profile = Path(tempfile.gettempdir()) / f"tidal_reg_{email_safe}_{random.randint(1000, 9999)}"
+
+    def _oleada_cancelada(self) -> bool:
+        ev = getattr(self, "cancel_event", None)
+        try:
+            return bool(ev is not None and ev.is_set())
+        except Exception:
+            return False
+
+    def _abortar_si_oleada_cancelada(self) -> None:
+        if self._oleada_cancelada():
+            raise RuntimeError("__OLEADA_CANCELADA__")
 
     def recuperar_login_tras_error_tidal(self) -> bool:
         """Tras 'Algo salió mal' en authorize/signin: NO recargar esa URL.
@@ -10627,6 +10665,7 @@ class TidalRegisterManager:
     def run_registration(self, cerrar_navegador_al_final=True) -> bool:
         registro_exitoso = False
         try:
+            self._abortar_si_oleada_cancelada()
             self.asegurar_navegador_abierto()
             self.context.clear_cookies(domain="tidal.com")
             self.context.clear_cookies(domain="login.tidal.com")
@@ -10886,7 +10925,12 @@ class TidalRegisterManager:
                 usa_worker_otp = False
             if usa_worker_otp:
                 print(f"  [Registro] [{self.client_email}] OTP por Email Worker "
-                      f"(igual que opciones 1–4), sin IMAP del Gmail de forward.")
+                      f"(alias exacto @cheapmusic.best), sin IMAP del Gmail de forward.")
+                try:
+                    from otp_worker_client import marcar_baseline_worker
+                    marcar_baseline_worker(self.client_email)
+                except Exception:
+                    pass
             t_suscribete = 0.0
 
             def _pantalla_otp_registro() -> bool:
@@ -10970,11 +11014,14 @@ class TidalRegisterManager:
 
                 def _peek_otp_llegado(silencioso: bool) -> bool:
                     """Guarda el OTP del worker/IMAP. True solo si ya hay Verify o sesión."""
+                    self._abortar_si_oleada_cancelada()
                     try:
                         codigo_previo = _peek_otp_registro_cuenta(
                             self.client_email,
                             after_email_id=max_id_previo,
                             silencioso=silencioso,
+                            consume=False,
+                            despues_de=t_suscribete or None,
                         )
                         if codigo_previo and not str(codigo_previo).startswith("http"):
                             self._otp_registro_prefetch = codigo_previo
@@ -10997,8 +11044,10 @@ class TidalRegisterManager:
                     return False
 
                 for intento_rec in range(1, 5):
+                    self._abortar_si_oleada_cancelada()
                     # ~7s de poll rápido; worker cada ciclo, IMAP cada ~1.4s
                     for poll in range(20):
+                        self._abortar_si_oleada_cancelada()
                         if _pantalla_otp_registro() or self._sesion_post_registro_detectada():
                             return True
                         peek_ahora = usa_worker_otp or (poll > 0 and poll % 4 == 0)
@@ -11132,6 +11181,7 @@ class TidalRegisterManager:
             self._registro_cuenta_existente = False
             otp_listo = False
             for _ciclo_form in range(1, 3):
+                self._abortar_si_oleada_cancelada()
                 try:
                     ok_otp = _asegurar_otp_tras_suscribirse()
                     if ok_otp:
@@ -11209,6 +11259,7 @@ class TidalRegisterManager:
                 )
 
             for ronda in range(1, 5):
+                self._abortar_si_oleada_cancelada()
                 if codigo_aceptado:
                     break
                 if self._sesion_post_registro_detectada():
@@ -11224,7 +11275,8 @@ class TidalRegisterManager:
                         estado_otp = {
                             "baseline_id": max_id_previo,
                             "otp_despues": t_suscribete or (time.time() - 2.0),
-                            "intentos_otp": 0 if ronda == 1 else ronda,
+                            "intentos_otp": ronda,
+                            "cancel_event": getattr(self, "cancel_event", None),
                         }
                         codigo = _invite_tomar_otp_worker(
                             estado_otp, self.client_email, es_alta=True, max_wait_s=28.0,
@@ -11506,7 +11558,33 @@ class TidalRegisterManager:
                 print(f"  {Color.FAIL}[Registro] [ERROR] No se logró verificar la redirección de cuenta para {self.client_email}.{Color.ENDC}")
                 return False
                 
+        except RuntimeError as e:
+            if "__OLEADA_CANCELADA__" in str(e):
+                print(f"  {Color.WARNING}[Registro] [{self.client_email}] Oleada cancelada "
+                      f"(timeout). Se cierra y se sigue con el resto.{Color.ENDC}")
+                return False
+            print(f"  {Color.FAIL}[ERROR] Falló el registro para {self.client_email}: {e}{Color.ENDC}")
+            try:
+                if self.page and not self.page.is_closed() and self._confirmar_registro_completado(timeout_s=12.0):
+                    print(f"  [Registro] {Color.GREEN}[{self.client_email}] La cuenta SÍ quedó registrada. "
+                          f"Se ignora el error OTP y se continúa.{Color.ENDC}")
+                    registro_exitoso = True
+                    try:
+                        cookies_proxy = self.context.cookies()
+                        self.cookies_tidal = [
+                            c for c in cookies_proxy if "tidal.com" in c.get("domain", "")
+                        ]
+                    except Exception:
+                        self.cookies_tidal = []
+                    return True
+            except Exception:
+                pass
+            return False
         except Exception as e:
+            if "__OLEADA_CANCELADA__" in str(e):
+                print(f"  {Color.WARNING}[Registro] [{self.client_email}] Oleada cancelada "
+                      f"(timeout). Se cierra y se sigue con el resto.{Color.ENDC}")
+                return False
             print(f"  {Color.FAIL}[ERROR] Falló el registro para {self.client_email}: {e}{Color.ENDC}")
             try:
                 if self.page and not self.page.is_closed() and self._confirmar_registro_completado(timeout_s=12.0):
@@ -17241,8 +17319,46 @@ class TidalAutoLoginManager:
             and not es_pantalla_error_login_tidal(self.page)
         )
 
-    def run_auto_login(self, modo: str = "tmm") -> bool:
-        """modo='tmm' → opción 10 (login + TuneMyMusic). modo='eliminar' → opción 15 (login + borrar)."""
+    def _esperar_sesion_manual_indefinida(self) -> bool:
+        """Opción 10: deja Chrome abierto sin límite hasta que el usuario lo cierre."""
+        print(f"  [Sesión] {Color.GREEN}[{self.client_email}] Sesión Tidal lista. "
+              f"La ventana queda abierta SIN límite de tiempo.{Color.ENDC}")
+        print(f"  [Sesión] [{self.client_email}] Puedes usar la cuenta a mano. "
+              f"Cierra Chrome cuando termines.")
+        try:
+            if self.page and not self.page.is_closed():
+                self.page.bring_to_front()
+        except Exception:
+            pass
+        while True:
+            try:
+                if not self.context:
+                    break
+                paginas = list(self.context.pages)
+                if not paginas:
+                    break
+                viva = None
+                for p in paginas:
+                    try:
+                        if not p.is_closed():
+                            viva = p
+                            break
+                    except Exception:
+                        continue
+                if viva is None:
+                    break
+                viva.wait_for_timeout(1000)
+            except Exception:
+                break
+        print(f"  [Sesión] [{self.client_email}] Ventana cerrada. Liberando recursos.")
+        try:
+            self.cerrar_recursos()
+        except Exception:
+            pass
+        return True
+
+    def run_auto_login(self, modo: str = "solo_login") -> bool:
+        """modo='solo_login' → opción 10 (solo login, ventana abierta). modo='eliminar' → opción 15."""
         try:
             self.asegurar_navegador_abierto()
             
@@ -17827,528 +17943,9 @@ class TidalAutoLoginManager:
 
             if modo == "eliminar":
                 return self._flujo_eliminar_cuenta_opcion15()
-            
-            # 2. Comprobar y cambiar correo si no coincide en el perfil
-            target_email_clean = self.client_email.strip().lower()
-            correo_perfil_correcto = False
-            print(f"  [Verificación Email] [{self.client_email}] Navegando al perfil para verificar/editar información...")
-            _max_verif = 4
-            for intento_verif in range(1, _max_verif + 1):
-                try:
-                    print(f"  [Verificación Email] Intento {intento_verif}/{_max_verif}: Navegando a la página de EDICIÓN del perfil...")
 
-                    # SIEMPRE ir a /profile/edit para ver el correo REAL registrado en el input
-                    # (el sidebar/barra lateral muestra el correo de LOGIN, no el registrado)
-                    navegar_tidal_tolerante(
-                        self.page,
-                        "https://account.tidal.com/profile/edit",
-                        timeout_ms=60000,
-                    )
-                    # manejar_bloqueos_e_intervencion ya espera a que la página acabe de cargar
-                    manejar_bloqueos_e_intervencion(self.page, "Edición Perfil Tidal")
-                    aceptar_cookies_con_espera(self.page)
-                    self.page = pagina_vigente(self.page)
+            return self._esperar_sesion_manual_indefinida()
 
-                    # Verificar que seguimos con sesión activa
-                    url_perfil = self.page.url.lower()
-                    if (("/login/tidal/return" in url_perfil or "/login/tidal/callback" in url_perfil)
-                            and "login.tidal.com" not in url_perfil):
-                        # Todavía en el puente OAuth: esperar a que termine
-                        time.sleep(2.0)
-                        url_perfil = self.page.url.lower()
-                    if ("login.tidal.com" in url_perfil or "/authorize" in url_perfil
-                            or (("/login" in url_perfil and "account.tidal.com" in url_perfil
-                                 and "/login/tidal/return" not in url_perfil
-                                 and "/login/tidal/callback" not in url_perfil))
-                            or self.hay_formulario_login_visible()):
-                        print(f"  [Verificación Email] {Color.WARNING}[WARN] Tidal redirigió al login. Rehaciendo sesión...{Color.ENDC}")
-                        if not self.rehacer_login_credenciales():
-                            print(f"  [Verificación Email] {Color.FAIL}[ERROR] No se pudo recuperar la sesión en el reintento {intento_verif}/{_max_verif}.{Color.ENDC}")
-                            continue
-                        # Tras re-login, volver a intentar /profile/edit en el siguiente ciclo
-                        continue
-
-                    # Buscar el campo de correo en el formulario de edición
-                    email_input = esperar_locator_en_frames(
-                        self.page,
-                        ['input[type="email"]', 'input[name="email"]', 'input[id*="email" i]', 'input[placeholder*="correo" i]', 'input[placeholder*="email" i]'],
-                        timeout_s=10.0
-                    )
-
-                    if not email_input:
-                        print(f"  [Verificación Email] {Color.WARNING}[WARN] No se encontró el campo de correo en la edición de perfil. Reintentando...{Color.ENDC}")
-                        continue
-
-                    # Leer el correo REAL registrado desde el input
-                    current_email_value = ""
-                    try:
-                        current_email_value = email_input.input_value().strip().lower()
-                    except Exception:
-                        pass
-
-                    print(f"  [Verificación Email] Correo REAL registrado en perfil: '{current_email_value}' (Objetivo: '{target_email_clean}')")
-
-                    if current_email_value and correos_iguales_exacto(current_email_value, target_email_clean):
-                        print(f"  [Verificación Email] {Color.GREEN}[OK] El correo registrado ya coincide "
-                              f"EXACTO con el de acceso: {self.client_email}{Color.ENDC}")
-                        correo_perfil_correcto = True
-                        break
-                    if current_email_value and son_correos_equivalentes(current_email_value, target_email_clean):
-                        print(f"  [Verificación Email] {Color.WARNING}[ACTUALIZANDO] Perfil tiene hermano "
-                              f"Gmail '{current_email_value}' ≠ '{self.client_email}' (puntos distintos). "
-                              f"Se fuerza el correo EXACTO del menú.{Color.ENDC}")
-                    else:
-                        print(f"  [Verificación Email] {Color.WARNING}[ACTUALIZANDO] Reemplazando correo "
-                              f"registrado '{current_email_value}' por '{self.client_email}'...{Color.ENDC}")
-                    try:
-                        email_input.click(timeout=3000)
-                        self.page.keyboard.press("Control+A")
-                        self.page.keyboard.press("Backspace")
-                        time.sleep(0.2)
-                    except Exception:
-                        pass
-
-                    rellenar_campo_humanizado(email_input, self.client_email)
-                    time.sleep(0.3)
-
-                    try:
-                        email_input.dispatch_event("input")
-                        email_input.dispatch_event("change")
-                        email_input.dispatch_event("blur")
-                    except Exception:
-                        pass
-                    time.sleep(0.5)
-
-                    # Pulsar Guardar
-                    btn_guardar = esperar_locator_en_frames(
-                        self.page,
-                        [
-                            "button[type='submit']",
-                            "button:has-text('Guardar cambios')", "button:has-text('Save changes')",
-                            "button:has-text('Guardar')", "button:has-text('Save')",
-                            "button:has-text('Continuar')", "button:has-text('Continue')",
-                            "input[type='submit']"
-                        ],
-                        timeout_s=8.0
-                    )
-                    btn_clicked = False
-                    if btn_guardar:
-                        try:
-                            btn_guardar.click(timeout=3000, force=True)
-                            btn_clicked = True
-                        except Exception:
-                            pass
-
-                    if not btn_clicked:
-                        try:
-                            email_input.press("Enter")
-                        except Exception:
-                            pass
-
-                    time.sleep(1.5)
-
-                    # Confirmación de contraseña si es requerida por TIDAL
-                    pwd_confirm = esperar_locator_en_frames(self.page, ['input[type="password"]'], timeout_s=6.0)
-                    if pwd_confirm:
-                        print("  [Verificación Email] Confirmando contraseña requerida para guardar cambios...")
-                        try:
-                            pwd_confirm.fill("")
-                            time.sleep(0.2)
-                            pwd_confirm.fill(self.target_pwd)
-                            pwd_confirm.dispatch_event("input")
-                            pwd_confirm.dispatch_event("change")
-                        except Exception:
-                            rellenar_campo_humanizado(pwd_confirm, self.target_pwd)
-                        time.sleep(0.5)
-
-                        btn_confirm = esperar_locator_en_frames(
-                            self.page,
-                            ["button[type='submit']", "button:has-text('Guardar')", "button:has-text('Confirmar')", "button:has-text('Save')", "button:has-text('Confirm')"],
-                            timeout_s=6.0
-                        )
-                        if btn_confirm:
-                            try:
-                                btn_confirm.click(timeout=3000, force=True)
-                            except Exception:
-                                pass
-                        try:
-                            pwd_confirm.press("Enter")
-                        except Exception:
-                            pass
-                        time.sleep(3.0)
-
-                    # Verificar volviendo a cargar la edición del perfil
-                    print("  [Verificación Email] Verificando si el correo fue guardado...")
-                    navegar_tidal_tolerante(
-                        self.page,
-                        "https://account.tidal.com/profile/edit",
-                        timeout_ms=45000,
-                    )
-                    time.sleep(2.5)
-
-                    email_post = esperar_locator_en_frames(self.page, ['input[type="email"]', 'input[name="email"]'], timeout_s=8.0)
-                    val_post = ""
-                    if email_post:
-                        try:
-                            val_post = email_post.input_value().strip().lower()
-                        except Exception:
-                            pass
-
-                    if val_post and correos_iguales_exacto(val_post, target_email_clean):
-                        print(f"  [Verificación Email] {Color.GREEN}[ÉXITO] Correo actualizado y verificado "
-                              f"EXACTO: {self.client_email}{Color.ENDC}")
-                        correo_perfil_correcto = True
-                        break
-                    if val_post and son_correos_equivalentes(val_post, target_email_clean):
-                        print(f"  [Verificación Email] {Color.WARNING}[WARN] Perfil aún muestra hermano "
-                              f"Gmail '{val_post}' ≠ '{self.client_email}'. Reintentando...{Color.ENDC}")
-                    else:
-                        print(f"  [Verificación Email] {Color.WARNING}[WARN] El correo aún no coincide "
-                              f"tras guardar (leído: '{val_post}'). Reintentando...{Color.ENDC}")
-
-                except Exception as e_edit:
-                    print(f"  [Verificación Email] [WARN] Error durante verificación/edición de perfil "
-                          f"({intento_verif}/{_max_verif}): {e_edit}")
-                    # Timeout/túnel: rotar PE y rehacer login (antes un solo fallo abortaba y seguía a TMM)
-                    if es_error_proxy_o_red(e_edit) or "timeout" in str(e_edit).lower():
-                        if intento_verif >= _max_verif:
-                            break
-                        print(f"  [Verificación Email] [{self.client_email}] Timeout/proxy en /profile/edit. "
-                              f"Rotando PE y rehaciendo sesión...")
-                        try:
-                            self.ejecutar_rotacion_proxy_y_recargar()
-                        except Exception as e_rot:
-                            print(f"  [Verificación Email] [WARN] Rotación PE falló: {e_rot}")
-                        if not self.rehacer_login_credenciales():
-                            print(f"  [Verificación Email] {Color.FAIL}[ERROR] No se pudo recuperar la sesión "
-                                  f"tras rotación ({intento_verif}/{_max_verif}).{Color.ENDC}")
-                        continue
-                    time.sleep(2.0)
-
-            if not correo_perfil_correcto:
-                print(f"  [Verificación Email] {Color.FAIL}[ERROR CRÍTICO] No se logró actualizar el correo "
-                      f"registrado a '{self.client_email}'.{Color.ENDC}")
-                print(f"  [Eliminación] [{self.client_email}] [ABORTADO] El correo del perfil no pudo "
-                      f"actualizarse a {self.client_email}; no se abrirá TuneMyMusic ni se eliminará la cuenta.")
-                self.abortar_barreras()
-                return self.finalizar_sin_exito(
-                    "Perfil/correo no verificado (sesión Tidal no usable). Se omite TuneMyMusic."
-                )
-
-            # La eliminación se aborda al final, después de exportar el CSV: entrar antes en el
-            # asistente dispararía el código de verificación mucho antes de poder usarlo.
-            print(f"  [Eliminación] [{self.client_email}] Pendiente: se ejecutará al terminar la exportación en TuneMyMusic.")
-
-            # Gate final: no abrir TMM si la pestaña de Tidal ya no tiene sesión (caso del log:
-            # timeout en /profile/edit dejó authorize vacío y aun así se abría TuneMyMusic).
-            if not self.es_sesion_activa() and not self.confirmar_sesion_en_perfil(15.0):
-                print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Sesión perdida antes de "
-                      f"TuneMyMusic. Intentando recuperar...{Color.ENDC}")
-                if not self.rehacer_login_credenciales():
-                    print(f"  [TuneMyMusic] [{self.client_email}] [ABORTADO] Sin sesión Tidal activa; "
-                          f"no se abrirá TuneMyMusic.")
-                    self.abortar_barreras()
-                    return self.finalizar_sin_exito("Sin sesión Tidal antes de TuneMyMusic.")
-
-            # 3. Abrir TuneMyMusic en una pestaña aparte con tolerancia a fallos de red/proxy
-            print(f"  [TuneMyMusic] [{self.client_email}] Abriendo TuneMyMusic en una nueva pestaña...")
-            try:
-                self.tmm_page = self.context.new_page()
-                self.tmm_page.on("download", self.handle_download)
-                
-                tmm_loaded = False
-                for tmm_try in range(1, 4):
-                    try:
-                        self.tmm_page.goto("https://www.tunemymusic.com/es/transfer", wait_until="domcontentloaded", timeout=45000)
-                        tmm_loaded = True
-                        break
-                    except Exception as e_tmm:
-                        print(f"  [TuneMyMusic] {Color.WARNING}[WARN] [{self.client_email}] Intento {tmm_try}/3 a TuneMyMusic tuvo fallo/retardo de proxy ({e_tmm}). Reintentando...{Color.ENDC}")
-                        time.sleep(2.0)
-                        
-                if not tmm_loaded:
-                    print(f"  [TuneMyMusic] {Color.WARNING}[WARN] [{self.client_email}] No se pudo cargar automáticamente la portada de TuneMyMusic por red/proxy, pero la ventana permanecerá abierta.{Color.ENDC}")
-            except Exception as ex_tmm_init:
-                print(f"  [TuneMyMusic] {Color.WARNING}[WARN] [{self.client_email}] Error al iniciar pestaña TuneMyMusic: {ex_tmm_init}{Color.ENDC}")
-            
-            # Mantener el hilo de Playwright vivo para procesar eventos de descargas y cierres,
-            # y detectar si TuneMyMusic muestra aviso de "No se encontraron listas de reproducción"
-            print(f"  [TuneMyMusic] [{self.client_email}] Listo para transferencias. Esperando descargas o aviso de cuenta vacía...")
-            self.sin_playlists = False
-            # Frases completas: un "sin listas" suelto no basta, porque este aviso habilita
-            # la eliminación de la cuenta y un falso positivo la borraría sin exportar nada.
-            frases_cuenta_vacia = [
-                "no se encontraron listas de reproducción", "no se encontraron listas",
-                "no se encontraron canciones", "no playlists found", "no playlist found",
-                "no tracks found", "no music found"
-            ]
-            inicio_espera_tmm = time.time()
-            # Snapshot del CSV exacto de ESTA cuenta (no alias): un archivo viejo no cuenta como éxito
-            csv_exacto = DESCARGAS_DIR / f"{self.client_email}.csv"
-            prev_mtime = 0.0
-            prev_size = -1
-            if csv_parece_valido(csv_exacto):
-                try:
-                    st0 = csv_exacto.stat()
-                    prev_mtime = st0.st_mtime
-                    prev_size = st0.st_size
-                    print(f"  [Descarga] [{self.client_email}] Ya existía CSV previo "
-                          f"({csv_exacto.name}, {prev_size} bytes); si hay descarga se exigirá uno nuevo. "
-                          f"Si TuneMyMusic indica cuenta vacía, no se exige CSV.")
-                except Exception:
-                    pass
-            confirmaciones_vacio = 0
-
-            def _csv_nuevo_en_disco():
-                """Solo el fichero exacto email.csv, y solo si es nuevo o cambió en esta sesión."""
-                if not csv_parece_valido(csv_exacto):
-                    return None
-                try:
-                    st = csv_exacto.stat()
-                except Exception:
-                    return None
-                if prev_size < 0:
-                    return csv_exacto
-                if st.st_mtime > prev_mtime + 0.5 or st.st_size != prev_size:
-                    return csv_exacto
-                if st.st_mtime >= inicio_espera_tmm - 1.0:
-                    return csv_exacto
-                return None
-
-            try:
-                while not self.download_completed and not self.sin_playlists and self.context and self.tmm_page and not self.tmm_page.is_closed():
-                    try:
-                        # Respaldo: evento download perdido pero CSV NUEVO ya en disco
-                        if not self.download_completed:
-                            csv_en_disco = _csv_nuevo_en_disco()
-                            if csv_en_disco:
-                                print(f"  [Descarga] [{self.client_email}] CSV nuevo detectado en disco: "
-                                      f"{csv_en_disco.name} ({csv_en_disco.stat().st_size} bytes).")
-                                self.download_completed = True
-                                self.export_ok = True
-                                break
-
-                        # Solo texto realmente visible: el SPA de TuneMyMusic mantiene avisos ocultos
-                        # en el DOM que dispararían la detección antes de empezar la transferencia.
-                        texto_visible = self.tmm_page.evaluate("""() => {
-                            const visible = (el) => {
-                                const st = window.getComputedStyle(el);
-                                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1) return false;
-                                const r = el.getBoundingClientRect();
-                                return r.width > 0 && r.height > 0;
-                            };
-                            const partes = [];
-                            for (const el of document.querySelectorAll('div, span, p, h1, h2, h3, li, [role="alert"]')) {
-                                if (el.children.length === 0 && visible(el)) {
-                                    partes.push((el.textContent || '').trim().toLowerCase());
-                                }
-                            }
-                            return partes.join(' | ');
-                        }""")
-                        if any(f in texto_visible for f in frases_cuenta_vacia):
-                            confirmaciones_vacio += 1
-                        else:
-                            confirmaciones_vacio = 0
-
-                        # Exigir el aviso estable (4 lecturas) y pasado el arranque de la página
-                        if confirmaciones_vacio >= 4 and (time.time() - inicio_espera_tmm) > 20.0:
-                            print(f"  {Color.WARNING}[TuneMyMusic] [{self.client_email}] La cuenta no contiene playlists/canciones ('No se encontraron listas de reproducción').{Color.ENDC}")
-                            self.sin_playlists = True
-                            break
-                    except Exception:
-                        pass
-                    self.tmm_page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-            # Verificación de CSV en disco — SOLO si hubo descarga.
-            # Cuentas vacías (sin_playlists): TuneMyMusic no ofrece CSV; eso ya es éxito
-            # válido y NO debe anularse por falta de fichero (comportamiento original).
-            if self.sin_playlists:
-                self.export_ok = False  # no hubo export, pero la cuenta vacía está confirmada
-                print(f"  [TuneMyMusic] [{self.client_email}] Cuenta vacía confirmada: no se exige CSV; "
-                      f"se puede continuar con la eliminación.")
-            else:
-                csv_nuevo = _csv_nuevo_en_disco()
-                if self.download_completed and not csv_parece_valido(csv_exacto):
-                    print(f"  {Color.FAIL}[Descarga] [{self.client_email}] Flag de descarga OK pero el CSV no está "
-                          f"en 'descargas/' o está vacío. Se anula el éxito de exportación.{Color.ENDC}")
-                    self.download_completed = False
-                    self.export_ok = False
-                elif self.download_completed and not csv_nuevo:
-                    print(f"  {Color.FAIL}[Descarga] [{self.client_email}] El CSV en disco es anterior a esta "
-                          f"exportación (no se actualizó). Se anula el éxito.{Color.ENDC}")
-                    self.download_completed = False
-                    self.export_ok = False
-                elif csv_nuevo:
-                    self.download_completed = True
-                    self.export_ok = True
-                    print(f"  [Descarga] [{self.client_email}] CSV verificado en disco: {csv_nuevo} "
-                          f"({csv_nuevo.stat().st_size} bytes).")
-                else:
-                    self.export_ok = False
-
-            # Retardo corto para asegurar el guardado correcto antes del desmantelamiento
-            if self.download_completed or self.sin_playlists:
-                time.sleep(2.5)
-                
-            # Guardar cookies de TuneMyMusic como respaldo antes de finalizar el hilo
-            try:
-                if self.context:
-                    guardar_cookies_tmm(self.context.cookies())
-            except Exception:
-                pass
-
-            # --- Proceso de eliminación de cuenta ---
-            # Éxito de fase TMM = CSV descargado OK  O  cuenta vacía (sin playlists, sin CSV).
-            exito_eliminacion = False
-            if self.sin_playlists:
-                print(f"\n  [Eliminación] [{self.client_email}] Cuenta sin playlists/CSV: se procede a eliminar "
-                      f"(no aplica exigir archivo en 'descargas/').")
-            if not (self.download_completed or self.sin_playlists):
-                print(f"\n  [Eliminación] [{self.client_email}] [OMITIDA] No se descargó el CSV ni se confirmó que la cuenta esté vacía.")
-            elif self.download_completed and not self.sin_playlists and not resolver_csv_cuenta(self.client_email):
-                print(f"\n  [Eliminación] [{self.client_email}] [OMITIDA] Había señal de descarga pero el CSV "
-                      f"no está en 'descargas/'; no se elimina la cuenta.")
-            elif not correo_perfil_correcto:
-                print(f"\n  [Eliminación] [{self.client_email}] [OMITIDA] El correo del perfil no coincide con la cuenta IMAP.")
-            else:
-                print(f"\n  [Eliminación] [{self.client_email}] Iniciando eliminación de cuenta Tidal...")
-                try:
-                    # Asegurar enfoque de la página de Tidal
-                    try:
-                        self.page.bring_to_front()
-                    except Exception:
-                        pass
-
-                    # La línea base del buzón se toma ANTES de recorrer el asistente, que es lo que
-                    # dispara el envío: tomarla después descartaría el código ya recibido.
-                    base_del_id = obtener_max_email_id(self.client_email, "tidal")
-                    print(f"  [Eliminación] [{self.client_email}] ID de correo de Tidal más reciente antes de disparar el envío: {base_del_id}")
-
-                    print(f"  [Eliminación] [{self.client_email}] Recorriendo el asistente de confirmación de Tidal...")
-                    self.page.goto("https://account.tidal.com/account-deletion", wait_until="domcontentloaded", timeout=35000)
-                    time.sleep(2.0)
-                    aceptar_cookies_con_espera(self.page)
-                    manejar_bloqueos_e_intervencion(self.page, "Eliminación de Cuenta")
-
-                    # Tidal a veces devuelve al perfil: desde ahí hay que entrar por el enlace
-                    if "account-deletion" not in self.page.url:
-                        print(f"  [Eliminación] [{self.client_email}] Redirigido fuera del asistente. Buscando el enlace 'Eliminar cuenta'...")
-                        btn_entrada = encontrar_locator_en_frames(
-                            self.page,
-                            ["a:has-text('Eliminar cuenta')", "button:has-text('Eliminar cuenta')",
-                             "a:has-text('Delete account')", "button:has-text('Delete account')"]
-                        )
-                        if btn_entrada:
-                            btn_entrada.click()
-                            time.sleep(3.0)
-                        else:
-                            self.page.goto("https://account.tidal.com/account-deletion", wait_until="domcontentloaded", timeout=25000)
-                            time.sleep(2.5)
-                        if "account-deletion" not in self.page.url:
-                            raise RuntimeError("Tidal no permitió abrir el asistente de eliminación de cuenta.")
-
-                    if not self.recorrer_asistente_eliminacion():
-                        raise RuntimeError("No se alcanzó la pantalla del código del asistente de eliminación.")
-
-                    if not self.verificar_destino_del_codigo(target_email_clean):
-                        raise RuntimeError("Tidal enviaría el código a un correo distinto al de la cuenta IMAP.")
-
-                    codigo_eliminacion = None
-                    print(f"  [Eliminación] [{self.client_email}] Buscando código de eliminación en el correo...")
-                    for intento in range(1, 19): # 18 intentos * 10s = 180s = 3 minutos
-                        if intento in (2, 8):
-                            self.forzar_reenvio_codigo()
-                        print(f"  [Eliminación] [{self.client_email}] Intento {intento}/18: Buscando correo de eliminación...")
-                        codigo_eliminacion = obtener_codigo_via_imap(
-                            gmail_user=self.client_email,
-                            required_keywords=["elimin", "desactiv", "delete", "code", "codigo"],
-                            after_email_id=base_del_id
-                        )
-                        if codigo_eliminacion:
-                            break
-                        if intento < 18:
-                            time.sleep(10.0)
-                            
-                    if not codigo_eliminacion:
-                        print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo obtener el código de eliminación vía IMAP.{Color.ENDC}")
-                    else:
-                        print(f"  [Eliminación] [{self.client_email}] {Color.GREEN}Código de eliminación obtenido: {codigo_eliminacion}{Color.ENDC}")
-                        
-                        # Escribir código
-                        if escribir_codigo_verificacion_inteligente(self.page, codigo_eliminacion):
-                            print(f"  [Eliminación] [{self.client_email}] Código ingresado correctamente.")
-                            time.sleep(2.0)
-                            
-                            # Click en el botón de confirmación
-                            btn_confirmar = esperar_locator_en_frames(
-                                self.page,
-                                [
-                                    "button[type='submit']",
-                                    "button:has-text('Eliminar cuenta')", "button:has-text('Delete account')",
-                                    "button:has-text('Confirmar')", "button:has-text('Confirm')",
-                                    "button:has-text('Eliminar')", "button:has-text('Delete')"
-                                ],
-                                timeout_s=15.0
-                            )
-                            if btn_confirmar:
-                                print(f"  [Eliminación] [{self.client_email}] Pulsando botón para confirmar la eliminación...")
-                                btn_confirmar.click()
-
-                                if self.esperar_y_confirmar_eliminacion(5.0, confirm_timeout_s=8.0):
-                                    print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} eliminada correctamente.{Color.ENDC}")
-                                    exito_eliminacion = True
-                                else:
-                                    # Tras timeout de /profile la pestaña puede estar ya en /authorize
-                                    # (cuenta borrada) sin que confirmar_cuenta_eliminada lo viera a tiempo.
-                                    url_post = ""
-                                    try:
-                                        url_post = (pagina_vigente(self.page).url or "").lower()
-                                    except Exception:
-                                        pass
-                                    if "login.tidal.com" in url_post or "/authorize" in url_post:
-                                        print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
-                                              f"eliminada (pestaña ya en login/authorize).{Color.ENDC}")
-                                        exito_eliminacion = True
-                                    else:
-                                        print(f"  [Eliminación] {Color.WARNING}[WARN] Primera confirmación no verificó borrado. Probando botón secundario...{Color.ENDC}")
-                                        btn_final = esperar_locator_en_frames(
-                                            self.page,
-                                            [
-                                                "button:has-text('Eliminar cuenta')", "button:has-text('Delete account')",
-                                                "button:has-text('Confirmar')", "button:has-text('Confirm')"
-                                            ],
-                                            timeout_s=3.0
-                                        )
-                                        if btn_final:
-                                            print(f"  [Eliminación] [{self.client_email}] Pulsando botón de confirmación final...")
-                                            btn_final.click()
-                                            if self.esperar_y_confirmar_eliminacion(5.0, confirm_timeout_s=8.0):
-                                                print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} eliminada correctamente (confirmación secundaria).{Color.ENDC}")
-                                                exito_eliminacion = True
-                                            else:
-                                                try:
-                                                    url_post2 = (pagina_vigente(self.page).url or "").lower()
-                                                except Exception:
-                                                    url_post2 = ""
-                                                if "login.tidal.com" in url_post2 or "/authorize" in url_post2:
-                                                    print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
-                                                          f"eliminada (authorize tras confirmación secundaria).{Color.ENDC}")
-                                                    exito_eliminacion = True
-                            else:
-                                print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se encontró el botón de confirmación de eliminación.{Color.ENDC}")
-                        else:
-                            print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo ingresar el código de verificación.{Color.ENDC}")
-                except Exception as ex_el:
-                    print(f"  {Color.FAIL}[Eliminación] [ERROR] Ocurrió un error al intentar eliminar la cuenta de {self.client_email}: {ex_el}{Color.ENDC}")
-
-            self.eliminacion_ok = exito_eliminacion
-            if exito_eliminacion:
-                self.cerrar_recursos()
-                return True
-            return self.finalizar_sin_exito("No se completó la eliminación de la cuenta.")
-            
         except Exception as e:
             print(f"  {Color.FAIL}[ERROR] Excepción general en el proceso para {self.client_email}: {e}{Color.ENDC}")
             self.abortar_barreras()
@@ -18836,7 +18433,7 @@ class TidalAutoLoginManager:
 
 def iniciar_sesion_automatico_tidal(correos):
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}   INICIO DE SESIÓN AUTOMÁTICO DE CUENTAS TIDAL / TMM{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   INICIO DE SESIÓN AUTOMÁTICO DE CUENTAS TIDAL{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     
     try:
@@ -18868,6 +18465,9 @@ def iniciar_sesion_automatico_tidal(correos):
 
     headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
     headless = headless_opt in ("s", "si", "yes", "y")
+    if headless:
+        print(f"{Color.WARNING}Opción 10 deja Chrome abierto para uso manual; se ignora el modo headless.{Color.ENDC}")
+        headless = False
 
     revision_opt = input("¿Mantener abiertas las ventanas con error para revisión manual? (s/n, por defecto 'n'): ").strip().lower()
     mantener_ventanas = revision_opt in ("s", "si", "sí", "yes", "y")
@@ -18901,7 +18501,9 @@ def iniciar_sesion_automatico_tidal(correos):
 
     batch_size = 10
     total_cuentas = len(correos_lista)
-    print(f"\n{Color.CYAN}{Color.BOLD}Iniciando sesión de {total_cuentas} cuentas en bloques de máximo {batch_size} ventanas de Chrome simultáneas...{Color.ENDC}\n")
+    print(f"\n{Color.CYAN}{Color.BOLD}Iniciando sesión de {total_cuentas} cuentas en bloques de máximo {batch_size} ventanas de Chrome simultáneas...{Color.ENDC}")
+    print(f"{Color.CYAN}Tras el login, cada ventana permanece abierta SIN límite de tiempo. "
+          f"Cierra Chrome cuando termines con esa cuenta.{Color.ENDC}\n")
     
     for b_start in range(0, total_cuentas, batch_size):
         # Entre lotes: liberar marcas antirobot para reutilizar IPs que solo fallaron temporalmente
@@ -18955,7 +18557,7 @@ def iniciar_sesion_automatico_tidal(correos):
             managers.append(manager)
             print(f"\n{Color.CYAN}{Color.BOLD}[Login Automático Concurrente] Iniciando proceso para: {correo}{Color.ENDC}")
             try:
-                exito = manager.run_auto_login()
+                exito = manager.run_auto_login(modo="solo_login")
             finally:
                 # Cerrar la conexión IMAP reutilizable del hilo para no dejarla abierta contra Gmail
                 cerrar_sesion_imap_hilo()
@@ -18976,19 +18578,12 @@ def iniciar_sesion_automatico_tidal(correos):
                     fail_count += 1
 
     total_login = sum(1 for m in managers if getattr(m, "login_ok", False))
-    total_export = sum(1 for m in managers if getattr(m, "export_ok", False))
-    total_vacias = sum(1 for m in managers if getattr(m, "sin_playlists", False))
-    total_eliminadas = sum(1 for m in managers if getattr(m, "eliminacion_ok", False))
 
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"   RESUMEN DEL INICIO DE SESIÓN AUTOMÁTICO")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f" Cuentas procesadas: {total_cuentas}")
     print(f" Inicios de sesión correctos: {total_login}")
-    print(f" CSV exportados desde TuneMyMusic: {total_export}")
-    print(f" Cuentas detectadas sin playlists: {total_vacias}")
-    print(f" Cuentas eliminadas: {total_eliminadas}")
-    print(f" Procesos completos (login + exportación + eliminación): {success_count}")
     print(f" Procesos incompletos: {fail_count}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
 
@@ -19398,118 +18993,283 @@ def registrar_cuentas_tidal(correos):
 
     print(f"\n{Color.CYAN}[Opción 8] Solo registro Tidal (sin pago/TuneMyMusic): no se reservan proxies PE.{Color.ENDC}")
 
-    headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
-    headless = headless_opt in ("s", "si", "yes", "y")
-    
-    success_count = 0
-    fail_count = 0
-    estado_lock = threading.Lock()
-
-    def registrar_un_correo(idx, correo):
-        nonlocal success_count, fail_count
-        p_ng_server = p_ng_user = p_ng_pass = None
-        manager = None
-        exito = False
-        proxies_ya_liberados = False
-        try:
-            if use_proxy and valid_ng_list:
-                p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico()
-                if not p_ng:
-                    print(f"  {Color.FAIL}[Proxy NG] [{correo}] Sin proxy de Nigeria libre; se omite la cuenta.{Color.ENDC}")
-                    with estado_lock:
-                        fail_count += 1
-                    return correo, False
-                p_ng_server = p_ng.get("server")
-                p_ng_user = p_ng.get("username")
-                p_ng_pass = p_ng.get("password")
-
-            manager = TidalRegisterManager(
-                client_email=correo,
-                client_pwd="",
-                proxy_ng_server=p_ng_server,
-                proxy_ng_user=p_ng_user,
-                proxy_ng_pass=p_ng_pass,
-                proxy_pe_server=None,
-                proxy_pe_user=None,
-                proxy_pe_pass=None,
-                headless=headless
-            )
-
-            print(f"\n{Color.CYAN}{Color.BOLD}[Registro Concurrente] Iniciando proceso para: {correo}{Color.ENDC}")
-            # cerrar_navegador_al_final=True ya libera NG/PE en el finally de run_registration.
-            exito = manager.run_registration(cerrar_navegador_al_final=True)
-            proxies_ya_liberados = True
-            if not exito:
-                try:
-                    manager.limpiar_perfil_temporal()
-                except Exception:
-                    pass
-                with estado_lock:
-                    fail_count += 1
-                return correo, False
-
-            try:
-                manager.limpiar_perfil_temporal()
-            except Exception:
-                pass
-            with estado_lock:
-                success_count += 1
-            print(f"  {Color.GREEN}[Registro] [{correo}] Completado. Opción 8 finaliza aquí (sin TuneMyMusic).{Color.ENDC}")
-            return correo, True
-        except Exception as e_reg:
-            if manager is not None:
-                try:
-                    if not proxies_ya_liberados:
-                        manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
-                        proxies_ya_liberados = True
-                    else:
-                        # Navegador ya cerrado por run_registration; no liberar proxy otra vez.
-                        manager.cerrar_navegador(liberar_ng=False, liberar_pe=False)
-                except Exception:
-                    pass
-                try:
-                    manager.limpiar_perfil_temporal()
-                except Exception:
-                    pass
-            with estado_lock:
-                if not exito:
-                    fail_count += 1
-            print(f"  {Color.FAIL}[ERROR] Excepción en registro de {correo}: {e_reg}{Color.ENDC}")
-            raise
-        finally:
-            cerrar_sesion_imap_hilo()
-            # Evitar doble liberar_proxy: si run_registration ya devolvió el NG al pool,
-            # liberarlo otra vez podía marcar como libre un proxy ya asignado a otro hilo.
-            if not exito and not proxies_ya_liberados and p_ng_server:
-                try:
-                    GLOBAL_NG_PROXY_POOL.liberar_proxy(p_ng_server)
-                except Exception:
-                    pass
-                if manager is not None:
-                    manager.proxy_ng_server = None
-                    manager.proxy_pe_server = None
-
-    if not correos:
+    vistos = set()
+    correos_lista = []
+    for c in correos or []:
+        a = (c or "").strip().lower()
+        if a and "@" in a and a not in vistos:
+            vistos.add(a)
+            correos_lista.append(a)
+    if not correos_lista:
         print(f"\n{Color.WARNING}[Opción 8] No hay correos para registrar.{Color.ENDC}")
         return
-    workers = min(10, len(correos))
-    print(f"\n{Color.CYAN}{Color.BOLD}Iniciando registro de {len(correos)} cuentas de forma simultánea (usando {workers} hilos)...{Color.ENDC}\n")
-    print(f"{Color.CYAN}Opción 8: solo registro Tidal. Al terminar cada cuenta se cierra el proceso (sin TuneMyMusic).{Color.ENDC}\n")
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(registrar_un_correo, idx, correo): correo for idx, correo in enumerate(correos, 1)}
-        for future in as_completed(futures):
-            correo = futures[future]
+    n_catch = sum(
+        1 for c in correos_lista
+        if not c.endswith(("@gmail.com", "@googlemail.com"))
+    )
+    if n_catch:
+        print(f"  {Color.CYAN}[Worker] {n_catch} correo(s) catch-all (@cheapmusic.best): "
+              f"OTP por Email Worker, un alias = un código (sin mezclar ventanas).{Color.ENDC}")
+        try:
+            from otp_worker_client import worker_salud, worker_config
+            ok_w, info_w = worker_salud()
+            cfg_w = worker_config()
+            marca = f"{Color.GREEN}OK{Color.ENDC}" if ok_w else f"{Color.FAIL}NO{Color.ENDC}"
+            print(f"  {Color.CYAN}Email Worker:{Color.ENDC} {marca}  {info_w}")
+            if not ok_w:
+                print(f"  {Color.WARNING}[Worker] Sin worker sano el OTP de @cheapmusic.best no llegará. "
+                      f"Revisa email_worker_url / email_worker_secret en passwords.txt.{Color.ENDC}")
+            elif cfg_w.get("imap_fallback"):
+                print(f"  imap_fallback=1 (si el worker no tiene el mail, se intenta IMAP del Gmail de forward).")
+        except Exception as e_w:
+            print(f"  {Color.WARNING}Email Worker: no se pudo comprobar ({e_w}){Color.ENDC}")
+
+    headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
+    headless = headless_opt in ("s", "si", "yes", "y")
+
+    # Tope 4: más ventanas saturan el Email Worker y se pisan OTP del catch-all.
+    batch_size = 4
+    timeout_oleada_s = 420.0
+    total_cuentas = len(correos_lista)
+    n_oleadas = max(1, (total_cuentas + batch_size - 1) // batch_size)
+    print(f"\n{Color.CYAN}{Color.BOLD}Opción 8: {total_cuentas} cuenta(s) → {n_oleadas} oleada(s) "
+          f"de hasta {batch_size} ventanas en simultáneo (proxy NG, OTP worker por alias).{Color.ENDC}")
+    print(f"{Color.CYAN}Un fallo no detiene el lote. Tras todas las oleadas se reintenta una vez "
+          f"lo que haya fallado.{Color.ENDC}\n")
+
+    success_count = 0
+    fail_count = 0
+    ok_list: list[str] = []
+    fail_list: list[str] = []
+    estado_lock = threading.Lock()
+
+    def _limpiar_tras_oleada(n_oleada: int, n_total: int) -> None:
+        try:
+            GLOBAL_NG_PROXY_POOL.liberar_todos_los_en_uso()
+        except Exception:
+            pass
+        try:
+            n_limpios = _limpiar_perfiles_chrome_invitacion_huerfanos(max_age_s=90.0)
+            if n_limpios:
+                print(f"  {Color.CYAN}[Opción 8] Limpieza: {n_limpios} perfil(es) Chrome huérfano(s).{Color.ENDC}")
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        if n_oleada < n_total:
+            pausa = 2.5 if total_cuentas >= 40 else 1.2
+            print(f"  {Color.CYAN}[Opción 8] Oleada {n_oleada}/{n_total} terminada "
+                  f"(OK {success_count} / fallos {fail_count} / quedan "
+                  f"{max(0, total_cuentas - success_count - fail_count)}). "
+                  f"Pausa {pausa:.0f}s...{Color.ENDC}")
+            time.sleep(pausa)
+
+    def _correr_oleadas(pendientes: list[str], etiqueta: str) -> tuple[list[str], list[str]]:
+        nonlocal success_count, fail_count
+        ok_esta: list[str] = []
+        fail_esta: list[str] = []
+        n_tot = len(pendientes)
+        n_ol = max(1, (n_tot + batch_size - 1) // batch_size)
+        for b_start in range(0, n_tot, batch_size):
+            lote = pendientes[b_start:b_start + batch_size]
+            n_oleada = (b_start // batch_size) + 1
+            print(f"\n{Color.BLUE}{Color.BOLD}=== {etiqueta} oleada {n_oleada}/{n_ol}: "
+                  f"{len(lote)} cuenta(s) "
+                  f"({b_start + 1}-{b_start + len(lote)} de {n_tot}) ==={Color.ENDC}")
+            for c_o in lote:
+                print(f"    • {c_o}")
+
+            cancel_oleada = threading.Event()
+            managers_lote: dict[str, TidalRegisterManager] = {}
+            managers_lock = threading.Lock()
+
+            def registrar_un_correo(idx_rel: int, correo: str):
+                if idx_rel > 1:
+                    time.sleep((idx_rel - 1) * random.uniform(0.25, 0.55))
+                if cancel_oleada.is_set():
+                    return correo, False
+                p_ng_server = p_ng_user = p_ng_pass = None
+                manager = None
+                exito = False
+                proxies_ya_liberados = False
+                try:
+                    if use_proxy and valid_ng_list:
+                        p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico()
+                        if not p_ng:
+                            print(f"  {Color.FAIL}[Proxy NG] [{correo}] Sin proxy de Nigeria libre; "
+                                  f"se omite la cuenta.{Color.ENDC}")
+                            return correo, False
+                        p_ng_server = p_ng.get("server")
+                        p_ng_user = p_ng.get("username")
+                        p_ng_pass = p_ng.get("password")
+
+                    manager = TidalRegisterManager(
+                        client_email=correo,
+                        client_pwd="",
+                        proxy_ng_server=p_ng_server,
+                        proxy_ng_user=p_ng_user,
+                        proxy_ng_pass=p_ng_pass,
+                        proxy_pe_server=None,
+                        proxy_pe_user=None,
+                        proxy_pe_pass=None,
+                        headless=headless,
+                        cancel_event=cancel_oleada,
+                    )
+                    with managers_lock:
+                        managers_lote[correo] = manager
+
+                    print(f"\n{Color.CYAN}{Color.BOLD}[Registro] [{correo}] Ventana {idx_rel}/{len(lote)}"
+                          f"{Color.ENDC}")
+                    exito = manager.run_registration(cerrar_navegador_al_final=True)
+                    proxies_ya_liberados = True
+                    try:
+                        manager.limpiar_perfil_temporal()
+                    except Exception:
+                        pass
+                    if exito:
+                        print(f"  {Color.GREEN}[Registro] [{correo}] Completado. "
+                              f"Opción 8 finaliza aquí (sin TuneMyMusic).{Color.ENDC}")
+                    return correo, bool(exito)
+                except Exception as e_reg:
+                    if manager is not None:
+                        try:
+                            if not proxies_ya_liberados:
+                                manager.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+                                proxies_ya_liberados = True
+                            else:
+                                manager.cerrar_navegador(liberar_ng=False, liberar_pe=False)
+                        except Exception:
+                            pass
+                        try:
+                            manager.limpiar_perfil_temporal()
+                        except Exception:
+                            pass
+                    print(f"  {Color.FAIL}[ERROR] Excepción en registro de {correo}: {e_reg}{Color.ENDC}")
+                    return correo, False
+                finally:
+                    with managers_lock:
+                        managers_lote.pop(correo, None)
+                    try:
+                        cerrar_sesion_imap_hilo()
+                    except Exception:
+                        pass
+                    if not exito and not proxies_ya_liberados and p_ng_server:
+                        try:
+                            GLOBAL_NG_PROXY_POOL.liberar_proxy(p_ng_server)
+                        except Exception:
+                            pass
+                        if manager is not None:
+                            manager.proxy_ng_server = None
+                            manager.proxy_pe_server = None
+
+            timed_out = False
+            ya_contados: set[str] = set()
+            executor = ThreadPoolExecutor(max_workers=len(lote))
             try:
-                future.result()
-            except Exception as e:
-                print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando {correo}: {e}{Color.ENDC}")
+                futures = {
+                    executor.submit(registrar_un_correo, idx_rel, correo): correo
+                    for idx_rel, correo in enumerate(lote, 1)
+                }
+                pendientes_f = set(futures.keys())
+                t_limite = time.time() + timeout_oleada_s
+                while pendientes_f:
+                    timeout_restante = max(0.1, t_limite - time.time())
+                    done, pendientes_f = wait(
+                        pendientes_f, timeout=min(5.0, timeout_restante), return_when=FIRST_COMPLETED
+                    )
+                    for future in done:
+                        correo_f = futures[future]
+                        try:
+                            c_res, ok = future.result(timeout=1.0)
+                        except Exception as ex_h:
+                            print(f"  {Color.FAIL}[ERROR] Excepción inesperada procesando "
+                                  f"{correo_f}: {ex_h}{Color.ENDC}")
+                            c_res, ok = correo_f, False
+                        with estado_lock:
+                            if c_res in ya_contados:
+                                continue
+                            ya_contados.add(c_res)
+                            if ok:
+                                success_count += 1
+                                ok_esta.append(c_res)
+                                ok_list.append(c_res)
+                            else:
+                                fail_count += 1
+                                fail_esta.append(c_res)
+                                fail_list.append(c_res)
+                    if time.time() >= t_limite and pendientes_f:
+                        timed_out = True
+                        print(f"\n  {Color.FAIL}[TIMEOUT] Oleada {n_oleada}/{n_ol} superó "
+                              f"{timeout_oleada_s:.0f}s. Se cancelan ventanas colgadas y se sigue.{Color.ENDC}")
+                        cancel_oleada.set()
+                        with managers_lock:
+                            colgados = list(managers_lote.items())
+                        for corr_m, mgr in colgados:
+                            print(f"  {Color.FAIL}[TIMEOUT] {corr_m} no respondió a tiempo.{Color.ENDC}")
+                            try:
+                                mgr.cerrar_navegador(liberar_ng=True, liberar_pe=True)
+                            except Exception:
+                                pass
+                        for fut in list(pendientes_f):
+                            corr = futures.get(fut)
+                            if corr:
+                                with estado_lock:
+                                    if corr not in ya_contados:
+                                        ya_contados.add(corr)
+                                        fail_count += 1
+                                        fail_esta.append(corr)
+                                        fail_list.append(corr)
+                            try:
+                                fut.cancel()
+                            except Exception:
+                                pass
+                        break
+            finally:
+                try:
+                    executor.shutdown(wait=not timed_out, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
+
+            _limpiar_tras_oleada(n_oleada, n_ol)
+        return ok_esta, fail_esta
+
+    _correr_oleadas(correos_lista, "Opción 8")
+
+    pendientes_retry = [c for c in fail_list if c not in ok_list]
+    # Unique preserving order
+    vistos_r = set()
+    retry_lista = []
+    for c in pendientes_retry:
+        if c not in vistos_r:
+            vistos_r.add(c)
+            retry_lista.append(c)
+    if retry_lista:
+        print(f"\n{Color.CYAN}{Color.BOLD}[Opción 8] Reintento de {len(retry_lista)} cuenta(s) "
+              f"fallida(s), otra vez en oleadas de {batch_size}...{Color.ENDC}\n")
+        time.sleep(2.0)
+        fail_count -= len(retry_lista)
+        fail_list[:] = [c for c in fail_list if c not in retry_lista]
+        _ok_r, _fail_r = _correr_oleadas(retry_lista, "Opción 8 reintento")
+        # fail_count / lists already updated inside _correr_oleadas
 
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO (opción 8){Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f" Cuentas procesadas con éxito: {Color.GREEN}{success_count}{Color.ENDC}")
-    print(f" Cuentas fallidas: {Color.FAIL}{fail_count}{Color.ENDC}")
+    print(f" Cuentas procesadas con éxito: {Color.GREEN}{len(ok_list)}{Color.ENDC}")
+    print(f" Cuentas fallidas: {Color.FAIL}{len(fail_list)}{Color.ENDC}")
+    if ok_list:
+        print(f"\n{Color.GREEN}{Color.BOLD}✓ Registradas OK:{Color.ENDC}")
+        for i, c in enumerate(ok_list, 1):
+            print(f"  {Color.GREEN}{i:2d}. {c}{Color.ENDC}")
+    if fail_list:
+        print(f"\n{Color.FAIL}{Color.BOLD}✗ Fallaron:{Color.ENDC}")
+        for i, c in enumerate(fail_list, 1):
+            print(f"  {Color.FAIL}{i:2d}. {c}{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso de registro finalizado. Regresando al menú principal...{Color.ENDC}\n")
 
@@ -20291,7 +20051,7 @@ def menu_principal():
         print(" 7. Salir")
         print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
-        print(" 10. Iniciar sesión automática (Login automático en TIDAL / TMM)")
+        print(" 10. Iniciar sesión automática (solo login TIDAL, ventana abierta sin límite)")
         print(" 11. Invitar al plan familiar (Titulares e Invitaciones Automáticas)")
         print(" 12. Verificar contraseñas IMAP registradas en passwords.txt")
         print(" 13. Validar y verificar lista de proxies (Nigeria / Perú)")

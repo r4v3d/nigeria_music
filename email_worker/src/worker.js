@@ -71,6 +71,7 @@ export default {
           kind: hit.kind,
           ts: hit.ts,
           subject: hit.subject,
+          alias,
         });
       } catch (err) {
         console.log("claim error", String(err));
@@ -255,19 +256,40 @@ function emailsIn(s) {
   return String(s || "").toLowerCase().match(/[a-z0-9._%+\-]+@[a-z0-9.\-]+/g) || [];
 }
 
-function pickAlias(messageTo, decoded, domain) {
+function aliasOfDomain(email, domain) {
+  const e = String(email || "").trim().toLowerCase();
   const dom = String(domain || "cheapmusic.best").toLowerCase();
-  const blob = [
+  return e.endsWith("@" + dom) ? e : "";
+}
+
+function firstAliasIn(src, domain) {
+  for (const e of emailsIn(src)) {
+    const hit = aliasOfDomain(e, domain);
+    if (hit) return hit;
+  }
+  return "";
+}
+
+function pickAlias(messageTo, decoded, domain) {
+  // Solo el destinatario real: el cuerpo de Tidal puede citar otros @cheapmusic.best
+  // y found[0] del blob mezclaba OTP entre ventanas de la misma oleada.
+  const dom = String(domain || "cheapmusic.best").toLowerCase();
+  const headerSources = [
     messageTo,
     decoded.headers.to,
     decoded.headers["delivered-to"],
     decoded.headers["x-original-to"],
+    decoded.headers["envelope-to"],
+    decoded.headers["x-envelope-to"],
     decoded.headers["x-forwarded-to"],
     decoded.headers["x-google-original-to"],
-    decoded.all.slice(0, 12000),
-  ].join(" ");
-  const found = emailsIn(blob).filter((e) => e.endsWith("@" + dom));
-  if (found.length) return found[0];
+  ];
+  for (const src of headerSources) {
+    const hit = firstAliasIn(src, dom);
+    if (hit) return hit;
+  }
+  const fromBody = firstAliasIn((decoded.all || "").slice(0, 8000), dom);
+  if (fromBody) return fromBody;
   const to = String(messageTo || "").trim().toLowerCase();
   return to.includes("@") ? to : "";
 }
@@ -463,11 +485,18 @@ function memReplace(alias, items) {
   MEM.set(String(alias || "").trim().toLowerCase(), (items || []).slice(-MAX_ITEMS));
 }
 
-function findUnclaimed(items, kinds, afterTs, maxAge, now) {
+function itemMatchesAlias(it, alias) {
+  const want = String(alias || "").trim().toLowerCase();
+  const got = String((it && it.alias) || "").trim().toLowerCase();
+  return !got || !want || got === want;
+}
+
+function findUnclaimed(items, kinds, afterTs, maxAge, now, alias) {
   const want = new Set(kinds);
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i];
     if (!it || !it.value || it.claimed) continue;
+    if (!itemMatchesAlias(it, alias)) continue;
     if (!want.has(it.kind)) continue;
     if (afterTs && Number(it.ts) <= afterTs) continue;
     if (now - Number(it.ts) > maxAge) continue;
@@ -478,6 +507,7 @@ function findUnclaimed(items, kinds, afterTs, maxAge, now) {
     for (let i = items.length - 1; i >= 0; i--) {
       const it = items[i];
       if (!it || !it.value || it.claimed) continue;
+      if (!itemMatchesAlias(it, alias)) continue;
       if (typeof it.value === "string" && /^\d{5,6}$/.test(it.value.trim())) {
         if (afterTs && Number(it.ts) <= afterTs) continue;
         if (now - Number(it.ts) > maxAge) continue;
@@ -592,7 +622,7 @@ async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
         const raw = await env.OTP.get(pendingKey(alias, k));
         if (!raw) continue;
         const it = JSON.parse(raw);
-        if (it && it.value && !it.claimed) {
+        if (it && it.value && !it.claimed && itemMatchesAlias(it, alias)) {
           byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
         }
       } catch {
@@ -622,14 +652,19 @@ async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
     }
   }
 
-  let items = [...byId.values()].sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
-  let idx = findUnclaimed(items, [kind], afterTs, maxAge, now);
+  let items = [...byId.values()]
+    .filter((it) => itemMatchesAlias(it, alias))
+    .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+  let idx = findUnclaimed(items, [kind], afterTs, maxAge, now, alias);
   if (idx < 0 && (kind === "login" || kind === "register")) {
     const other = kind === "login" ? "register" : "login";
-    idx = findUnclaimed(items, [other], afterTs, maxAge, now);
+    idx = findUnclaimed(items, [other], afterTs, maxAge, now, alias);
   }
   if (idx < 0) return null;
   const hit = items[idx];
+  if (hit.alias && String(hit.alias).trim().toLowerCase() !== String(alias || "").trim().toLowerCase()) {
+    return null;
+  }
   if (consume) {
     items[idx] = { ...hit, claimed: true };
     memReplace(alias, items);
@@ -661,6 +696,7 @@ async function listItems(env, alias, kind, maxAge) {
       it.kind === kind &&
       it.value &&
       !it.claimed &&
+      itemMatchesAlias(it, alias) &&
       now - Number(it.ts) <= maxAge
   );
 }

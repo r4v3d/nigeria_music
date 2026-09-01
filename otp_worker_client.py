@@ -90,14 +90,21 @@ def worker_habilitado() -> bool:
     return bool(cfg.get("url") and cfg.get("secret"))
 
 
+_WORKER_CATCHALL_DOMAINS = (
+    "cheapmusic.best",
+    "cheapmusic.beast",  # alias/typo frecuente del dominio catch-all
+)
+
+
 def worker_cubre_alias(alias: str) -> bool:
-    """El worker solo recibe el catch-all (p. ej. @cheapmusic.best), no Gmail nativo."""
+    """El worker solo recibe el catch-all @cheapmusic.best, no Gmail nativo."""
     a = (alias or "").strip().lower()
     if not worker_habilitado() or "@" not in a:
         return False
     if a.endswith("@gmail.com") or a.endswith("@googlemail.com"):
         return False
-    return True
+    dominio = a.rsplit("@", 1)[-1]
+    return dominio in _WORKER_CATCHALL_DOMAINS
 
 
 def marcar_baseline_worker(alias: str) -> None:
@@ -265,6 +272,11 @@ def reclamar_desde_worker(
         return None
     val = str(data.get("value") or "").strip()
     if not val:
+        return None
+    got_alias = str(data.get("alias") or "").strip().lower()
+    if got_alias and got_alias != alias:
+        if not silencioso:
+            print(f"    [WORKER] Ignorado OTP de {got_alias} (se pedía {alias})", flush=True)
         return None
     if kind in ("invite", "reset"):
         val = resolver_enlace_worker(val, kind)
