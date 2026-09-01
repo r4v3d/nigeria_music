@@ -407,17 +407,25 @@ function classifyTidal(decoded, alias) {
   ) {
     return { ...base, kind: "delete", value: otp };
   }
+  // Registro / alta (opción 4: "Verifica tu correo… completar la creación de tu cuenta")
+  if (
+    /completar la creaci[oó]n|creaci[oó]n de tu cuenta|creating your account|finish creating|terminar de crear|sign[-\s]?up|bienven|verifica tu correo|verify your email/.test(
+      blob
+    ) ||
+    (/registr/.test(blob) && !/c[oó]digo de inicio|login code|sign-?in code/.test(blob))
+  ) {
+    return { ...base, kind: "register", value: otp };
+  }
   if (
     /c[oó]digo de inicio|login code|sign-?in code|c[oó]digo de acceso|your tidal login code/.test(blob)
   ) {
     return { ...base, kind: "login", value: otp };
   }
-  if (
-    /registr|bienven|sign[-\s]?up|finish creating|terminar de crear/.test(blob)
-  ) {
-    return { ...base, kind: "register", value: otp };
-  }
   return { ...base, kind: "login", value: otp };
+}
+
+function pendingKey(alias, kind) {
+  return "pending:" + String(alias || "").trim().toLowerCase() + ":" + String(kind || "");
 }
 
 function kvKey(alias) {
@@ -494,7 +502,7 @@ async function loadRecent(kv, alias) {
 async function listItemKeys(kv, alias) {
   try {
     const prefix = "item:" + String(alias || "").trim().toLowerCase() + ":";
-    const listed = await kv.list({ prefix, limit: 30 });
+    const listed = await kv.list({ prefix, limit: 50 });
     return (listed && listed.keys) || [];
   } catch {
     return [];
@@ -504,12 +512,14 @@ async function listItemKeys(kv, alias) {
 async function loadItemsFromKv(kv, alias) {
   const keys = await listItemKeys(kv, alias);
   const items = [];
-  for (const k of keys) {
+  // Lecturas en paralelo: varias ventanas Chrome reclaman a la vez
+  const raws = await Promise.all(keys.map((k) => kv.get(k.name).catch(() => null)));
+  for (let i = 0; i < keys.length; i++) {
     try {
-      const raw = await kv.get(k.name);
+      const raw = raws[i];
       if (!raw) continue;
       const it = JSON.parse(raw);
-      if (it && it.value) items.push({ ...it, _key: k.name });
+      if (it && it.value) items.push({ ...it, _key: keys[i].name });
     } catch {
       /* ignore */
     }
@@ -519,59 +529,100 @@ async function loadItemsFromKv(kv, alias) {
 }
 
 async function readBox(env, alias) {
-  const mem = memItems(alias);
-  if (mem.length) return mem;
-  if (env && env.OTP) {
-    const fromRecent = await loadRecent(env.OTP, alias);
-    if (fromRecent.length) {
-      memReplace(alias, fromRecent);
-      return fromRecent;
-    }
-    return loadItemsFromKv(env.OTP, alias);
+  const byId = new Map();
+  for (const it of memItems(alias)) {
+    if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
   }
-  return [];
+  if (env && env.OTP) {
+    const rec = await loadRecent(env.OTP, alias);
+    for (const it of rec) {
+      if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
+    }
+    const fromKv = await loadItemsFromKv(env.OTP, alias);
+    for (const it of fromKv) {
+      if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
+    }
+  }
+  const items = [...byId.values()].sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+  if (items.length) memReplace(alias, items);
+  return items;
 }
 
 async function pushItem(env, alias, item) {
   memPush(alias, item);
-  const snap = memItems(alias);
-  if (env && env.OTP) {
-    try {
-      const body = JSON.stringify(item);
-      const ttl = { expirationTtl: 60 * 60 * 2 };
-      await Promise.all([
-        env.OTP.put(itemKey(alias, item.id), body, ttl),
-        env.OTP.put(recentKey(alias), JSON.stringify(snap.slice(-15)), ttl),
-      ]);
-    } catch (err) {
-      console.log("kv push error", String(err));
+  if (!(env && env.OTP)) return;
+  const body = JSON.stringify(item);
+  const ttl = { expirationTtl: 60 * 60 * 2 };
+  try {
+    // 1) item: es la fuente de verdad (sobrevive races de recent:)
+    await env.OTP.put(itemKey(alias, item.id), body, ttl);
+    // 2) pending: lectura O(1) desde /claim (crítico con N ventanas en paralelo)
+    await env.OTP.put(pendingKey(alias, item.kind), body, ttl);
+    // 3) recent: merge read-modify-write para no pisar OTPs de otro correo concurrente
+    let rec = await loadRecent(env.OTP, alias);
+    const byId = new Map();
+    for (const it of rec) {
+      if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
     }
+    for (const it of memItems(alias)) {
+      if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
+    }
+    byId.set(item.id || `${item.kind}:${item.value}:${item.ts}`, item);
+    const snap = [...byId.values()]
+      .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0))
+      .slice(-15);
+    await env.OTP.put(recentKey(alias), JSON.stringify(snap), ttl);
+  } catch (err) {
+    console.log("kv push error", String(err));
   }
 }
 
 async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
   const now = Date.now() / 1000;
-  let items = memItems(alias);
+  const byId = new Map();
+
+  // A) pending: O(1) — el email handler acaba de escribir aquí
+  if (env && env.OTP) {
+    const kindsTry = [kind];
+    if (kind === "login" || kind === "register") {
+      kindsTry.push(kind === "login" ? "register" : "login");
+    }
+    for (const k of kindsTry) {
+      try {
+        const raw = await env.OTP.get(pendingKey(alias, k));
+        if (!raw) continue;
+        const it = JSON.parse(raw);
+        if (it && it.value && !it.claimed) {
+          byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  // B) memoria del isolate (solo útil si email+claim caen en el mismo isolate)
+  for (const it of memItems(alias)) {
+    if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
+  }
+
+  // C) SIEMPRE recent + item: (antes: si recent tenía claimed viejos, NO leía item: nuevos)
   if (env && env.OTP) {
     try {
       const rec = await loadRecent(env.OTP, alias);
-      if (rec.length) {
-        const byId = new Map(items.map((it) => [it.id || `${it.kind}:${it.value}`, it]));
-        for (const it of rec) byId.set(it.id || `${it.kind}:${it.value}`, it);
-        items = [...byId.values()];
+      for (const it of rec) {
+        if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
       }
-      if (!items.length) {
-        const fromKv = await loadItemsFromKv(env.OTP, alias);
-        if (fromKv.length) {
-          const byId = new Map(items.map((it) => [it.id || `${it.kind}:${it.value}`, it]));
-          for (const it of fromKv) byId.set(it.id || `${it.kind}:${it.value}`, it);
-          items = [...byId.values()];
-        }
+      const fromKv = await loadItemsFromKv(env.OTP, alias);
+      for (const it of fromKv) {
+        if (it && it.value) byId.set(it.id || `${it.kind}:${it.value}:${it.ts}`, it);
       }
     } catch (err) {
       console.log("kv claim read error", String(err));
     }
   }
+
+  let items = [...byId.values()].sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
   let idx = findUnclaimed(items, [kind], afterTs, maxAge, now);
   if (idx < 0 && (kind === "login" || kind === "register")) {
     const other = kind === "login" ? "register" : "login";
@@ -591,6 +642,7 @@ async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
         await Promise.all([
           env.OTP.put(hit._key || itemKey(alias, hit.id), body, ttl),
           env.OTP.put(recentKey(alias), JSON.stringify(items.slice(-15)), ttl),
+          env.OTP.delete(pendingKey(alias, hit.kind)),
         ]);
       } catch {
         /* ignore */

@@ -32,7 +32,7 @@ def _http_session() -> requests.Session:
             allowed_methods=frozenset(["GET"]),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
         sess = requests.Session()
         sess.mount("https://", adapter)
         sess.mount("http://", adapter)
@@ -67,7 +67,7 @@ def worker_config() -> dict:
         mtime = None
     if _CFG_CACHE is not None and mtime == _CFG_MTIME:
         return _CFG_CACHE
-    cfg = {"url": "", "secret": "", "imap_fallback": False, "timeout": 8.0}
+    cfg = {"url": "", "secret": "", "imap_fallback": False, "timeout": 5.0}
     for key, val in _pares_passwords():
         if key in ("email_worker_url", "otp_worker_url") and val:
             cfg["url"] = val.rstrip("/")
@@ -193,6 +193,15 @@ def intentar_via_worker(
             after_email_id=after_email_id,
             silencioso=silencioso,
         )
+        # Tidal a veces clasifica el alta como login (o al revés); probar el otro kind.
+        if not val and kind in ("login", "register"):
+            other = "register" if kind == "login" else "login"
+            val = reclamar_desde_worker(
+                al, other,
+                max_age_minutes=max_age_minutes,
+                after_email_id=after_email_id,
+                silencioso=silencioso,
+            )
         if val:
             return val, True
         if worker_config().get("imap_fallback"):
@@ -269,14 +278,14 @@ def esperar_desde_worker(
     kind: str,
     *,
     max_wait_s: float = 20.0,
-    interval_s: float = 0.15,
+    interval_s: float = 0.08,
     after_email_id: int = 0,
     max_age_minutes: int = 15,
     silencioso: bool = False,
     consume: bool = True,
     despues_de: float | None = None,
 ) -> str | None:
-    """Sondea /claim cada ~150 ms hasta que el correo llegue al worker."""
+    """Sondea /claim cada ~80 ms hasta que el correo llegue al worker."""
     alias = (alias or "").strip().lower()
     if not worker_cubre_alias(alias):
         return None
@@ -313,11 +322,11 @@ def esperar_desde_worker(
                 print(f"    [WORKER] {kind} para {alias}: {val[:96]} ({time.time() - t0:.1f}s)", flush=True)
             return val
         elapsed = time.time() - t0
-        if not silencioso and elapsed >= 2.0 and (not visto or elapsed - ultimo_hb >= 3.0):
+        if not silencioso and elapsed >= 1.5 and (not visto or elapsed - ultimo_hb >= 2.0):
             print(f"    [WORKER] Esperando {kind} para {alias}... ({elapsed:.0f}s/{tope:.0f}s)", flush=True)
             visto = True
             ultimo_hb = elapsed
-        time.sleep(max(0.08, float(interval_s)))
+        time.sleep(max(0.06, float(interval_s)))
     return None
 
 
