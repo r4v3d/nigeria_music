@@ -591,9 +591,12 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
     return None
 
 
-def cargar_mapa_cuentas_sesiones() -> dict[str, str]:
+def cargar_mapa_cuentas_sesiones(path_cuentas: Path | None = None) -> dict[str, str]:
     """Lee sesiones_imap_cuentas.txt → {correo: contraseña} (orden de archivo)."""
-    path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+    if path_cuentas is None:
+        path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+    else:
+        path_cuentas = Path(path_cuentas)
     cuentas_map: dict[str, str] = {}
     if not path_cuentas.exists():
         return cuentas_map
@@ -15809,7 +15812,7 @@ PATRON_MODO_CONTRASENA = r"(?:inicia|iniciar|usar|use|sign\s*in|log\s*in|entrar)
 
 class TidalAutoLoginManager:
     def __init__(self, client_email, target_pwd, proxy_pe_server=None, proxy_pe_user=None, proxy_pe_pass=None, headless=False, barreras=None, thread_index=1,
-                 mantener_ventana_si_falla=False):
+                 mantener_ventana_si_falla=False, keep_open_event=None, on_fase_login_terminada=None, omitir_tmm=False):
         self.client_email = client_email
         self.target_pwd = target_pwd
         self.proxy_pe_server = proxy_pe_server
@@ -15820,6 +15823,10 @@ class TidalAutoLoginManager:
         self.barreras = barreras or {}
         self.thread_index = thread_index
         self.mantener_ventana_si_falla = mantener_ventana_si_falla
+        self.keep_open_event = keep_open_event
+        self.on_fase_login_terminada = on_fase_login_terminada
+        self.omitir_tmm = omitir_tmm
+        self._fase_login_notificada = False
         self.playwright = None
         self.context = None
         self.page = None
@@ -16373,6 +16380,7 @@ class TidalAutoLoginManager:
 
         La API sync de Playwright está ligada al hilo creador, así que el cierre no puede
         delegarse al hilo principal: fallaría en silencio y dejaría Chrome y el driver vivos."""
+        self._notificar_fase_login_terminada()
         if self.mantener_ventana_si_falla:
             minutos = max(1, int(TIEMPO_REVISION_MANUAL_S / 60))
             print(f"  [Navegador] [{self.client_email}] {motivo} La ventana queda abierta para revisión manual "
@@ -16455,14 +16463,15 @@ class TidalAutoLoginManager:
         except Exception:
             pass
 
-        # Cargar cookies de TuneMyMusic si existen
-        try:
-            valid_cookies = cargar_cookies_tmm()
-            if valid_cookies:
-                self.context.add_cookies(valid_cookies)
-                print(f"  [TuneMyMusic] [{self.client_email}] Sesión precargada desde 'tmm_cookies.json'.")
-        except Exception as e:
-            print(f"  [TuneMyMusic] [WARN] Error al cargar cookies: {e}")
+        # Cargar cookies de TuneMyMusic si existen (opción 10 ya no usa TMM)
+        if not getattr(self, "omitir_tmm", False):
+            try:
+                valid_cookies = cargar_cookies_tmm()
+                if valid_cookies:
+                    self.context.add_cookies(valid_cookies)
+                    print(f"  [TuneMyMusic] [{self.client_email}] Sesión precargada desde 'tmm_cookies.json'.")
+            except Exception as e:
+                print(f"  [TuneMyMusic] [WARN] Error al cargar cookies: {e}")
                 
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.client_email = self.client_email
@@ -17242,7 +17251,8 @@ class TidalAutoLoginManager:
         )
 
     def run_auto_login(self, modo: str = "tmm") -> bool:
-        """modo='tmm' → opción 10 (login + TuneMyMusic). modo='eliminar' → opción 15 (login + borrar)."""
+        """modo='login' → opción 10 (login y ventana abierta). modo='eliminar' → opción 15.
+        modo='tmm' queda como legado (ya no lo usa el menú)."""
         try:
             self.asegurar_navegador_abierto()
             
@@ -17827,6 +17837,9 @@ class TidalAutoLoginManager:
 
             if modo == "eliminar":
                 return self._flujo_eliminar_cuenta_opcion15()
+
+            if modo == "login":
+                return self._flujo_mantener_sesion_abierta()
             
             # 2. Comprobar y cambiar correo si no coincide en el perfil
             target_email_clean = self.client_email.strip().lower()
@@ -18460,6 +18473,63 @@ class TidalAutoLoginManager:
               f"'Correo electrónico' en Información general.{Color.ENDC}")
         return None
 
+    def _notificar_fase_login_terminada(self) -> None:
+        """Avisa una sola vez al orquestador de la opción 10 (éxito o fallo)."""
+        if getattr(self, "_fase_login_notificada", False):
+            return
+        self._fase_login_notificada = True
+        cb = getattr(self, "on_fase_login_terminada", None)
+        if callable(cb):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def _flujo_mantener_sesion_abierta(self) -> bool:
+        """Opción 10: deja Chrome con la sesión Tidal abierta (proxy PE) sin límite de tiempo."""
+        print(f"  [Login] {Color.GREEN}[{self.client_email}] Sesión iniciada. "
+              f"La ventana permanece abierta sin límite de tiempo.{Color.ENDC}")
+        try:
+            if self.page and not self.page.is_closed():
+                url = (self.page.url or "").lower()
+                if "login.tidal.com" in url or "/authorize" in url:
+                    navegar_tidal_tolerante(
+                        self.page, "https://account.tidal.com/",
+                        timeout_ms=30000,
+                    )
+        except Exception:
+            pass
+
+        self._notificar_fase_login_terminada()
+
+        ev = getattr(self, "keep_open_event", None)
+        print(f"  [Login] [{self.client_email}] Puedes usar esta cuenta con normalidad. "
+              f"La ventana no se cerrará sola.")
+        while True:
+            if ev is not None and ev.is_set():
+                break
+            try:
+                if not self.context:
+                    break
+                pages = [p for p in list(self.context.pages) if not p.is_closed()]
+                if not pages:
+                    break
+                self.page = pages[0]
+                self.page.wait_for_timeout(1000)
+            except Exception:
+                try:
+                    if not self.context:
+                        break
+                    if all(p.is_closed() for p in list(self.context.pages)):
+                        break
+                except Exception:
+                    break
+                time.sleep(1.0)
+
+        print(f"  [Navegador] [{self.client_email}] Cerrando ventana de Chrome...")
+        self.cerrar_recursos()
+        return True
+
     def _flujo_eliminar_cuenta_opcion15(self) -> bool:
         """Tras login: verifica correo del perfil en passwords.txt (IMAP) y elimina la cuenta."""
         print(f"  [Eliminación] [{self.client_email}] Modo opción 15: verificar correo registrado → "
@@ -18834,27 +18904,57 @@ class TidalAutoLoginManager:
             threading.Thread(target=_rm_async, args=(Path(prof_dir),), daemon=True).start()
 
 
+PATH_CUENTAS_LOGIN_AUTOMATICO = Path(
+    r"C:\Users\prett\OneDrive\Documentos\tidal nigeria\sesiones_imap_cuentas.txt"
+)
+
+
+def resolver_path_cuentas_login_automatico() -> Path:
+    """Contraseñas de la opción 10: archivo de OneDrive, con respaldo junto al script."""
+    candidatos = [
+        PATH_CUENTAS_LOGIN_AUTOMATICO,
+        Path.home() / "OneDrive" / "Documentos" / "tidal nigeria" / "sesiones_imap_cuentas.txt",
+        SCRIPT_DIR / "sesiones_imap_cuentas.txt",
+    ]
+    vistos = []
+    for p in candidatos:
+        try:
+            p_res = p.resolve() if p.exists() else p
+        except Exception:
+            p_res = p
+        if p_res in vistos:
+            continue
+        vistos.append(p_res)
+        if p.exists():
+            return p
+    return PATH_CUENTAS_LOGIN_AUTOMATICO
+
+
 def iniciar_sesion_automatico_tidal(correos):
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}   INICIO DE SESIÓN AUTOMÁTICO DE CUENTAS TIDAL / TMM{Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   INICIO DE SESIÓN AUTOMÁTICO (LOGIN AUTOMÁTICO){Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    
+    print(f"{Color.CYAN}Login en TIDAL con correo y contraseña (proxy Perú). "
+          f"Sin TuneMyMusic. Las ventanas quedan abiertas sin límite de tiempo.{Color.ENDC}")
+
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright  # noqa: F401
     except ImportError:
         print(f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. Ejecute 'pip install playwright' e instale los navegadores con 'playwright install'.")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
 
-    path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
+    path_cuentas = resolver_path_cuentas_login_automatico()
+    print(f"\n{Color.CYAN}[Cuentas] Leyendo contraseñas desde:{Color.ENDC} {path_cuentas}")
     if not path_cuentas.exists():
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe en la carpeta actual.")
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No existe el archivo de cuentas:\n  {path_cuentas}")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
-        
-    cuentas_map = cargar_mapa_cuentas_sesiones()
+
+    cuentas_map = cargar_mapa_cuentas_sesiones(path_cuentas)
     if not cuentas_map:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en 'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
+        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en '{path_cuentas}' "
+              f"(formato: correo contraseña).")
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
 
@@ -18862,7 +18962,7 @@ def iniciar_sesion_automatico_tidal(correos):
     if cuentas_map is None:
         input(">>> Presiona Enter para volver al menú principal <<<")
         return
-        
+
     correos_lista = list(cuentas_map.keys())
     print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
@@ -18902,30 +19002,38 @@ def iniciar_sesion_automatico_tidal(correos):
     batch_size = 10
     total_cuentas = len(correos_lista)
     print(f"\n{Color.CYAN}{Color.BOLD}Iniciando sesión de {total_cuentas} cuentas en bloques de máximo {batch_size} ventanas de Chrome simultáneas...{Color.ENDC}\n")
-    
+
     for b_start in range(0, total_cuentas, batch_size):
         # Entre lotes: liberar marcas antirobot para reutilizar IPs que solo fallaron temporalmente
         if b_start > 0:
             GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
         lote_correos = correos_lista[b_start : b_start + batch_size]
         num_cuentas_lote = len(lote_correos)
-        
+
         # Sólo se sincroniza la apertura de ventanas. Las fases siguientes son independientes por
         # cuenta, así que encadenarlas dejaba a todas las ventanas paradas esperando a la más lenta.
         barreras_lote = {
             "inicio": threading.Barrier(num_cuentas_lote)
         }
-        
+
         workers = num_cuentas_lote
         if total_cuentas > batch_size:
             print(f"\n{Color.CYAN}{Color.BOLD}--- Procesando Lote ({b_start + 1} a {b_start + num_cuentas_lote} de {total_cuentas}) ---{Color.ENDC}")
+
+        cerrar_ventanas = threading.Event()
+        fase_lock = threading.Lock()
+        fase_terminadas = [0]
+
+        def marcar_fase_terminada():
+            with fase_lock:
+                fase_terminadas[0] += 1
 
         def login_un_correo(idx_rel, correo):
             if idx_rel > 1:
                 time.sleep((idx_rel - 1) * 1.5)
             idx_abs = b_start + idx_rel
             contrasena = cuentas_map[correo]
-            
+
             p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
             if not p_pe:
                 print(f"  {Color.FAIL}[Proxy PE] [{correo}] No queda ningún proxy de Perú disponible; se omite la cuenta.{Color.ENDC}")
@@ -18935,6 +19043,7 @@ def iniciar_sesion_automatico_tidal(correos):
                         b.abort()
                     except Exception:
                         pass
+                marcar_fase_terminada()
                 return correo, False
 
             p_pe_server = p_pe.get("server")
@@ -18950,12 +19059,18 @@ def iniciar_sesion_automatico_tidal(correos):
                 headless=headless,
                 barreras=barreras_lote,
                 thread_index=idx_abs,
-                mantener_ventana_si_falla=mantener_ventanas
+                mantener_ventana_si_falla=mantener_ventanas,
+                keep_open_event=cerrar_ventanas,
+                on_fase_login_terminada=marcar_fase_terminada,
+                omitir_tmm=True,
             )
             managers.append(manager)
             print(f"\n{Color.CYAN}{Color.BOLD}[Login Automático Concurrente] Iniciando proceso para: {correo}{Color.ENDC}")
             try:
-                exito = manager.run_auto_login()
+                exito = manager.run_auto_login(modo="login")
+            except Exception:
+                manager._notificar_fase_login_terminada()
+                raise
             finally:
                 # Cerrar la conexión IMAP reutilizable del hilo para no dejarla abierta contra Gmail
                 cerrar_sesion_imap_hilo()
@@ -18963,6 +19078,28 @@ def iniciar_sesion_automatico_tidal(correos):
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(login_un_correo, idx_rel, correo): correo for idx_rel, correo in enumerate(lote_correos, 1)}
+
+            while True:
+                with fase_lock:
+                    n_fase = fase_terminadas[0]
+                if n_fase >= num_cuentas_lote:
+                    break
+                time.sleep(0.35)
+
+            logins_ok_lote = sum(
+                1 for m in managers
+                if getattr(m, "login_ok", False) and m.client_email in lote_correos
+            )
+            print(f"\n{Color.GREEN}{Color.BOLD}Login del lote listo ({logins_ok_lote} sesión(es) activa(s)). "
+                  f"Las ventanas permanecen abiertas sin límite de tiempo.{Color.ENDC}")
+            print(f"{Color.CYAN}Puedes usar las cuentas en Chrome (proxy Perú). "
+                  f"Cuando termines, pulsa Enter para cerrar este lote.{Color.ENDC}")
+            try:
+                input(">>> Presiona Enter para cerrar las ventanas de este lote <<<")
+            except EOFError:
+                pass
+            cerrar_ventanas.set()
+
             for future in as_completed(futures):
                 correo = futures[future]
                 try:
@@ -18976,20 +19113,14 @@ def iniciar_sesion_automatico_tidal(correos):
                     fail_count += 1
 
     total_login = sum(1 for m in managers if getattr(m, "login_ok", False))
-    total_export = sum(1 for m in managers if getattr(m, "export_ok", False))
-    total_vacias = sum(1 for m in managers if getattr(m, "sin_playlists", False))
-    total_eliminadas = sum(1 for m in managers if getattr(m, "eliminacion_ok", False))
 
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"   RESUMEN DEL INICIO DE SESIÓN AUTOMÁTICO")
+    print(f"   RESUMEN DEL LOGIN AUTOMÁTICO")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f" Cuentas procesadas: {total_cuentas}")
     print(f" Inicios de sesión correctos: {total_login}")
-    print(f" CSV exportados desde TuneMyMusic: {total_export}")
-    print(f" Cuentas detectadas sin playlists: {total_vacias}")
-    print(f" Cuentas eliminadas: {total_eliminadas}")
-    print(f" Procesos completos (login + exportación + eliminación): {success_count}")
-    print(f" Procesos incompletos: {fail_count}")
+    print(f" Procesos OK: {success_count}")
+    print(f" Procesos fallidos: {fail_count}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
 
     if fail_count and mantener_ventanas:
@@ -20291,7 +20422,7 @@ def menu_principal():
         print(" 7. Salir")
         print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
-        print(" 10. Iniciar sesión automática (Login automático en TIDAL / TMM)")
+        print(" 10. Iniciar sesión automática (Login automático)")
         print(" 11. Invitar al plan familiar (Titulares e Invitaciones Automáticas)")
         print(" 12. Verificar contraseñas IMAP registradas en passwords.txt")
         print(" 13. Validar y verificar lista de proxies (Nigeria / Perú)")
