@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -375,17 +376,76 @@ def resolver_enlace_worker(url: str, kind: str = "invite") -> str:
         return u
 
 
+_INVITE_QS_RUIDO = frozenset({
+    "lid", "utm", "utm_source", "utm_medium", "utm_campaign", "utm_term",
+    "utm_content", "fbclid", "gclid", "mc_cid", "mc_eid", "_ga",
+})
+
+
+def _invite_url_identidad(url: str) -> str:
+    """Identidad del invite: UUID de accept-invite, o upn= de ablink (no solo el path)."""
+    try:
+        p = urlparse((url or "").strip().split("#")[0])
+    except Exception:
+        return (url or "").strip().lower()
+    host_path = f"{(p.netloc or '').lower()}{(p.path or '').rstrip('/').lower()}"
+    try:
+        qs = parse_qs(p.query, keep_blank_values=True)
+    except Exception:
+        qs = {}
+    keep: list[str] = []
+    for k, vals in (qs or {}).items():
+        kl = (k or "").lower()
+        if kl in _INVITE_QS_RUIDO or kl.startswith("utm_"):
+            continue
+        for v in vals:
+            keep.append(f"{kl}={(v or '').strip()}")
+    keep.sort()
+    if keep:
+        return host_path + "?" + "&".join(keep)
+    return host_path
+
+
+def _email_en_url(url: str) -> str:
+    try:
+        qs = parse_qs(urlparse(url or "").query)
+    except Exception:
+        return ""
+    for key in ("email", "login_hint", "username", "user", "invitee"):
+        for val in qs.get(key) or []:
+            v = unquote(val or "").strip()
+            if "@" in v:
+                return v
+    return ""
+
+
 def reclamar_invites_para_aliases(
     aliases: list[str],
     max_age_minutes: int = 1440,
 ) -> tuple[dict[str, str], list[str]]:
     """Reclama invitaciones del worker. Devuelve (asignados, aliases para IMAP).
 
+    Un UUID por alias. Si el enlace trae email= de otro correo, no se asigna.
     Si el worker no tiene el enlace, el alias pasa a IMAP (FORWARD_TO → Gmail).
-    Antes, con imap_fallback=False, se perdían en silencio y la opción 4 no abría nada.
     """
     asignados: dict[str, str] = {}
     restantes: list[str] = []
+    usados_ident: set[str] = set()
+
+    def _tomar(al: str, enlace: str) -> bool:
+        if not enlace or "resetpass" in enlace.lower():
+            return False
+        ident = _invite_url_identidad(enlace)
+        em = _email_en_url(enlace)
+        if em and em.strip().lower() != al.strip().lower():
+            return False
+        if ident and ident in usados_ident:
+            return False
+        if ident:
+            usados_ident.add(ident)
+        asignados[al] = enlace
+        return True
+
     for a in aliases or []:
         al = (a or "").strip()
         if not al:
@@ -393,11 +453,26 @@ def reclamar_invites_para_aliases(
         if not worker_cubre_alias(al):
             restantes.append(al)
             continue
+        elegido = ""
+        for it in listar_invites_worker(al, max_age_minutes):
+            link = str((it or {}).get("link") or "").strip()
+            em = _email_en_url(link)
+            ident = _invite_url_identidad(link)
+            if ident and ident in usados_ident:
+                continue
+            if em and em.strip().lower() != al.strip().lower():
+                continue
+            if em and em.strip().lower() == al.strip().lower():
+                elegido = link
+                break
+            if not elegido:
+                elegido = link
+        if elegido and _tomar(al, elegido):
+            continue
         enlace = reclamar_desde_worker(
             al, "invite", max_age_minutes=max_age_minutes, silencioso=False,
         )
-        if enlace and "resetpass" not in enlace.lower():
-            asignados[al] = enlace
+        if enlace and _tomar(al, enlace):
             continue
         restantes.append(al)
     return asignados, restantes

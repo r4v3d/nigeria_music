@@ -204,15 +204,37 @@ def _format_summary(name: str, result: dict | None, error: str | None) -> str:
         return f"<b>{_html_esc(name)}</b> terminado (sin resumen)."
     ok = result.get("ok_list") or []
     fail = result.get("fail_list") or []
+    pwd_bad = result.get("pwd_incorrecta_list") or []
+    ya_usados = result.get("ya_usados_list") or []
     err = (result.get("error") or "").strip()
     lines = [
         f"<b>{_html_esc(_TITULOS.get(name, name))}</b> listo",
-        f"OK: {len(ok)} · Sin resultado: {len(fail)}",
     ]
+    if name == "op4" or pwd_bad or ya_usados:
+        extra = f"Aceptadas: {len(ok)} · Contraseña incorrecta: {len(pwd_bad)} · Errores: {len(fail)}"
+        if ya_usados:
+            extra += f" · Ya usadas: {len(ya_usados)}"
+        lines.append(extra)
+    else:
+        lines.append(f"OK: {len(ok)} · Sin resultado: {len(fail)}")
     if err:
         lines.append(f"\nMotivo:\n<code>{_html_esc(err[:600])}</code>")
+    if name == "op4" and ok:
+        lines.append("\nAceptadas:")
+        for c in ok[:25]:
+            lines.append(f"· {_html_esc(c)}")
+        if len(ok) > 25:
+            lines.append(f"· … +{len(ok) - 25}")
+    if pwd_bad:
+        lines.append("\nContraseña incorrecta:")
+        for c in pwd_bad[:25]:
+            lines.append(f"· {_html_esc(c)}")
+        if len(pwd_bad) > 25:
+            lines.append(f"· … +{len(pwd_bad) - 25}")
     if fail:
-        label = "Faltan en passwords.txt:" if name == "op12" else "Sin resultado:"
+        label = "Faltan en passwords.txt:" if name == "op12" else (
+            "Errores:" if name == "op4" else "Sin resultado:"
+        )
         lines.append(f"\n{label}")
         for c in fail[:25]:
             lines.append(f"· {_html_esc(c)}")

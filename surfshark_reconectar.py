@@ -14,7 +14,13 @@ import argparse
 import os
 import sys
 import time
+import unicodedata
 from pathlib import Path
+
+
+def _sin_acentos(s: str) -> str:
+    nfd = unicodedata.normalize("NFD", s or "")
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn").casefold().strip()
 
 
 def _exe_por_defecto() -> Path:
@@ -173,35 +179,71 @@ def _escribir_busqueda_surfshark(wnd, texto: str, timeout_s: float) -> bool:
 
 
 def _pulsar_resultado_ubicacion(wnd, texto_pais: str, timeout_s: float) -> bool:
-    """Busca en los resultados de la lista el país indicado y le hace clic."""
-    import time
-    texto_pais_norm = texto_pais.casefold().strip()
+    """Clic en el resultado de ubicación (Nigeria / Perú / Costa Rica), no en el buscador."""
+    texto_pais_norm = _sin_acentos(texto_pais)
+    tipos_ok = ("ListItem", "Button", "ListBoxItem", "DataItem")
     fin = time.time() + timeout_s
     while time.time() < fin:
+        candidatos = []
         try:
             for elem in wnd.descendants():
                 try:
                     info = elem.element_info
-                    tipo = info.control_type or ""
-                    name = (info.name or "").strip().casefold()
-                    
-                    # Buscamos en elementos tipo ListItem, Text, Button, Group o DataItem
-                    if tipo in ("Text", "ListItem", "Button", "Group", "DataItem", "ListBoxItem"):
-                        if name == texto_pais_norm or texto_pais_norm in name:
-                            # Hacer clic sobre el elemento encontrado
-                            try:
-                                elem.click_input()
-                            except Exception:
-                                try:
-                                    elem.invoke()
-                                except Exception:
-                                    pass
-                            return True
+                    tipo = (info.control_type or "").strip()
+                    name = (info.name or "").strip()
+                    name_cf = _sin_acentos(name)
+                    class_name = (info.class_name or "").strip().lower()
+                    if tipo in ("Edit", "TitleBar") or class_name == "textbox":
+                        continue
+                    if name_cf in ("search box", "search"):
+                        continue
+                    if tipo not in tipos_ok:
+                        continue
+                    if name_cf == texto_pais_norm or name_cf.startswith(texto_pais_norm + ",") or name_cf.startswith(texto_pais_norm + " "):
+                        candidatos.append((0, elem, name))
+                    elif texto_pais_norm in name_cf and "surfshark." not in name_cf:
+                        candidatos.append((1, elem, name))
                 except Exception:
                     continue
         except Exception:
-            pass
-        time.sleep(0.5)
+            candidatos = []
+        candidatos.sort(key=lambda x: x[0])
+        for _prio, elem, name in candidatos:
+            try:
+                elem.click_input()
+            except Exception:
+                try:
+                    elem.invoke()
+                except Exception:
+                    continue
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def _boton_desconectar_visible(wnd) -> bool:
+    try:
+        for btn in wnd.descendants(control_type="Button"):
+            t = _texto_control(btn).casefold()
+            if t in ("desconectar", "disconnect"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _esperar_ui_conectado(wnd, ubicacion: str | None, timeout_s: float, verbose: bool) -> bool:
+    """Espera a que Surfshark muestre Desconectar (túnel arriba), no solo el clic."""
+    fin = time.time() + max(4.0, timeout_s)
+    while time.time() < fin:
+        if _boton_desconectar_visible(wnd):
+            # El buscador sigue teniendo «nigeria»; no usarlo como prueba de país.
+            if verbose:
+                print("  Surfshark: UI conectada (botón Desconectar visible).")
+            return True
+        time.sleep(0.6)
+    if verbose:
+        print("  Surfshark: no apareció «Desconectar» tras el clic (¿no conectó?).")
     return False
 
 
@@ -213,6 +255,7 @@ def _ciclo_ui_surfshark(
     verbose: bool,
     ubicacion: str | None = None,
     solo_desconectar: bool = False,
+    esperar_conectado: bool = True,
 ) -> bool:
     """Desconectar → espera → Conexión rápida o búsqueda de ubicación específica."""
     wnd = _ventana_principal(app)
@@ -223,10 +266,12 @@ def _ciclo_ui_surfshark(
         pass
 
     desconectar = ("Desconectar", "Disconnect")
+    # Si ya está desconectado, no gastar 15s buscando el botón.
+    timeout_desc = 2.5 if not solo_desconectar else min(8.0, timeout_busqueda)
 
     if verbose:
         print("  Surfshark: buscando «Desconectar»…")
-    if _pulsar_boton_por_textos(wnd, desconectar, timeout_busqueda):
+    if _pulsar_boton_por_textos(wnd, desconectar, timeout_desc):
         if verbose:
             print("  Surfshark: pulsado Desconectar.")
         if solo_desconectar:
@@ -249,10 +294,12 @@ def _ciclo_ui_surfshark(
         if _escribir_busqueda_surfshark(wnd, ubicacion, timeout_busqueda):
             if verbose:
                 print(f"  Surfshark: escrito «{ubicacion}». Buscando el resultado en la lista…")
-            time.sleep(1.5)  # Espera a que se filtre la lista
+            time.sleep(1.2)
             if _pulsar_resultado_ubicacion(wnd, ubicacion, timeout_busqueda):
                 if verbose:
                     print(f"  Surfshark: seleccionado «{ubicacion}» para conectar.")
+                if esperar_conectado:
+                    return _esperar_ui_conectado(wnd, ubicacion, 28.0, verbose)
                 return True
             else:
                 if verbose:
@@ -274,6 +321,8 @@ def _ciclo_ui_surfshark(
         if _pulsar_boton_por_textos(wnd, rapida, timeout_busqueda):
             if verbose:
                 print("  Surfshark: pulsado Conexión rápida.")
+            if esperar_conectado:
+                return _esperar_ui_conectado(wnd, ubicacion, 28.0, verbose)
             return True
         if verbose:
             print("  Surfshark: no se encontró «Conexión rápida».")
@@ -289,6 +338,7 @@ def ejecutar_reconexion_surfshark(
     verbose: bool = True,
     ubicacion: str | None = None,
     solo_desconectar: bool = False,
+    esperar_conectado: bool = True,
 ) -> bool:
     """
     Conecta o inicia Surfshark y ejecuta Desconectar → espera → Ubicación específica o Conexión rápida.
@@ -324,6 +374,7 @@ def ejecutar_reconexion_surfshark(
             verbose=verbose,
             ubicacion=ubicacion,
             solo_desconectar=solo_desconectar,
+            esperar_conectado=esperar_conectado and not solo_desconectar,
         )
     except Exception as e:
         if verbose:
@@ -372,6 +423,11 @@ def main() -> None:
         action="store_true",
         help="Solo desconectar la VPN de Surfshark, sin volver a conectar.",
     )
+    parser.add_argument(
+        "--no-esperar-conectado",
+        action="store_true",
+        help="No esperar a que aparezca «Desconectar» tras pulsar la ubicación.",
+    )
     args = parser.parse_args()
 
     ok = ejecutar_reconexion_surfshark(
@@ -382,6 +438,7 @@ def main() -> None:
         verbose=True,
         ubicacion=args.ubicacion,
         solo_desconectar=args.solo_desconectar,
+        esperar_conectado=not args.no_esperar_conectado,
     )
     sys.exit(0 if ok else 3)
 

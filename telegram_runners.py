@@ -381,7 +381,9 @@ def ejecutar_opcion4(
         else:
             print(f"    [SIN enlace] {c}")
 
-    enlaces_map = {c: enlaces_map[c] for c in correos if enlaces_map.get(c)}
+    enlaces_map = S._invite_filtrar_enlaces_unicos(
+        {c: enlaces_map[c] for c in correos if enlaces_map.get(c)}
+    )
     if enlaces_map:
         try:
             path_links = S.guardar_enlaces_en_linksextraidos(enlaces_map, merge=True)
@@ -391,15 +393,21 @@ def ejecutar_opcion4(
 
     sin_enlace = [c for c in correos if not enlaces_map.get(c)]
     ok_list: list[str] = []
+    ya_usados_list: list[str] = []
+    pwd_incorrecta_list: list[str] = []
     fail_list: list[str] = list(sin_enlace)
 
     if not enlaces_map:
         print(">>> No se encontró ningún enlace de invitación.")
-        S._imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
+        S._imprimir_resumen_opcion4(
+            correos, ok_list, fail_list, sin_enlace, ya_usados_list, pwd_incorrecta_list
+        )
         return {
             "ok_list": ok_list,
             "fail_list": fail_list,
             "sin_enlace": sin_enlace,
+            "ya_usados_list": ya_usados_list,
+            "pwd_incorrecta_list": pwd_incorrecta_list,
             "enlaces": {},
         }
 
@@ -430,11 +438,15 @@ def ejecutar_opcion4(
     if sin_pwd and not proxies_ng:
         print("[Error] Cuentas sin registrar y sin proxies NG.")
         fail_list.extend(list(enlaces_map.keys()))
-        S._imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
+        S._imprimir_resumen_opcion4(
+            correos, ok_list, fail_list, sin_enlace, ya_usados_list, pwd_incorrecta_list
+        )
         return {
             "ok_list": ok_list,
             "fail_list": fail_list,
             "sin_enlace": sin_enlace,
+            "ya_usados_list": ya_usados_list,
+            "pwd_incorrecta_list": pwd_incorrecta_list,
             "enlaces": dict(enlaces_map),
         }
 
@@ -442,21 +454,29 @@ def ejecutar_opcion4(
     if con_pwd and not proxies_pe:
         print("[Error] Cuentas con login y sin proxies PE.")
         fail_list.extend(list(enlaces_map.keys()))
-        S._imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
+        S._imprimir_resumen_opcion4(
+            correos, ok_list, fail_list, sin_enlace, ya_usados_list, pwd_incorrecta_list
+        )
         return {
             "ok_list": ok_list,
             "fail_list": fail_list,
             "sin_enlace": sin_enlace,
+            "ya_usados_list": ya_usados_list,
+            "pwd_incorrecta_list": pwd_incorrecta_list,
             "enlaces": dict(enlaces_map),
         }
     if not proxies_pe and not proxies_ng:
         print("[Error] Sin proxies PE ni NG.")
         fail_list.extend(list(enlaces_map.keys()))
-        S._imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
+        S._imprimir_resumen_opcion4(
+            correos, ok_list, fail_list, sin_enlace, ya_usados_list, pwd_incorrecta_list
+        )
         return {
             "ok_list": ok_list,
             "fail_list": fail_list,
             "sin_enlace": sin_enlace,
+            "ya_usados_list": ya_usados_list,
+            "pwd_incorrecta_list": pwd_incorrecta_list,
             "enlaces": dict(enlaces_map),
         }
 
@@ -484,10 +504,8 @@ def ejecutar_opcion4(
             p_ng = S.GLOBAL_NG_PROXY_POOL.obtener_proxy_unico(espera_s=60.0)
             if not p_ng and proxies_ng:
                 p_ng = proxies_ng[(idx - 1) % len(proxies_ng)]
-        return correo, bool(
-            S.abrir_enlace_familia_con_autocierre(
-                enlace, correo, proxy_pe=p_pe, proxy_ng=p_ng, headless=headless
-            )
+        return correo, S.abrir_enlace_familia_con_autocierre(
+            enlace, correo, proxy_pe=p_pe, proxy_ng=p_ng, headless=headless
         )
 
     for n_oleada, oleada in enumerate(oleadas, 1):
@@ -506,9 +524,15 @@ def ejecutar_opcion4(
             for future in as_completed(futures):
                 correo_f = futures[future]
                 try:
-                    c_res, exito = future.result()
-                    if exito:
+                    c_res, res_status = future.result()
+                    if res_status in ("ok", True):
                         ok_list.append(c_res)
+                    elif res_status == "pwd_incorrecta":
+                        pwd_incorrecta_list.append(c_res)
+                    elif res_status == "invite_ajeno":
+                        fail_list.append(c_res)
+                    elif res_status in ("ya_usado", "previamente_utilizado", "caducado"):
+                        ya_usados_list.append(c_res)
                     else:
                         fail_list.append(c_res)
                 except Exception as ex_h:
@@ -517,11 +541,15 @@ def ejecutar_opcion4(
         if n_oleada < len(oleadas):
             time.sleep(1.5)
 
-    S._imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace)
+    S._imprimir_resumen_opcion4(
+        correos, ok_list, fail_list, sin_enlace, ya_usados_list, pwd_incorrecta_list
+    )
     return {
         "ok_list": ok_list,
         "fail_list": fail_list,
         "sin_enlace": sin_enlace,
+        "ya_usados_list": ya_usados_list,
+        "pwd_incorrecta_list": pwd_incorrecta_list,
         "origen": origen_enlaces,
         "enlaces": dict(enlaces_map),
     }

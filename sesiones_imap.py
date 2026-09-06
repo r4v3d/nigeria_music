@@ -15,6 +15,7 @@ import requests
 import json
 import random
 import threading
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 import queue
 import contextlib
 import gc
@@ -39,6 +40,9 @@ if sys.stdout.encoding != 'utf-8':
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LINKS_EXTRAIDOS_PATH = SCRIPT_DIR / "linksextraidos.txt"
+
+# Sin proxies residenciales: Chrome sale por la IP real (o la VPN local, si la hay).
+MODO_SIN_PROXY = True
 
 # Gmail rechaza las conexiones cuando se superan ~15 sesiones IMAP simultáneas por buzón.
 # Con lotes de 20 (opción 9) un semáforo de 5 dejaba a muchos hilos minutos en cola: cuando
@@ -526,19 +530,22 @@ def _parse_linea_cuenta_sesiones(line: str) -> tuple[str, str] | None:
     if not line or line.startswith("#"):
         return None
     if "\t" in line:
-        parts = [p.strip() for p in line.split("\t") if p.strip()]
-    else:
-        line_normalized = line.replace(",", " ").replace("=", " ")
-        parts = line_normalized.split()
+        correo, pwd = line.split("\t", 1)
+        correo = correo.strip().strip('"').strip("'")
+        pwd = pwd.strip().strip('"').strip("'")
+        if not correo or "@" not in correo or not pwd:
+            return None
+        correo = re.split(r'[\s,;]+', correo, maxsplit=1)[0].strip()
+        if "@" not in correo:
+            return None
+        return correo, pwd
+
+    line_normalized = line.replace(",", " ").replace("=", " ")
+    parts = line_normalized.split()
     if len(parts) < 2:
         return None
     correo = parts[0].strip().strip('"').strip("'")
-    if "\t" in line:
-        pwd = "\t".join(parts[1:]).strip().strip('"').strip("'")
-        if "\t" in pwd:
-            pwd = parts[1].strip().strip('"').strip("'")
-    else:
-        pwd = " ".join(parts[1:]).strip().strip('"').strip("'")
+    pwd = " ".join(parts[1:]).strip().strip('"').strip("'")
     if not correo or "@" not in correo or not pwd:
         return None
     correo = re.split(r'[\s,;]+', correo, maxsplit=1)[0].strip()
@@ -562,7 +569,7 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
     path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
     if path_cuentas.exists():
         try:
-            for line in path_cuentas.read_text(encoding="utf-8").splitlines():
+            for line in path_cuentas.read_text(encoding="utf-8-sig").splitlines():
                 parsed = _parse_linea_cuenta_sesiones(line)
                 if not parsed:
                     continue
@@ -598,7 +605,7 @@ def cargar_mapa_cuentas_sesiones() -> dict[str, str]:
     if not path_cuentas.exists():
         return cuentas_map
     try:
-        for line in path_cuentas.read_text(encoding="utf-8").splitlines():
+        for line in path_cuentas.read_text(encoding="utf-8-sig").splitlines():
             parsed = _parse_linea_cuenta_sesiones(line)
             if not parsed:
                 continue
@@ -715,9 +722,13 @@ def guardar_credencial_cuenta(correo: str, pwd: str) -> bool:
             return False
 
 
-# Patrón del enlace "Inicia sesión con contraseña" (Tidal lo pinta como texto suelto, no <button>).
+# Solo el enlace OTP→password. Un padre con "Inicia Sesión" + "¿Olvidaste tu contraseña?"
+# coincidía con el patrón amplio y el clic vaciaba el campo.
 _PATRON_MODO_CONTRASENA_INVITE = (
-    r"(?:inicia|iniciar|usar|use|sign\s*in|log\s*in|entrar)[^\n]{0,24}(?:contrase|password)"
+    r"(?:inicia(?:r)?\s*(?:sesi[oó]n\s*)?con\s*(?:tu\s*)?(?:contrase|password)"
+    r"|(?:usar|use)\s*(?:tu\s*|your\s*)?(?:contrase|password)"
+    r"|log\s*in\s*with\s*(?:your\s*)?password"
+    r"|sign\s*in\s*with\s*(?:your\s*)?password)"
 )
 
 
@@ -1016,7 +1027,7 @@ def _invite_hay_algo_salio_mal(page) -> bool:
 
 
 def _invite_continuar_esta_cargando(page) -> bool:
-    """True si el CTA Continuar está en estado loading (...)."""
+    """True si Continuar / Inicia sesión está en spinner (Tidal quita el texto y anima puntos)."""
     try:
         return bool(page.evaluate("""() => {
             const visible = (el) => {
@@ -1030,15 +1041,130 @@ def _invite_continuar_esta_cargando(page) -> bool:
                 const t = (b.innerText || b.textContent || '').replace(/\\s+/g, ' ').trim();
                 const aria = (b.getAttribute('aria-busy') || '').toLowerCase();
                 const dis = b.disabled || b.getAttribute('aria-disabled') === 'true';
+                const r = b.getBoundingClientRect();
+                const grande = r.width >= 180 && r.height >= 36;
+                const spinner = b.querySelector(
+                    'svg, canvas, img, [class*="spin" i], [class*="load" i], [class*="dot" i], [class*="loader" i]'
+                );
+                let animando = false;
+                try {
+                    animando = typeof b.getAnimations === 'function'
+                        && b.getAnimations({subtree: true}).some(a => a.playState === 'running');
+                } catch (e) {}
                 if (aria === 'true') return true;
-                // Botón grande sin texto útil / solo puntos = loading
+                if (spinner && (t.length < 3 || /loading|cargando/i.test(t))) return true;
+                if (grande && t.length === 0) return true;
+                if (grande && /^[·.•●…]{1,8}$/.test(t)) return true;
+                if (grande && /loading|cargando/i.test(t)) return true;
+                const title = (b.getAttribute('title') || b.getAttribute('aria-label') || '').toLowerCase();
+                if (grande && /loading|cargando/.test(title)) return true;
+                if (grande && animando && (t.length < 3 || /loading|cargando/i.test(t))) return true;
                 if (dis && (t === '' || /^\\.{1,6}$/.test(t) || /loading|cargando/i.test(t))) return true;
-                if (/^continuar$|^continue$/i.test(t) && (dis || aria === 'true')) return true;
+                if (/^(continuar|continue|inicia(?:r)?\\s*sesi[oó]n|log\\s*in)$/i.test(t)
+                    && (dis || aria === 'true' || spinner)) return true;
             }
+            if (Array.from(document.querySelectorAll('[aria-busy="true"]')).some(visible)) return true;
             return false;
         }"""))
     except Exception:
         return False
+
+
+_INVITE_PWD_GRACE_S = 8.0
+
+
+def _invite_pwd_sigue_esperando_tidal(page, estado: dict) -> bool:
+    """True mientras Tidal aún no respondió al Inicia Sesión (spinner o gracia post-clic)."""
+    if _invite_continuar_esta_cargando(page):
+        return True
+    if not estado.get("pwd_enviada"):
+        return False
+    ts = float(estado.get("pwd_enviada_ts") or 0)
+    return bool(ts) and (time.time() - ts) < _INVITE_PWD_GRACE_S
+
+
+def _invite_post_clave_recibida(page, estado: dict | None = None) -> bool:
+    if estado and estado.get("login_pwd_en_post") is True:
+        return True
+    try:
+        return bool(getattr(page, "_tidal_invite_pwd_post", False))
+    except Exception:
+        return False
+
+
+def _invite_debe_abortar_pwd_incorrecta(page, estado: dict) -> bool:
+    """Solo abortar si Tidal rechazó DESPUÉS de recibir la clave del archivo."""
+    if estado.get("registro_nuevo") or not estado.get("pwd_enviada"):
+        return False
+    if _invite_pwd_sigue_esperando_tidal(page, estado):
+        return False
+    if not _invite_post_clave_recibida(page, estado):
+        return False
+    return _invite_detectar_pwd_incorrecta(page)
+
+
+def _invite_marcar_login_enviado(estado: dict) -> None:
+    estado["pwd_enviada"] = True
+    estado["pwd_enviada_ts"] = time.time()
+    estado["aviso_login_esperando"] = False
+
+
+def _invite_avisar_pwd_incorrecta(correo: str, estado: dict) -> None:
+    if estado.get("aviso_pwd_incorrecta"):
+        return
+    estado["aviso_pwd_incorrecta"] = True
+    print(f"    {Color.FAIL}[Invitación] [{correo}] Contraseña incorrecta en Tidal. "
+          f"Se omite al instante (sin reintentos).{Color.ENDC}")
+
+
+def _invite_esperar_respuesta_login(page, correo: str, estado: dict) -> str:
+    """Tras Inicia Sesión: no declarar error mientras el botón sigue cargando."""
+    if not estado.get("aviso_login_esperando"):
+        estado["aviso_login_esperando"] = True
+        print(f"    [Invitación] [{correo}] Login enviado; esperando respuesta de Tidal...",
+              flush=True)
+    t0 = time.time()
+    while time.time() - t0 < 22.0:
+        if _invite_detectar_exito(page):
+            return "ok"
+        if _invite_queda_boton_aceptar(page):
+            if _invite_pulsar_aceptar(page):
+                print(f"    [Invitación] [{correo}] Pulsado botón de aceptación.")
+                if _invite_esperar_ui(page, [lambda: _invite_detectar_exito(page)], max_s=4.0):
+                    return "ok"
+                return "progreso"
+        if not _invite_pwd_sigue_esperando_tidal(page, estado):
+            break
+        time.sleep(0.15)
+    if _invite_detectar_exito(page):
+        return "ok"
+    if _invite_queda_boton_aceptar(page) and _invite_pulsar_aceptar(page):
+        print(f"    [Invitación] [{correo}] Pulsado botón de aceptación.")
+        if _invite_esperar_ui(page, [lambda: _invite_detectar_exito(page)], max_s=4.0):
+            return "ok"
+        return "progreso"
+    if _invite_detectar_pwd_incorrecta(page):
+        if _invite_post_clave_recibida(page, estado):
+            _invite_avisar_pwd_incorrecta(correo, estado)
+            return "pwd_incorrecta"
+        n = int(estado.get("pwd_vue_reintentos") or 0) + 1
+        estado["pwd_vue_reintentos"] = n
+        print(f"    {Color.WARNING}[Invitación] [{correo}] Tidal rechazó el login pero "
+              f"no recibió la clave del archivo (Vue vacío). "
+              f"Reescribiendo ({n}/3)...{Color.ENDC}", flush=True)
+        estado["pwd_enviada"] = False
+        estado["aviso_pwd_incorrecta"] = False
+        estado["aviso_login_esperando"] = False
+        if n >= 3:
+            _invite_avisar_pwd_incorrecta(correo, estado)
+            return "pwd_incorrecta"
+        return "progreso"
+    if _invite_debe_abortar_pwd_incorrecta(page, estado):
+        _invite_avisar_pwd_incorrecta(correo, estado)
+        return "pwd_incorrecta"
+    if _invite_pwd_sigue_esperando_tidal(page, estado):
+        return "esperar"
+    return "progreso"
 
 
 def _invite_limpiar_cajas_otp(page) -> None:
@@ -1212,18 +1338,114 @@ def _invite_hay_pantalla_codigo(page) -> bool:
                 return r.width > 1 && r.height > 1;
             };
             const txt = (document.body ? document.body.innerText : '').toLowerCase();
+            const pwdLogin = /introduce tu contrase|enter your password|olvidaste tu contrase|forgot (your )?password/i.test(txt);
+            const switchACodigo = /iniciar sesi[oó]n con c[oó]digo|log in with (a )?code|sign in with (a )?code/i.test(txt);
+            const pwdEl = Array.from(document.querySelectorAll(
+                'input[type="password"], input[autocomplete="current-password"], input[placeholder*="contrase" i], input[placeholder*="password" i]'
+            )).filter(visible).filter(el => (el.getAttribute('maxlength') || '') !== '1');
+            if (pwdLogin && pwdEl.length) return false;
+            if (pwdEl.some(el => el.getBoundingClientRect().width >= 40)) return false;
             const esVerify = /verifica tu correo|verify your email|introduce el c[oó]digo|c[oó]digo de 6 d[ií]gitos|6-digit code|reenviar el c[oó]digo|resend code|we've sent|te hemos enviado/i.test(txt);
             const boxes = Array.from(document.querySelectorAll(
-                'input[maxlength=\"1\"], input[autocomplete=\"one-time-code\"], input[data-test*=\"otp\" i], input[inputmode=\"numeric\"]'
+                'input[maxlength=\"1\"], input[autocomplete=\"one-time-code\"], input[data-test*=\"otp\" i], input[inputmode=\"numeric\"]:not([type=\"password\"])'
             )).filter(visible);
+            // "Iniciar sesión con código" / "¿Olvidaste tu contraseña?" = formulario de clave, no OTP.
+            if ((pwdLogin || switchACodigo) && boxes.length < 4) return false;
             if (boxes.length >= 4) return true;
             if (boxes.length >= 1 && esVerify) return true;
-            // Sin cajas estándar: el copy de Tidal basta (opción 4 no reclamaba OTP)
-            if (esVerify) return true;
+            if (esVerify && pwdEl.length === 0) return true;
             return false;
         }"""))
     except Exception:
         return False
+
+
+def _invite_es_pantalla_password_login(page) -> bool:
+    """True en 'Introduce tu contraseña' + Inicia Sesión (cuenta ya registrada)."""
+    try:
+        return bool(page.evaluate("""() => {
+            const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden'
+                    || parseFloat(st.opacity || '1') < 0.05) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 1 && r.height > 1;
+            };
+            const txt = (document.body ? document.body.innerText : '').toLowerCase();
+            const pwdEl = Array.from(document.querySelectorAll(
+                'input[type="password"], input[autocomplete="current-password"], input[placeholder*="contrase" i], input[placeholder*="password" i], input[aria-label*="contrase" i], input[aria-label*="password" i]'
+            )).filter(visible).filter(el => (el.getAttribute('maxlength') || '') !== '1');
+            const otpBoxes = Array.from(document.querySelectorAll(
+                'input[maxlength="1"], input[autocomplete="one-time-code"]'
+            )).filter(visible);
+            if (otpBoxes.length >= 4) return false;
+            const marcaPwd = /introduce tu contrase|enter your password|olvidaste tu contrase|forgot (your )?password|iniciar sesi[oó]n con c[oó]digo|log in with (a )?code/i.test(txt);
+            const btnLogin = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+                .filter(visible)
+                .some(el => /^(inicia(?:r)?\\s*sesi[oó]n|log\\s*in|sign\\s*in|login)$/i.test(
+                    (el.innerText || el.textContent || el.value || '').trim()
+                ));
+            return Boolean(pwdEl.length && (marcaPwd || btnLogin));
+        }"""))
+    except Exception:
+        return False
+
+
+def _invite_pwd_selectors() -> list:
+    return [
+        'input[autocomplete="current-password"]',
+        'input[type="password"]',
+        'input[name="password"]',
+        'input[placeholder*="contrase" i]',
+        'input[placeholder*="password" i]',
+        'input[aria-label*="contrase" i]',
+        'input[aria-label*="password" i]',
+    ]
+
+
+def _invite_localizar_password_login(page):
+    """Localiza el input de contraseña del login (placeholder incluido; ignora OTP)."""
+    loc = encontrar_locator_en_frames(page, _invite_pwd_selectors())
+    if loc:
+        try:
+            if (loc.get_attribute("maxlength", timeout=400) or "").strip() == "1":
+                loc = None
+        except Exception:
+            pass
+    if loc:
+        return loc
+    try:
+        frames = list(page.frames or [])
+    except Exception:
+        frames = []
+    try:
+        main = page.main_frame
+        if main is not None:
+            frames = [main] + [f for f in frames if f != main]
+    except Exception:
+        pass
+    if not frames:
+        frames = [page]
+    pat = re.compile(r"contrase|password", re.I)
+    for fr in frames[:5]:
+        for getter in ("get_by_placeholder", "get_by_label"):
+            try:
+                cand = getattr(fr, getter)(pat)
+                n = cand.count()
+            except Exception:
+                continue
+            for idx in range(n):
+                el = cand.nth(idx)
+                try:
+                    if not el.is_visible(timeout=0):
+                        continue
+                    if (el.get_attribute("maxlength", timeout=400) or "").strip() == "1":
+                        continue
+                except Exception:
+                    continue
+                return el
+    return None
 
 
 def _invite_url_es_pagina_legal(url: str) -> bool:
@@ -1384,6 +1606,51 @@ def _invite_es_formulario_registro(page) -> bool:
             );
             const dobHint = /fecha de nacimiento|date of birth|cumpleaños|birthday|nacimiento|crea tu cuenta|create your account/i.test(t);
             return btnSus && (selects >= 2 || !!dayish || dobHint);
+        }"""))
+    except Exception:
+        return False
+
+
+def _tidal_es_login_cuenta_existente(page) -> bool:
+    """True si Tidal ya conoce el correo: pide contraseña o código de login (no el alta).
+
+    Tras Continuar, una cuenta registrada aparece de dos formas:
+    - 'Iniciar sesión' + campo contraseña + '¿Olvidaste tu contraseña?'
+    - 'Revisa tu correo electrónico' + 6 dígitos + 'Inicia sesión con contraseña'
+    El OTP de alta (tras Suscríbete) no trae el enlace de contraseña ni 'olvidaste'.
+    """
+    try:
+        if not page or page.is_closed():
+            return False
+        if _invite_es_formulario_registro(page):
+            return False
+        return bool(page.evaluate("""() => {
+            const t = (document.body && document.body.innerText || '').toLowerCase();
+            if (/crea tu cuenta|create your account|fecha de nacimiento|date of birth/.test(t)
+                && /suscr[ií]bete|subscribe|crear cuenta|create account/.test(t)) {
+                return false;
+            }
+            const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden'
+                    || parseFloat(st.opacity || '1') < 0.05) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 4 && r.height > 4;
+            };
+            const pwd = Array.from(document.querySelectorAll(
+                'input[type="password"], input[name="password"]'
+            )).some(visible);
+            const forgot = /olvidaste tu contrase|forgot (your )?password/.test(t);
+            const modoPwd = /inicia(?:r)? sesi[oó]n con contrase|sign in with password|log in with password/.test(t);
+            const modoCodigo = /inicia(?:r)? sesi[oó]n con c[oó]digo|sign in with (a )?code|log in with (a )?code/.test(t);
+            const cajas = Array.from(document.querySelectorAll(
+                'input[maxlength="1"], input[autocomplete="one-time-code"]'
+            )).filter(visible).length >= 4;
+            const revisa = /revisa tu correo|check your email|te hemos enviado un c[oó]digo/.test(t);
+            if (pwd || forgot || modoCodigo) return true;
+            if (modoPwd && (cajas || revisa)) return true;
+            return false;
         }"""))
     except Exception:
         return False
@@ -1748,6 +2015,26 @@ def _invite_pulsar_suscribete(page) -> bool:
 
 
 def _invite_clic_modo_contrasena(page) -> bool:
+    """Clic en el enlace exacto 'Inicia sesión con contraseña' (como en el login manual)."""
+    try:
+        loc = page.get_by_text(
+            re.compile(r"^inicia(?:r)?\s+sesi[oó]n\s+con\s+(?:tu\s+)?contrase\w*$", re.I)
+        )
+        n = loc.count()
+        for i in range(min(n, 5)):
+            el = loc.nth(i)
+            try:
+                if el.is_visible(timeout=0):
+                    el.click(timeout=2500)
+                    return True
+            except Exception:
+                try:
+                    el.click(timeout=2000, force=True)
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
     coords = _invite_eval_modo_contrasena(page, "coords")
     if coords:
         try:
@@ -1990,6 +2277,216 @@ def _invite_pantalla_correo_con_continuar(page) -> bool:
         return False
 
 
+_INVITE_QS_RUIDO = frozenset({
+    "lid", "utm", "utm_source", "utm_medium", "utm_campaign", "utm_term",
+    "utm_content", "fbclid", "gclid", "mc_cid", "mc_eid", "_ga",
+})
+
+
+def _invite_url_identidad(url: str) -> str:
+    """Identidad del invite: UUID de accept-invite, o upn= de ablink (no solo el path).
+
+    Todos los tracking Tidal son ablink.info.tidal.com/ls/click; lo que los distingue
+    es ?upn=.... Ignorar eso hacía que 20 enlaces distintos se omitieran como duplicados.
+    """
+    try:
+        p = urlparse((url or "").strip().split("#")[0])
+    except Exception:
+        return (url or "").strip().lower()
+    host_path = f"{(p.netloc or '').lower()}{(p.path or '').rstrip('/').lower()}"
+    try:
+        qs = parse_qs(p.query, keep_blank_values=True)
+    except Exception:
+        qs = {}
+    keep: list[str] = []
+    for k, vals in (qs or {}).items():
+        kl = (k or "").lower()
+        if kl in _INVITE_QS_RUIDO or kl.startswith("utm_"):
+            continue
+        for v in vals:
+            keep.append(f"{kl}={(v or '').strip()}")
+    keep.sort()
+    if keep:
+        return host_path + "?" + "&".join(keep)
+    return host_path
+
+
+def _invite_filtrar_enlaces_unicos(enlaces_map: dict[str, str]) -> dict[str, str]:
+    """Un UUID por cuenta. Descarta invites cuyo email= es de otro alias."""
+    out: dict[str, str] = {}
+    vistos: dict[str, str] = {}
+    for c, u in list((enlaces_map or {}).items()):
+        if not u:
+            continue
+        em = _invite_email_en_url(u)
+        if em and not correos_iguales_exacto(em, c):
+            print(
+                f"    {Color.WARNING}[Enlaces] {c}: el invite es de {em}, se omite.{Color.ENDC}"
+            )
+            continue
+        ident = _invite_url_identidad(u)
+        if ident and ident in vistos:
+            print(
+                f"    {Color.WARNING}[Enlaces] {c}: mismo invite que {vistos[ident]} "
+                f"— se omite (Tidal bloquearía el otro correo).{Color.ENDC}"
+            )
+            continue
+        out[c] = u
+        if ident:
+            vistos[ident] = c
+    return out
+
+
+def _invite_email_en_url(url: str) -> str:
+    try:
+        qs = parse_qs(urlparse(url or "").query)
+    except Exception:
+        return ""
+    for key in ("email", "login_hint", "username", "user", "invitee"):
+        for val in qs.get(key) or []:
+            v = unquote(val or "").strip()
+            if "@" in v:
+                return v
+    return ""
+
+
+def _invite_email_en_pagina(page) -> str:
+    """Correo que Tidal tiene bloqueado en authorize (URL o input)."""
+    try:
+        em = _invite_email_en_url(page.url or "")
+    except Exception:
+        em = ""
+    if em:
+        return em
+    try:
+        return str(page.evaluate("""() => {
+            const el = document.querySelector(
+                'input[type="email"], input[name="email"], input[autocomplete="email"], #email, input[name="username"]'
+            );
+            return (el && el.value) ? String(el.value).trim() : '';
+        }""") or "")
+    except Exception:
+        return ""
+
+
+def _invite_authorize_con_email(url: str, correo: str) -> str:
+    """Misma URL OAuth, con email= de ESTA cuenta (no el invitee de otro alias)."""
+    correo = (correo or "").strip()
+    if not correo or not url:
+        return url
+    try:
+        p = urlparse(url)
+    except Exception:
+        return url
+    if "login.tidal.com" not in (p.netloc or "").lower():
+        return url
+    if "/authorize" not in (p.path or "").lower() and "/signin" not in (p.path or "").lower():
+        return url
+    qs = parse_qs(p.query, keep_blank_values=True)
+    qs["email"] = [correo]
+    qs["disableEmailInput"] = ["true"]
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(qs, doseq=True), p.fragment))
+
+
+def _invite_asegurar_email_cuenta(page, correo: str, estado: dict) -> bool:
+    """Si el invite abrió el login de OTRO alias, reescribe email= y no pulsa Continuar aún."""
+    actual = _invite_email_en_pagina(page)
+    if not actual or correos_iguales_exacto(actual, correo):
+        return False
+    if estado.get("email_forzado_a") and correos_iguales_exacto(estado.get("email_forzado_a"), correo):
+        return False
+    print(
+        f"    {Color.WARNING}[Invitación] [{correo}] Tidal abrió el login de '{actual}'. "
+        f"Corrigiendo al correo de esta oleada...{Color.ENDC}",
+        flush=True,
+    )
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    nueva = _invite_authorize_con_email(url, correo)
+    estado["email_forzado_a"] = correo
+    if nueva and nueva != url and "login.tidal.com" in nueva.lower():
+        try:
+            page.goto(nueva, wait_until="domcontentloaded", timeout=25000)
+            time.sleep(0.35)
+            return True
+        except Exception:
+            pass
+    try:
+        page.evaluate(
+            """(em) => {
+                const el = document.querySelector(
+                    'input[type="email"], input[name="email"], input[autocomplete="email"], #email'
+                );
+                if (!el) return;
+                el.removeAttribute('disabled');
+                el.removeAttribute('readonly');
+                el.readOnly = false;
+                el.disabled = false;
+                const proto = window.HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(el, em);
+                else el.value = em;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            correo,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _invite_pulsar_inicia_sesion(page) -> bool:
+    """Pulsa solo Inicia sesión / Log in. Nunca Continuar (eso reenvía el correo/OTP)."""
+    if _invite_continuar_esta_cargando(page):
+        return False
+    try:
+        loc = page.get_by_role(
+            "button",
+            name=re.compile(r"^(inicia(?:r)?\s*sesi[oó]n|log\s*in|sign\s*in|login)$", re.I),
+        )
+        if loc.count() > 0:
+            btn = loc.first
+            if btn.is_visible(timeout=0) and btn.is_enabled(timeout=0):
+                btn.click(timeout=2500)
+                print("    [Invitación] Pulsado CTA de login: Inicia Sesión")
+                return True
+    except Exception:
+        pass
+    try:
+        clicked = page.evaluate("""() => {
+            const esCodigo = (t) => /c[oó]digo|code|otp|one[- ]?time|contrase/i.test(t)
+                && /c[oó]digo|code|otp/.test(t);
+            const visible = (el) => {
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden'
+                    || parseFloat(st.opacity || '1') < 0.1) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 2 && r.height > 2;
+            };
+            const re = /^(inicia(?:r)?\\s*sesi[oó]n|log\\s*in|sign\\s*in|login)$/i;
+            const candidatos = Array.from(document.querySelectorAll(
+                'button, [role="button"], input[type="submit"]'
+            )).filter(visible);
+            const hit = candidatos.find(el => {
+                const t = (el.innerText || el.textContent || el.value || '').trim();
+                return re.test(t) && !esCodigo(t)
+                    && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+            });
+            if (!hit) return null;
+            hit.click();
+            return (hit.innerText || hit.textContent || 'login').trim();
+        }""")
+        if clicked:
+            print(f"    [Invitación] Pulsado CTA de login: {clicked}")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _invite_pulsar_continuar_o_login(page) -> bool:
     """Pulsa Continuar / Inicia Sesión. NUNCA 'Iniciar sesión con código'."""
     try:
@@ -2026,6 +2523,9 @@ def _invite_pulsar_continuar_o_login(page) -> bool:
             for (const re of exactos) {
                 const hit = candidatos.find(x => re.test(x.t));
                 if (hit) {
+                    if (hit.el.disabled || hit.el.getAttribute('aria-disabled') === 'true') {
+                        return null;
+                    }
                     try { hit.el.click(); } catch (e) {
                         try { hit.el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window})); } catch (e2) {}
                     }
@@ -2528,16 +3028,736 @@ def _invite_reclamar_y_escribir_otp_ya(
     return "progreso"
 
 
+def _invite_detectar_pwd_incorrecta(page) -> bool:
+    """True solo con el aviso rojo de Tidal, y NUNCA mientras el login sigue en spinner."""
+    try:
+        if _invite_continuar_esta_cargando(page):
+            return False
+    except Exception:
+        pass
+    js = r"""() => {
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            if (st.display === 'none' || st.visibility === 'hidden'
+                || parseFloat(st.opacity || '1') < 0.35) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 8 && r.height > 8;
+        };
+        const frases = [
+            /est[aá]\s+incorrecto\s+el\s+nombre\s+de\s+acceso/,
+            /contrase[ñn]a\s+incorrecta/,
+            /incorrect\s+password/,
+            /invalid\s+password/,
+            /wrong\s+password/,
+            /password\s+is\s+incorrect/,
+            /username\s+or\s+password\s+(is\s+)?incorrect/,
+            /email\s+or\s+password\s+(you\s+entered\s+)?(is\s+)?incorrect/,
+        ];
+        const nodos = document.querySelectorAll(
+            '[role="alert"], [data-test="form-error"], [data-testid*="error" i], .error-message, p, span, small, li'
+        );
+        for (const el of nodos) {
+            if (!visible(el)) continue;
+            if (el.querySelector('input, button, a, textarea')) continue;
+            const t = ((el.innerText || el.textContent || '') + '').trim();
+            if (t.length < 12 || t.length > 140) continue;
+            const low = t.toLowerCase();
+            if (/c[oó]digo/.test(low) && !/contrase|password/.test(low)) continue;
+            if (frases.some(re => re.test(low))) return true;
+        }
+        return false;
+    }"""
+    try:
+        frames = list(page.frames or [])
+    except Exception:
+        frames = []
+    if not frames:
+        frames = [page]
+    for fr in frames:
+        try:
+            if fr.evaluate(js):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _invite_pwd_js_campo_vivo() -> str:
+    """JS: localiza el input de contraseña visible (no OTP) y devuelve {val,x,y,w} o null."""
+    return r"""() => {
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            if (st.display === 'none' || st.visibility === 'hidden'
+                || parseFloat(st.opacity || '1') < 0.1) return false;
+            const r = el.getBoundingClientRect();
+            return r.width >= 40 && r.height >= 10;
+        };
+        const esOtp = (el) => {
+            const max = (el.getAttribute('maxlength') || '').trim();
+            const ac = (el.autocomplete || '').toLowerCase();
+            return max === '1' || ac === 'one-time-code';
+        };
+        const cands = Array.from(document.querySelectorAll(
+            'input[type="password"], input[name="password"], input[autocomplete="current-password"], input[placeholder*="contrase" i], input[placeholder*="password" i]'
+        )).filter(visible).filter(el => !esOtp(el));
+        if (!cands.length) return null;
+        cands.sort((a, b) => {
+            const ap = (a.autocomplete || '').toLowerCase() === 'current-password' ? 0 : 1;
+            const bp = (b.autocomplete || '').toLowerCase() === 'current-password' ? 0 : 1;
+            return ap - bp;
+        });
+        const el = cands[0];
+        const r = el.getBoundingClientRect();
+        return {
+            val: el.value || '',
+            x: r.x + r.width / 2,
+            y: r.y + r.height / 2,
+            w: r.width,
+            ac: el.autocomplete || '',
+        };
+    }"""
+
+
+def _invite_leer_password_viva(page) -> str:
+    js = _invite_pwd_js_campo_vivo()
+    try:
+        frames = list(page.frames or [])
+    except Exception:
+        frames = []
+    if not frames:
+        frames = [page]
+    for fr in frames[:5]:
+        try:
+            info = fr.evaluate(js)
+            if isinstance(info, dict) and str(info.get("val") or ""):
+                return str(info.get("val") or "")
+            if isinstance(info, dict):
+                return str(info.get("val") or "")
+        except Exception:
+            continue
+    return ""
+
+
+def _invite_hay_campo_password_vivo(page) -> bool:
+    js = _invite_pwd_js_campo_vivo()
+    try:
+        frames = list(page.frames or [])
+    except Exception:
+        frames = []
+    if not frames:
+        frames = [page]
+    for fr in frames[:5]:
+        try:
+            info = fr.evaluate(js)
+            if isinstance(info, dict) and float(info.get("w") or 0) >= 40:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _invite_login_cta_habilitado(page) -> bool:
+    """True si Inicia sesión / Log in está enabled (Vue ya tomó la contraseña)."""
+    try:
+        return bool(page.evaluate(r"""() => {
+            const visible = (el) => {
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden'
+                    || parseFloat(st.opacity || '1') < 0.1) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 2 && r.height > 2;
+            };
+            const re = /^(inicia(?:r)?\s*sesi[oó]n|log\s*in|sign\s*in|login)$/i;
+            const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+                .filter(visible);
+            const btn = btns.find(el => re.test((el.innerText || el.textContent || el.value || '').trim()));
+            if (!btn) return false;
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+            const st = window.getComputedStyle(btn);
+            if (st.pointerEvents === 'none' || parseFloat(st.opacity || '1') < 0.45) return false;
+            return true;
+        }"""))
+    except Exception:
+        return False
+
+
+def _invite_pwd_campo_marcado_invalido(page) -> bool:
+    """True si el input password quedó aria-invalid / is-invalid (tras un envío)."""
+    js = r"""() => {
+        const bad = document.querySelector(
+            'input[type="password"][aria-invalid="true"], input[type="password"].is-invalid'
+        );
+        if (!bad) return false;
+        const st = window.getComputedStyle(bad);
+        if (st.display === 'none' || st.visibility === 'hidden') return false;
+        const r = bad.getBoundingClientRect();
+        return r.width > 2 && r.height > 2;
+    }"""
+    try:
+        frames = list(page.frames or [])
+    except Exception:
+        frames = []
+    if not frames:
+        frames = [page]
+    for fr in frames:
+        try:
+            if fr.evaluate(js):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _invite_parchear_password_en_obj(obj, pwd: str) -> bool:
+    """Sustituye cualquier campo de contraseña en un JSON de login. True si cambió algo."""
+    patched = False
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower().replace("-", "").replace("_", "")
+            if kl in {"password", "passwd", "pass", "secret", "currentpassword"} and not isinstance(v, (dict, list)):
+                obj[k] = pwd
+                patched = True
+            elif isinstance(v, (dict, list)):
+                if _invite_parchear_password_en_obj(v, pwd):
+                    patched = True
+    elif isinstance(obj, list):
+        for item in obj:
+            if _invite_parchear_password_en_obj(item, pwd):
+                patched = True
+    return patched
+
+
+def _invite_instalar_parche_login(page, correo: str, pwd: str, estado: dict | None = None) -> None:
+    """Fuerza la clave del archivo en el POST de login.tidal.com (Vue a menudo envía vacío)."""
+    pwd = str(pwd or "")
+    if not page or not pwd:
+        return
+    try:
+        page._tidal_invite_login = {"correo": correo, "pwd": pwd}
+        if estado is not None:
+            page._tidal_invite_estado = estado
+    except Exception:
+        pass
+    if estado is not None:
+        estado["login_pwd_esperada"] = pwd
+        estado["login_spy_correo"] = correo
+    if getattr(page, "_tidal_invite_parche", False):
+        return
+    try:
+        page._tidal_invite_parche = True
+    except Exception:
+        return
+
+    def _handle(route) -> None:
+        try:
+            req = route.request
+            if (req.method or "").upper() not in ("POST", "PUT", "PATCH"):
+                route.continue_()
+                return
+            url = req.url or ""
+            low_url = url.lower()
+            if "login.tidal.com" not in low_url and "auth.tidal.com" not in low_url:
+                route.continue_()
+                return
+            info = getattr(page, "_tidal_invite_login", {}) or {}
+            pwd_now = str(info.get("pwd") or "")
+            correo_now = str(info.get("correo") or correo or "")
+            raw = req.post_data
+            if not pwd_now or not raw:
+                route.continue_()
+                return
+            try:
+                body = json.loads(raw)
+            except Exception:
+                route.continue_()
+                return
+            patched = False
+            if isinstance(body, dict) and correo_now:
+                for k in list(body.keys()):
+                    kl = str(k).lower()
+                    if kl in ("email", "username", "user", "login", "identifier") and isinstance(body.get(k), str):
+                        if "@" in body[k] and not correos_iguales_exacto(body[k], correo_now):
+                            body[k] = correo_now
+                            patched = True
+                        elif "@" in correo_now and kl == "email":
+                            body[k] = correo_now
+                            patched = True
+            patched = _invite_parchear_password_en_obj(body, pwd_now) or patched
+            if (not patched) and isinstance(body, dict) and (
+                "user/existing" in low_url or "email/user" in low_url
+            ):
+                body["password"] = pwd_now
+                patched = True
+            if patched:
+                try:
+                    page._tidal_invite_pwd_post = True
+                except Exception:
+                    pass
+                st = getattr(page, "_tidal_invite_estado", None)
+                if st is None:
+                    st = estado
+                if st is not None:
+                    st["login_pwd_en_post"] = True
+                if not getattr(page, "_tidal_invite_parche_aviso", False):
+                    try:
+                        page._tidal_invite_parche_aviso = True
+                    except Exception:
+                        pass
+                    path = url.split("?")[0]
+                    keys = list(body.keys())[:12] if isinstance(body, dict) else []
+                    print(
+                        f"    [Invitación] [{info.get('correo') or correo}] "
+                        f"POST login: clave del archivo forzada ({path} keys={keys}).",
+                        flush=True,
+                    )
+                headers = dict(req.headers)
+                headers.pop("content-length", None)
+                headers.pop("Content-Length", None)
+                route.continue_(
+                    post_data=json.dumps(body, ensure_ascii=False),
+                    headers=headers,
+                )
+                return
+            route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    try:
+        page.route("https://login.tidal.com/**", _handle)
+        page.route("https://auth.tidal.com/**", _handle)
+    except Exception:
+        try:
+            page.route("**/*tidal.com/**", _handle)
+        except Exception:
+            pass
+
+
+def _invite_instalar_espia_login(page, estado: dict, pwd: str) -> None:
+    """Instala el parche de POST con la clave del archivo."""
+    correo = (estado or {}).get("login_spy_correo") or ""
+    _invite_instalar_parche_login(page, correo, pwd, estado)
+
+
+def _invite_sync_vue_desde_dom(loc) -> None:
+    """Hace que Vue lea el value nativo (v-model = el.value)."""
+    try:
+        loc.dispatch_event("input")
+        loc.dispatch_event("change")
+    except Exception:
+        try:
+            loc.evaluate("""el => {
+                el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""")
+        except Exception:
+            pass
+
+
+def _invite_teclear_password_en_locator(page, loc, valor: str) -> bool:
+    """Teclea la clave en el input vivo. Nunca fill(): Vue se queda en '' y Tidal rechaza."""
+    try:
+        loc.scroll_into_view_if_needed(timeout=1200)
+    except Exception:
+        pass
+    try:
+        loc.click(timeout=2000)
+    except Exception:
+        try:
+            loc.click(timeout=1200, force=True)
+        except Exception:
+            return False
+    try:
+        loc.fill("")
+    except Exception:
+        try:
+            loc.press("Control+a")
+            loc.press("Backspace")
+        except Exception:
+            pass
+    escrito = False
+    try:
+        loc.press_sequentially(valor, delay=18)
+        escrito = True
+    except Exception:
+        pass
+    if not escrito:
+        try:
+            loc.focus()
+            page.keyboard.insert_text(valor)
+            escrito = True
+        except Exception:
+            pass
+    if not escrito:
+        return False
+    _invite_sync_vue_desde_dom(loc)
+    try:
+        actual = loc.input_value() or ""
+    except Exception:
+        actual = ""
+    if actual != valor:
+        try:
+            loc.click(timeout=1000)
+            loc.press("Control+a")
+            page.keyboard.insert_text(valor)
+            _invite_sync_vue_desde_dom(loc)
+            actual = loc.input_value() or ""
+        except Exception:
+            return False
+    return actual == valor
+
+
+def _invite_escribir_password(page, valor: str, correo: str, estado: dict | None = None) -> bool:
+    """Teclea la clave en el input de ESTA ventana y sincroniza el v-model de Vue."""
+    fresco = buscar_contrasena_cuenta(correo)
+    if fresco:
+        valor = str(fresco)
+    valor = str(valor or "")
+    if not page or not valor:
+        return False
+    print(f"    [Invitación] [{correo}] Clave de sesiones_imap_cuentas.txt: '{valor}'",
+          flush=True)
+    if estado is not None:
+        estado["login_spy_correo"] = correo
+        _invite_instalar_parche_login(page, correo, valor, estado)
+
+    for intento in range(1, 5):
+        loc = _invite_localizar_password_login(page)
+        if not loc:
+            loc = esperar_locator_en_frames(
+                page,
+                ['input[autocomplete="current-password"]',
+                 'input[type="password"]', 'input[name="password"]'],
+                timeout_s=3.0,
+            )
+        if loc:
+            try:
+                if (loc.get_attribute("maxlength", timeout=400) or "").strip() == "1":
+                    loc = None
+            except Exception:
+                pass
+        if not loc:
+            print(f"    {Color.WARNING}[Invitación] [{correo}] Sin campo contraseña "
+                  f"(intento {intento}/4).{Color.ENDC}", flush=True)
+            time.sleep(0.2)
+            continue
+
+        if not _invite_teclear_password_en_locator(page, loc, valor):
+            print(f"    {Color.WARNING}[Invitación] [{correo}] No se pudo teclear "
+                  f"(intento {intento}/4).{Color.ENDC}", flush=True)
+            time.sleep(0.12)
+            continue
+        actual = ""
+        try:
+            actual = loc.input_value() or ""
+        except Exception:
+            actual = _invite_leer_password_viva(page)
+        if actual != valor:
+            print(f"    {Color.WARNING}[Invitación] [{correo}] Campo '{actual}' ≠ "
+                  f"archivo '{valor}' (intento {intento}/4).{Color.ENDC}",
+                  flush=True)
+            time.sleep(0.2)
+            continue
+        print(f"    [Invitación] [{correo}] Campo = archivo: '{actual}'.", flush=True)
+        return True
+    return False
+
+
+def _invite_localizar_boton_inicia_sesion(page):
+    """Botón Inicia sesión / Log in (no Continuar, no 'con código')."""
+    return encontrar_locator_en_frames(
+        page,
+        [
+            "button[type='submit']",
+            'button:text-is("Iniciar sesión")',
+            'button:text-is("Inicia Sesión")',
+            'button:text-is("Inicia sesión")',
+            'button:text-is("Log in")',
+            'button:text-is("Sign in")',
+        ],
+        text_regex=re.compile(
+            r"^(inicia(?:r)?\s*sesi[oó]n|log\s*in|sign\s*in|login)$", re.I
+        ),
+    )
+
+
+def _invite_login_cuenta_archivo(page, correo: str, pwd_cuenta: str, estado: dict) -> str:
+    """Login lineal de cuenta ya registrada con la clave de sesiones_imap_cuentas.txt.
+
+    Igual que TidalAutoLoginManager: Continuar → (OTP) modo contraseña → teclear →
+    Inicia sesión / Enter → Aceptar invitación. Nunca pide OTP por IMAP.
+    """
+    fresco = buscar_contrasena_cuenta(correo)
+    if fresco:
+        pwd_cuenta = str(fresco)
+    pwd_cuenta = str(pwd_cuenta or "")
+    if not pwd_cuenta:
+        return "sin_pwd"
+
+    _invite_instalar_parche_login(page, correo, pwd_cuenta, estado)
+
+    if _invite_detectar_exito(page):
+        return "ok"
+
+    if estado.get("pwd_enviada") and _invite_pwd_sigue_esperando_tidal(page, estado):
+        return _invite_esperar_respuesta_login(page, correo, estado)
+
+    if _invite_debe_abortar_pwd_incorrecta(page, estado):
+        _invite_avisar_pwd_incorrecta(correo, estado)
+        return "pwd_incorrecta"
+
+    if _invite_queda_boton_aceptar(page):
+        if _invite_pulsar_aceptar(page):
+            print(f"    [Invitación] [{correo}] Pulsado botón de aceptación.")
+            if _invite_esperar_ui(page, [lambda: _invite_detectar_exito(page)], max_s=4.0):
+                return "ok"
+            return "progreso"
+
+    # El invite de otro alias deja email=ajeno + disableEmailInput: Continuar loguearía
+    # esa otra cuenta con ESTA contraseña → "contraseña incorrecta".
+    if _invite_pantalla_correo_con_continuar(page) or _invite_email_en_pagina(page):
+        if _invite_asegurar_email_cuenta(page, correo, estado):
+            _invite_esperar_ui(
+                page,
+                [lambda: correos_iguales_exacto(_invite_email_en_pagina(page), correo)],
+                max_s=5.0,
+            )
+        visto = _invite_email_en_pagina(page)
+        if visto and not correos_iguales_exacto(visto, correo):
+            print(
+                f"    {Color.FAIL}[Invitación] [{correo}] Tidal tiene '{visto}' en el login. "
+                f"Esta invitación no es de esta cuenta; no se pulsa Continuar.{Color.ENDC}",
+                flush=True,
+            )
+            return "invite_ajeno"
+
+    pwd_loc = _invite_localizar_password_login(page)
+    en_pwd = bool(
+        pwd_loc
+        or _invite_hay_campo_password_vivo(page)
+        or _invite_es_pantalla_password_login(page)
+    )
+
+    if _invite_pantalla_correo_con_continuar(page) and not en_pwd:
+        visto = _invite_email_en_pagina(page)
+        if visto and not correos_iguales_exacto(visto, correo):
+            print(
+                f"    {Color.FAIL}[Invitación] [{correo}] Tidal tiene '{visto}' en el login. "
+                f"Esta invitación no es de esta cuenta; no se pulsa Continuar.{Color.ENDC}",
+                flush=True,
+            )
+            return "invite_ajeno"
+        if not visto:
+            print(
+                f"    {Color.WARNING}[Invitación] [{correo}] Aún no se ve el correo "
+                f"en pantalla; no se pulsa Continuar.{Color.ENDC}",
+                flush=True,
+            )
+            return "progreso"
+        print(f"    [Invitación] [{correo}] Correo en pantalla: '{visto}'. Pulsando Continuar...")
+        estado["continuar_correo_pulsado"] = True
+        if not _invite_pulsar_continuar_o_login(page):
+            print(
+                f"    {Color.WARNING}[Invitación] [{correo}] No se pudo pulsar Continuar.{Color.ENDC}"
+            )
+            return "progreso"
+        _invite_esperar_ui(
+            page,
+            [
+                lambda: _invite_es_pantalla_password_login(page),
+                lambda: _invite_hay_campo_password_vivo(page),
+                lambda: bool(_invite_localizar_password_login(page)),
+                lambda: bool(_invite_eval_modo_contrasena(page, "existe")),
+                lambda: _invite_queda_boton_aceptar(page),
+            ],
+            max_s=5.0,
+        )
+        pwd_loc = _invite_localizar_password_login(page)
+        en_pwd = bool(
+            pwd_loc
+            or _invite_hay_campo_password_vivo(page)
+            or _invite_es_pantalla_password_login(page)
+        )
+
+    if (
+        not en_pwd
+        and _invite_eval_modo_contrasena(page, "existe")
+        and estado.get("intentos_modo_pwd", 0) < 3
+    ):
+        estado["intentos_modo_pwd"] = int(estado.get("intentos_modo_pwd") or 0) + 1
+        print(f"    [Invitación] [{correo}] Pantalla de código. "
+              f"Modo contraseña ({estado['intentos_modo_pwd']}/3)...")
+        _invite_clic_modo_contrasena(page)
+        _invite_esperar_ui(
+            page,
+            [
+                lambda: (
+                    (
+                        _invite_hay_campo_password_vivo(page)
+                        or bool(_invite_localizar_password_login(page))
+                    )
+                    and not _invite_hay_pantalla_codigo(page)
+                ),
+            ],
+            max_s=6.0,
+        )
+        pwd_loc = _invite_localizar_password_login(page)
+        en_pwd = bool(
+            pwd_loc
+            or _invite_hay_campo_password_vivo(page)
+            or _invite_es_pantalla_password_login(page)
+        )
+
+    if en_pwd:
+        if estado.get("pwd_enviada"):
+            return _invite_esperar_respuesta_login(page, correo, estado)
+
+        if _invite_hay_pantalla_codigo(page) and not _invite_hay_campo_password_vivo(page):
+            return "progreso"
+
+        print(f"    [Invitación] [{correo}] Escribiendo clave de sesiones_imap_cuentas.txt...")
+        if not _invite_escribir_password(page, pwd_cuenta, correo, estado):
+            n_write = int(estado.get("pwd_write_fallos", 0)) + 1
+            estado["pwd_write_fallos"] = n_write
+            print(f"    {Color.FAIL}[Invitación] [{correo}] No se pudo dejar la "
+                  f"contraseña exacta en el campo ({n_write}/3).{Color.ENDC}")
+            if n_write >= 3:
+                return "sin_pwd"
+            return "progreso"
+
+        loc_env = _invite_localizar_password_login(page)
+        try:
+            actual_env = (loc_env.input_value() or "") if loc_env else ""
+        except Exception:
+            actual_env = ""
+        if actual_env != pwd_cuenta:
+            print(f"    {Color.WARNING}[Invitación] [{correo}] Antes de enviar el campo ya no "
+                  f"tiene la clave ('{actual_env}'). Se reescribe.{Color.ENDC}", flush=True)
+            return "progreso"
+        enviado = False
+        btn = _invite_localizar_boton_inicia_sesion(page)
+        try:
+            if btn:
+                btn.click(timeout=2500)
+                enviado = True
+                print("    [Invitación] Pulsado CTA de login: Inicia Sesión")
+        except Exception:
+            enviado = False
+        if not enviado:
+            try:
+                page.get_by_role(
+                    "button",
+                    name=re.compile(r"^inicia(?:r)?\s*sesi[oó]n$", re.I),
+                ).first.click(timeout=2500)
+                enviado = True
+                print("    [Invitación] Pulsado CTA de login: Inicia Sesión")
+            except Exception:
+                pass
+        if not enviado:
+            if not _invite_pulsar_inicia_sesion(page):
+                print(f"    {Color.WARNING}[Invitación] [{correo}] No se pudo pulsar Inicia Sesión.{Color.ENDC}")
+                return "progreso"
+
+        _invite_marcar_login_enviado(estado)
+        return _invite_esperar_respuesta_login(page, correo, estado)
+
+    email_selectors = [
+        'input[type="email"]', 'input[name="email"]',
+        'input[autocomplete="email"]', '#email',
+        'input[name="username"]', 'input[autocomplete="username"]',
+    ]
+    email_inp = encontrar_locator_en_frames(page, email_selectors)
+    if email_inp:
+        try:
+            visible = email_inp.is_visible(timeout=0)
+        except Exception:
+            visible = True
+        if visible:
+            try:
+                val = (email_inp.input_value() or "").strip()
+            except Exception:
+                val = ""
+            if not val:
+                print(f"    [Invitación] [{correo}] Correo vacío; colocándolo una vez...")
+                try:
+                    email_inp.click(timeout=2000)
+                    email_inp.fill("")
+                    email_inp.press_sequentially(correo, delay=18)
+                except Exception:
+                    try:
+                        email_inp.fill(correo)
+                    except Exception:
+                        pass
+                try:
+                    val = (email_inp.input_value() or "").strip()
+                except Exception:
+                    val = ""
+            if val and not correos_iguales_exacto(val, correo):
+                print(
+                    f"    {Color.FAIL}[Invitación] [{correo}] El campo tiene '{val}'. "
+                    f"No se pulsa Continuar.{Color.ENDC}",
+                    flush=True,
+                )
+                return "invite_ajeno"
+            print(f"    [Invitación] [{correo}] Correo ya presente. Pulsando Continuar...")
+            estado["continuar_correo_pulsado"] = True
+            if not _invite_pulsar_continuar_o_login(page):
+                print(
+                    f"    {Color.WARNING}[Invitación] [{correo}] No se pudo pulsar Continuar.{Color.ENDC}"
+                )
+                return "progreso"
+            _invite_esperar_ui(
+                page,
+                [
+                    lambda: _invite_es_pantalla_password_login(page),
+                    lambda: bool(_invite_localizar_password_login(page)),
+                    lambda: bool(_invite_eval_modo_contrasena(page, "existe")),
+                    lambda: _invite_queda_boton_aceptar(page),
+                ],
+                max_s=8.0,
+            )
+            return "progreso"
+
+    return "esperar"
+
+
 def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dict) -> str:
     """Avanza un paso del login/alta en la invitación.
 
     Cubre también cuentas aún no registradas: DOB + términos + Suscríbete + OTP IMAP
     (match exacto por alias para hasta 5 hermanos del mismo Gmail).
 
-    Devuelve: 'ok' | 'progreso' | 'esperar' | 'sin_pwd' | 'fallo_otp'.
+    Devuelve: 'ok' | 'progreso' | 'esperar' | 'sin_pwd' | 'pwd_incorrecta' | 'fallo_otp'.
     """
+    if not pwd_cuenta:
+        pwd_cuenta = buscar_contrasena_cuenta(correo)
     ya_en_otp = bool(_invite_hay_pantalla_codigo(page) and not estado.get("otp_escrito"))
     post_suscribete = bool(estado.get("suscribete_pulsado") and not estado.get("otp_escrito"))
+    pantalla_pwd = False
+    try:
+        if not estado.get("registro_nuevo"):
+            pantalla_pwd = bool(_invite_es_pantalla_password_login(page))
+    except Exception:
+        pantalla_pwd = False
+    if pantalla_pwd:
+        ya_en_otp = False
+
+    if pwd_cuenta and not estado.get("registro_nuevo"):
+        _invite_instalar_parche_login(page, correo, str(pwd_cuenta), estado)
+
+    # Cuenta ya registrada + clave en sesiones_imap_cuentas.txt: flujo lineal.
+    # No mezclar con OTP IMAP (eso es solo alta nueva).
+    if (
+        pwd_cuenta
+        and not estado.get("registro_nuevo")
+        and not estado.get("suscribete_pulsado")
+        and not _invite_es_formulario_registro(page)
+    ):
+        return _invite_login_cuenta_archivo(page, correo, pwd_cuenta, estado)
 
     # 0) Alta nueva: tras Suscríbete / UI OTP → reclamar y escribir YA (caduca ~60s).
     # No aplicar en login con cuenta existente (allí se prefiere modo contraseña).
@@ -2554,12 +3774,25 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
         estado["registro_nuevo"] = True
         return _invite_reclamar_y_escribir_otp_ya(page, correo, estado)
 
-    # 0b) Ruta rápida: correo + Continuar. Nunca tras Suscríbete / OTP.
+    # Contraseña rechazada: abortar YA (no Continuar, no reenviar).
+    # Nunca mientras el CTA sigue en spinner ni en la gracia post-clic.
+    if _invite_debe_abortar_pwd_incorrecta(page, estado):
+        _invite_avisar_pwd_incorrecta(correo, estado)
+        return "pwd_incorrecta"
+
+    if (not estado.get("registro_nuevo")) and _invite_pwd_sigue_esperando_tidal(page, estado):
+        return _invite_esperar_respuesta_login(page, correo, estado)
+
+    # 0b) Ruta rápida: correo + Continuar. Nunca tras Suscríbete / OTP / campo contraseña.
     if (
         not estado.get("otp_escrito")
         and not estado.get("otp_valor")
         and not estado.get("suscribete_pulsado")
         and not ya_en_otp
+        and not pantalla_pwd
+        and not encontrar_locator_en_frames(
+            page, _invite_pwd_selectors()
+        )
         and _invite_pantalla_correo_con_continuar(page)
     ):
         print(f"    [Invitación] [{correo}] Correo ya presente. Pulsando Continuar...")
@@ -2576,8 +3809,8 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 lambda: _invite_es_formulario_registro(page),
                 lambda: _invite_hay_pantalla_codigo(page),
                 lambda: _invite_queda_boton_aceptar(page),
-                lambda: bool(encontrar_locator_en_frames(
-                    page, ['input[type="password"]', 'input[name="password"]']
+                lambda: bool(_invite_localizar_password_login(page) or encontrar_locator_en_frames(
+                    page, _invite_pwd_selectors()
                 )),
             ],
             max_s=1.6,
@@ -2623,7 +3856,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
         'input[id*="email" i]', 'input[placeholder*="correo" i]',
         'input[placeholder*="email" i]', 'input[placeholder*="acceso" i]',
     ]
-    pwd_selectors = ['input[type="password"]', 'input[name="password"]']
+    pwd_selectors = _invite_pwd_selectors()
 
     # 1b) Alta de cuenta nueva. Si ya salió el OTP, no reenviar Suscríbete (invalidaría el código).
     if _invite_es_formulario_registro(page) and not _invite_hay_pantalla_codigo(page):
@@ -2685,8 +3918,8 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                       f"reintento Suscríbete ({estado['reintentos_suscribete']}/2)...")
                 return "progreso"
 
-    # 2) Pantalla de código OTP (registro o login)
-    if _invite_hay_pantalla_codigo(page):
+    # 2) Pantalla de código OTP (registro o login). Nunca si ya estamos en contraseña.
+    if _invite_hay_pantalla_codigo(page) and not pantalla_pwd:
         # Si ya apareció Accept junto al OTP, aceptar de inmediato
         if _invite_queda_boton_aceptar(page) and estado.get("otp_escrito"):
             if _invite_pulsar_aceptar(page):
@@ -2702,9 +3935,13 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                 _invite_clic_modo_contrasena(page)
                 _invite_esperar_ui(
                     page,
-                    [lambda: bool(encontrar_locator_en_frames(page, pwd_selectors))],
-                    max_s=1.8,
+                    [
+                        lambda: _invite_hay_campo_password_vivo(page),
+                        lambda: _invite_es_pantalla_password_login(page),
+                    ],
+                    max_s=4.0,
                 )
+                time.sleep(0.7)
                 return "progreso"
 
         if not encontrar_locator_en_frames(page, pwd_selectors) or es_alta:
@@ -2944,84 +4181,120 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     estado["otp_continuar_pulsado"] = True
             return "progreso"
 
-    # 3) Campo de contraseña → rellenar y enviar (solo cuentas ya existentes)
-    pwd_inp = encontrar_locator_en_frames(page, pwd_selectors)
-    if pwd_inp and not estado.get("registro_nuevo"):
-        try:
-            ml = (pwd_inp.get_attribute("maxlength", timeout=500) or "").strip()
-        except Exception:
-            ml = ""
-        if ml == "1":
-            pwd_inp = None
-    if pwd_inp and not estado.get("registro_nuevo"):
-        try:
-            visible = pwd_inp.is_visible(timeout=0)
-        except Exception:
-            visible = True
-        if visible:
-            if not pwd_cuenta:
-                if not estado.get("aviso_sin_pwd"):
-                    estado["aviso_sin_pwd"] = True
-                    print(f"    {Color.FAIL}[Invitación] [{correo}] Campo contraseña visible pero "
-                          f"no hay entrada en sesiones_imap_cuentas.txt.{Color.ENDC}")
-                return "sin_pwd"
+    # 3) Campo de contraseña → tecleo en el input vivo (no locator de OTP) y enviar
+    pwd_vivo = False
+    try:
+        if not estado.get("registro_nuevo"):
+            pwd_vivo = (
+                bool(pantalla_pwd)
+                or _invite_hay_campo_password_vivo(page)
+                or bool(_invite_localizar_password_login(page))
+            )
+    except Exception:
+        pwd_vivo = bool(pantalla_pwd)
+    if pwd_vivo:
+        if _invite_debe_abortar_pwd_incorrecta(page, estado):
+            _invite_avisar_pwd_incorrecta(correo, estado)
+            return "pwd_incorrecta"
+        if (
+            estado.get("pwd_enviada")
+            and not _invite_pwd_sigue_esperando_tidal(page, estado)
+            and _invite_pwd_campo_marcado_invalido(page)
+            and not _invite_detectar_exito(page)
+            and not _invite_queda_boton_aceptar(page)
+        ):
+            _invite_avisar_pwd_incorrecta(correo, estado)
+            return "pwd_incorrecta"
 
-            # Verificar si Tidal ya rechazó la contraseña
-            try:
-                err_pwd = page.evaluate("""() => {
-                    const txt = ((document.body ? document.body.innerText : '') + ' ' + (document.title || '')).toLowerCase();
-                    if (/contrase[ñn]a\\s*incorrecta|invalid\\s*password|incorrect\\s*password|wrong\\s*password/i.test(txt)) {
-                        return true;
-                    }
-                    const bad = document.querySelector('input[type="password"][aria-invalid="true"], input[type="password"].is-invalid');
-                    return Boolean(bad);
-                }""")
-                if err_pwd:
-                    print(f"    {Color.FAIL}[Invitación] [{correo}] Contraseña incorrecta en Tidal. Verifica sesiones_imap_cuentas.txt.{Color.ENDC}")
+        fresco = buscar_contrasena_cuenta(correo)
+        if fresco:
+            pwd_cuenta = fresco
+
+        if not pwd_cuenta:
+            if not estado.get("aviso_sin_pwd"):
+                estado["aviso_sin_pwd"] = True
+                print(f"    {Color.FAIL}[Invitación] [{correo}] Campo contraseña visible pero "
+                      f"no hay entrada en sesiones_imap_cuentas.txt.{Color.ENDC}")
+            return "sin_pwd"
+
+        actual = _invite_leer_password_viva(page)
+        loc_chk = _invite_localizar_password_login(page)
+        try:
+            if loc_chk:
+                actual = loc_chk.input_value() or actual
+        except Exception:
+            pass
+
+        if estado.get("pwd_enviada") and _invite_pwd_sigue_esperando_tidal(page, estado):
+            return _invite_esperar_respuesta_login(page, correo, estado)
+
+        if estado.get("pwd_enviada"):
+            sigue_login = pantalla_pwd or _invite_es_pantalla_password_login(page)
+            cta_ok = _invite_login_cta_habilitado(page)
+            if actual != pwd_cuenta:
+                print(f"    [Invitación] [{correo}] El campo de contraseña quedó vacío. "
+                      f"Reescribiendo la clave...", flush=True)
+                estado["pwd_enviada"] = False
+            elif sigue_login and not cta_ok:
+                # Botón gris sin spinner: Vue no tomó la clave.
+                print(f"    [Invitación] [{correo}] 'Inicia Sesión' sigue gris. "
+                      f"Reescribiendo la clave...", flush=True)
+                estado["pwd_enviada"] = False
+            else:
+                if cta_ok:
+                    _invite_pulsar_inicia_sesion(page)
+                return "esperar"
+
+        if actual != pwd_cuenta:
+            print(f"    [Invitación] [{correo}] Escribiendo clave de sesiones_imap_cuentas.txt...")
+            if not _invite_escribir_password(page, pwd_cuenta, correo, estado):
+                n_write = int(estado.get("pwd_write_fallos", 0)) + 1
+                estado["pwd_write_fallos"] = n_write
+                print(f"    {Color.FAIL}[Invitación] [{correo}] No se pudo dejar la "
+                      f"contraseña exacta en el campo vivo ({n_write}/3). No se envía.{Color.ENDC}")
+                if n_write >= 3:
                     return "sin_pwd"
+                return "progreso"
+        actual = _invite_leer_password_viva(page)
+        loc_chk = _invite_localizar_password_login(page)
+        try:
+            if loc_chk:
+                actual = loc_chk.input_value() or actual
+        except Exception:
+            pass
+        if actual != pwd_cuenta:
+            print(f"    {Color.WARNING}[Invitación] [{correo}] Verificación viva: "
+                  f"'{actual}' ≠ archivo '{pwd_cuenta}'. No se envía.{Color.ENDC}")
+            return "progreso"
+        if not _invite_login_cta_habilitado(page):
+            _invite_esperar_ui(page, [lambda: _invite_login_cta_habilitado(page)], max_s=2.0)
+        cta_ok = _invite_login_cta_habilitado(page)
+        if not cta_ok:
+            print(f"    {Color.WARNING}[Invitación] [{correo}] 'Inicia Sesión' sigue deshabilitado "
+                  f"(Vue no tomó la clave). Se reintenta.{Color.ENDC}", flush=True)
+            estado["pwd_enviada"] = False
+            return "progreso"
+        if not _invite_pulsar_inicia_sesion(page):
+            try:
+                if loc_chk:
+                    loc_chk.press("Enter")
+                else:
+                    page.keyboard.press("Enter")
             except Exception:
                 pass
-
+        _invite_marcar_login_enviado(estado)
+        resultado_login = _invite_esperar_respuesta_login(page, correo, estado)
+        if resultado_login == "progreso":
             try:
-                val_p = pwd_inp.input_value()
+                if (
+                    not _invite_pwd_sigue_esperando_tidal(page, estado)
+                    and _invite_es_pantalla_password_login(page)
+                    and not _invite_leer_password_viva(page)
+                ):
+                    estado["pwd_enviada"] = False
             except Exception:
-                val_p = ""
-            if not val_p or val_p != pwd_cuenta:
-                print(f"    [Invitación] [{correo}] Auto-completando contraseña "
-                      f"desde sesiones_imap_cuentas.txt...")
-                try:
-                    rellenar_campo_humanizado(pwd_inp, pwd_cuenta)
-                except Exception:
-                    try:
-                        pwd_inp.fill(pwd_cuenta)
-                    except Exception:
-                        pass
-                time.sleep(0.3)
-                try:
-                    pwd_inp.dispatch_event("input")
-                    pwd_inp.dispatch_event("change")
-                except Exception:
-                    pass
-            if not _invite_pulsar_continuar_o_login(page):
-                try:
-                    pwd_inp.press("Enter")
-                except Exception:
-                    pass
-            _invite_esperar_ui(
-                page,
-                [
-                    lambda: _invite_detectar_exito(page),
-                    lambda: _invite_queda_boton_aceptar(page),
-                    lambda: _invite_hay_pantalla_codigo(page),
-                ],
-                max_s=2.5,
-            )
-            if _invite_pulsar_aceptar(page):
-                if _invite_esperar_ui(page, [lambda: _invite_detectar_exito(page)], max_s=2.5):
-                    return "ok"
-            if _invite_detectar_exito(page):
-                return "ok"
-            return "progreso"
+                pass
+        return resultado_login
 
     # 4) Campo de correo (ya viene rellenado por el enlace) → solo Continuar
     # Nunca tras Suscríbete/OTP: el input email a menudo sigue en el DOM y re-Continuar rompe el flujo.
@@ -3032,6 +4305,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
         and not estado.get("otp_valor")
         and not estado.get("suscribete_pulsado")
         and not _invite_hay_pantalla_codigo(page)
+        and not _invite_es_pantalla_password_login(page)
     ):
         try:
             visible = email_inp.is_visible(timeout=0)
@@ -3079,6 +4353,7 @@ def _invite_avanzar_login(page, correo: str, pwd_cuenta: str | None, estado: dic
                     page,
                     [
                         lambda: bool(encontrar_locator_en_frames(page, pwd_selectors)),
+                        lambda: _invite_es_pantalla_password_login(page),
                         lambda: _invite_es_formulario_registro(page),
                         lambda: _invite_queda_boton_aceptar(page),
                     ],
@@ -3127,7 +4402,8 @@ def abrir_enlace_familia_con_autocierre(
     - Cuenta aún no registrada (alta DOB/Suscríbete): proxy NG (Nigeria), obligatorio.
     - Links desde linksextraidos.txt: forzar_proxy_ng=True → siempre NG (una sola ventana).
     - cancel_event: si se setea (timeout de oleada), aborta y cierra Chrome.
-    Devuelve True si la invitación quedó aceptada.
+    Devuelve True/'ok' si la invitación quedó aceptada, 'ya_usado',
+    'pwd_incorrecta' o False.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -3143,10 +4419,23 @@ def abrir_enlace_familia_con_autocierre(
         print(f"    {Color.CYAN}[Invitación] [{correo}] Usando URL directa (sin ablink).{Color.ENDC}")
 
     pwd_cuenta = buscar_contrasena_cuenta(correo)
+    em_invite = _invite_email_en_url(url)
+    if em_invite and not correos_iguales_exacto(em_invite, correo):
+        print(
+            f"    {Color.FAIL}[Invitación] [{correo}] El enlace es de '{em_invite}'. "
+            f"No se abre Chrome (evitaría 'contraseña incorrecta').{Color.ENDC}"
+        )
+        return "invite_ajeno"
     # Sin contraseña → alta nueva → Nigeria. Con forzar_proxy_ng (archivo .txt) → siempre NG.
     # Con contraseña (IMAP/manual) → Perú; si aparece alta, se cambia a NG (cerrando la 1ª ventana).
     usar_ng_inicial = bool(forzar_proxy_ng) or not bool(pwd_cuenta)
-    if usar_ng_inicial:
+    if MODO_SIN_PROXY:
+        current_proxy = {}
+        proxy_tipo = "NG" if usar_ng_inicial else "PE"
+        print(f"    {Color.CYAN}[Sin Proxy] [{correo}] Invitación familiar con IP real.{Color.ENDC}")
+        proxy_ng = None
+        proxy_pe = None
+    elif usar_ng_inicial:
         if forzar_proxy_ng and pwd_cuenta:
             print(f"    {Color.CYAN}[Invitación] [{correo}] Link desde archivo .txt → "
                   f"proxy NG desde el inicio (no se abre ventana PE).{Color.ENDC}")
@@ -3181,8 +4470,8 @@ def abrir_enlace_familia_con_autocierre(
     reparar_perfil_corrupto(profile_dir)
 
     print(f"    {Color.CYAN}[Navegador]{Color.ENDC} Iniciando automatización familiar ({correo}) "
-          f"con proxy {proxy_tipo}"
-          f"{' (alta/registro Nigeria)' if proxy_tipo == 'NG' else ' (login/aceptar Perú)'}"
+          f"{'con IP real' if MODO_SIN_PROXY else ('con proxy ' + proxy_tipo)}"
+          f"{'' if MODO_SIN_PROXY else (' (alta/registro Nigeria)' if proxy_tipo == 'NG' else ' (login/aceptar Perú)')}"
           f"{' [headless]' if (headless or headless_forzado_por_entorno()) else ''}...")
 
     with sync_playwright() as p:
@@ -3191,16 +4480,13 @@ def abrir_enlace_familia_con_autocierre(
         def abrir_contexto(proxy, prof_dir, tipo: str):
             kwargs = dict(base_launch_kwargs)
             kwargs["user_data_dir"] = str(prof_dir)
-            p_serv = proxy.get("server", "")
-            if p_serv and not p_serv.startswith("http"):
-                p_serv = "http://" + p_serv
-            kwargs["proxy"] = {
-                "server": p_serv,
-                "username": proxy.get("username", ""),
-                "password": proxy.get("password", "")
-            }
-            etiqueta = "NIGERIA" if tipo == "NG" else "PERÚ"
-            print(f"    [Proxy {tipo}] [{correo}] Conectando mediante proxy de {etiqueta}: {p_serv}")
+            anexar_proxy_launch(kwargs, proxy=proxy or {})
+            if MODO_SIN_PROXY or not (proxy or {}).get("server"):
+                print(f"    [Sin Proxy] [{correo}] Conectando con IP real.")
+            else:
+                etiqueta = "NIGERIA" if tipo == "NG" else "PERÚ"
+                print(f"    [Proxy {tipo}] [{correo}] Conectando mediante proxy de {etiqueta}: "
+                      f"{(proxy or {}).get('server')}")
             try:
                 ctx = p.chromium.launch_persistent_context(**kwargs)
             except Exception as e:
@@ -3212,6 +4498,13 @@ def abrir_enlace_familia_con_autocierre(
             ctx.set_default_timeout(35000)
             ctx.add_init_script(STEALTH_SCRIPT)
             ctx.add_init_script(_INVITE_COOKIE_KILLER_INIT)
+            try:
+                ctx.grant_permissions(
+                    ["clipboard-read", "clipboard-write"],
+                    origin="https://login.tidal.com",
+                )
+            except Exception:
+                pass
             return ctx
 
         context = None
@@ -3273,9 +4566,66 @@ def abrir_enlace_familia_con_autocierre(
             except Exception:
                 pass
 
+        def _salir_pwd_incorrecta():
+            """Cierra esta ventana al instante; el resto de la oleada sigue."""
+            print(f"    {Color.FAIL}[Invitación] [{correo}] Contraseña incorrecta. "
+                  f"Cerrando esta ventana; el resto continúa.{Color.ENDC}")
+            _cerrar_contexto()
+            try:
+                prof = profile_dir
+
+                def _rm_async_pwd(p_dir):
+                    time.sleep(0.4)
+                    try:
+                        shutil.rmtree(p_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_rm_async_pwd, args=(Path(prof),), daemon=True).start()
+            except Exception:
+                pass
+            _liberar_proxy_actual()
+            return "pwd_incorrecta"
+
+        def _salir_invite_ajeno():
+            print(
+                f"    {Color.FAIL}[Invitación] [{correo}] Login de otra cuenta. "
+                f"Cerrando esta ventana; el resto continúa.{Color.ENDC}"
+            )
+            _cerrar_contexto()
+            try:
+                prof = profile_dir
+
+                def _rm_async_ajeno(p_dir):
+                    time.sleep(0.4)
+                    try:
+                        shutil.rmtree(p_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_rm_async_ajeno, args=(Path(prof),), daemon=True).start()
+            except Exception:
+                pass
+            _liberar_proxy_actual()
+            return "invite_ajeno"
+
         def _rotar_proxy_y_perfil(razon: str) -> bool:
             """Rota al pool del país actual y descarta el perfil. False si no hay IP."""
             nonlocal current_proxy, profile_dir
+            if MODO_SIN_PROXY:
+                print(f"    {Color.WARNING}[Invitación] [{correo}] {razon}. "
+                      f"Reiniciando Chrome (IP real, sin proxy)...{Color.ENDC}")
+                _cerrar_contexto()
+                perfil_quemado = profile_dir
+                profile_dir = Path(tempfile.gettempdir()) / (
+                    f"tidal_chrome_profile_{email_safe}_{random.randint(1000, 9999)}"
+                )
+                reparar_perfil_corrupto(profile_dir)
+                try:
+                    shutil.rmtree(perfil_quemado, ignore_errors=True)
+                except Exception:
+                    pass
+                return True
             pais = "Nigeria" if proxy_tipo == "NG" else "Perú"
             print(f"    {Color.WARNING}[Invitación] [{correo}] {razon}. "
                   f"Rotando a un proxy de {pais} limpio...{Color.ENDC}")
@@ -3304,6 +4654,11 @@ def abrir_enlace_familia_con_autocierre(
             """
             nonlocal current_proxy, proxy_tipo, profile_dir, proxy_ng
             if proxy_tipo == "NG":
+                return True
+            if MODO_SIN_PROXY:
+                print(f"    {Color.CYAN}[Invitación] [{correo}] {razon}. "
+                      f"Continuando el alta con IP real (sin cambiar de proxy).{Color.ENDC}")
+                proxy_tipo = "NG"
                 return True
             print(f"    {Color.CYAN}[Invitación] [{correo}] {razon}. "
                   f"Cerrando ventana PE y abriendo solo proxy NIGERIA...{Color.ENDC}")
@@ -3474,26 +4829,40 @@ def abrir_enlace_familia_con_autocierre(
                 if context is None:
                     context = abrir_contexto(current_proxy, profile_dir, proxy_tipo)
                     page = context.pages[0] if context.pages else context.new_page()
+                    if pwd_cuenta:
+                        _invite_instalar_parche_login(page, correo, pwd_cuenta, None)
 
                 try:
-                    print(f"    [Invitación] [{correo}] Calentando reputación en tidal.com/pricing "
-                          f"(intento {intento_inv}/{_max_intentos_inv}, proxy {proxy_tipo})...")
-                    navegar_tidal_tolerante(page, "https://tidal.com/pricing", timeout_ms=45000)
-                    time.sleep(random.uniform(1.2, 2.2))
-                    aceptar_cookies_con_espera(page)
-                    _invite_limpiar_cookies_agresivo(page)
-                    time.sleep(random.uniform(0.35, 0.7))
+                    if pwd_cuenta:
+                        print(f"    [Invitación] [{correo}] Abriendo invitación "
+                              f"(intento {intento_inv}/{_max_intentos_inv})...")
+                        try:
+                            navegar_tidal_tolerante(
+                                page, "https://tidal.com/pricing", timeout_ms=25000
+                            )
+                            time.sleep(0.3)
+                            aceptar_cookies_con_espera(page)
+                        except Exception:
+                            pass
+                    else:
+                        print(f"    [Invitación] [{correo}] Calentando reputación en tidal.com/pricing "
+                              f"(intento {intento_inv}/{_max_intentos_inv}, proxy {proxy_tipo})...")
+                        navegar_tidal_tolerante(page, "https://tidal.com/pricing", timeout_ms=45000)
+                        time.sleep(random.uniform(1.2, 2.2))
+                        aceptar_cookies_con_espera(page)
+                        _invite_limpiar_cookies_agresivo(page)
+                        time.sleep(random.uniform(0.35, 0.7))
 
-                    # Calentar account antes del ablink (reduce ERR_TUNNEL en tracking links)
-                    try:
-                        navegar_tidal_tolerante(
-                            page, "https://account.tidal.com/",
-                            referer="https://tidal.com/pricing",
-                            timeout_ms=35000,
-                        )
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
+                        # Calentar account antes del ablink (reduce ERR_TUNNEL en tracking links)
+                        try:
+                            navegar_tidal_tolerante(
+                                page, "https://account.tidal.com/",
+                                referer="https://tidal.com/pricing",
+                                timeout_ms=35000,
+                            )
+                            time.sleep(0.5)
+                        except Exception:
+                            pass
 
                     # Re-resolver por si el enlace IMAP quedó en ablink
                     if "ablink." in (url or "").lower():
@@ -3534,7 +4903,7 @@ def abrir_enlace_familia_con_autocierre(
                                 raise
                         else:
                             raise
-                    time.sleep(2.0)
+                    time.sleep(0.4 if pwd_cuenta else 2.0)
                     _invite_limpiar_cookies_agresivo(page)
                     try:
                         url_post = (page.url or "").lower()
@@ -3666,6 +5035,8 @@ def abrir_enlace_familia_con_autocierre(
             rotaciones_antibot_loop = 0
             max_rotaciones_antibot_loop = 5
             estado_login = {}
+            if pwd_cuenta:
+                _invite_instalar_parche_login(page, correo, pwd_cuenta, estado_login)
             t_sin_ui = time.time()
             t_verif_dispositivo = 0.0
             recargas_stuck = 0
@@ -3707,6 +5078,9 @@ def abrir_enlace_familia_con_autocierre(
                             pass
                         _liberar_proxy_actual()
                         return "ya_usado"
+
+                    if _invite_debe_abortar_pwd_incorrecta(page, estado_login):
+                        return _salir_pwd_incorrecta()
 
                     if check_sec == 1 or check_sec % 10 == 0:
                         try:
@@ -3770,7 +5144,15 @@ def abrir_enlace_familia_con_autocierre(
                             _invite_pantalla_correo_con_continuar(page)
                             or _invite_es_formulario_registro(page)
                             or _invite_hay_pantalla_codigo(page)
+                            or _invite_es_pantalla_password_login(page)
+                            or _invite_hay_campo_password_vivo(page)
+                            or _invite_continuar_esta_cargando(page)
                             or _invite_queda_boton_aceptar(page)
+                            or _invite_detectar_pwd_incorrecta(page)
+                            or bool(
+                                estado_login.get("pwd_enviada")
+                                and not estado_login.get("registro_nuevo")
+                            )
                         )
                     except Exception:
                         en_ui_activa = False
@@ -3784,6 +5166,10 @@ def abrir_enlace_familia_con_autocierre(
                         if resultado == "fallo_otp":
                             print(f"    {Color.FAIL}[Invitación] [{correo}] Verificación OTP fallida.{Color.ENDC}")
                             break
+                        if resultado == "pwd_incorrecta":
+                            return _salir_pwd_incorrecta()
+                        if resultado == "invite_ajeno":
+                            return _salir_invite_ajeno()
                         if resultado in ("progreso", "sin_pwd", "esperar"):
                             time.sleep(0.12 if resultado == "progreso" else 0.28)
                             continue
@@ -3999,6 +5385,10 @@ def abrir_enlace_familia_con_autocierre(
                     if resultado == "fallo_otp":
                         print(f"    {Color.FAIL}[Invitación] [{correo}] Verificación OTP fallida tras múltiples intentos.{Color.ENDC}")
                         break
+                    if resultado == "pwd_incorrecta":
+                        return _salir_pwd_incorrecta()
+                    if resultado == "invite_ajeno":
+                        return _salir_invite_ajeno()
                     if resultado == "sin_pwd":
                         time.sleep(0.6)
                         continue
@@ -4334,8 +5724,9 @@ def _imprimir_resumen_opcion4(
     fail_list: list[str],
     sin_enlace: list[str] | None = None,
     ya_usados_list: list[str] | None = None,
+    pwd_incorrecta_list: list[str] | None = None,
 ) -> None:
-    """Resumen visual de la opción 4: aceptadas vs previamente utilizadas vs pendientes/fallidas."""
+    """Resumen visual de la opción 4: aceptadas, contraseña incorrecta y errores."""
     def _norm(c: str) -> str:
         return (c or "").strip().lower()
 
@@ -4347,11 +5738,19 @@ def _imprimir_resumen_opcion4(
             vistos_ok.add(k)
             ok_unique.append(c.strip())
 
+    vistos_pwd: set[str] = set()
+    pwd_unique: list[str] = []
+    for c in (pwd_incorrecta_list or []):
+        k = _norm(c)
+        if k and k not in vistos_ok and k not in vistos_pwd:
+            vistos_pwd.add(k)
+            pwd_unique.append(c.strip())
+
     vistos_ya_usados: set[str] = set()
     ya_usados_unique: list[str] = []
     for c in (ya_usados_list or []):
         k = _norm(c)
-        if k and k not in vistos_ok and k not in vistos_ya_usados:
+        if k and k not in vistos_ok and k not in vistos_pwd and k not in vistos_ya_usados:
             vistos_ya_usados.add(k)
             ya_usados_unique.append(c.strip())
 
@@ -4359,14 +5758,25 @@ def _imprimir_resumen_opcion4(
     fail_unique: list[str] = []
     for c in fail_list:
         k = _norm(c)
-        if k and k not in vistos_ok and k not in vistos_ya_usados and k not in vistos_fail:
+        if (
+            k
+            and k not in vistos_ok
+            and k not in vistos_pwd
+            and k not in vistos_ya_usados
+            and k not in vistos_fail
+        ):
             vistos_fail.add(k)
             fail_unique.append(c.strip())
 
-    # Cualquier correo del menú que no esté en OK, Ya usados, ni FAIL
     for c in correos_menu or []:
         k = _norm(c)
-        if k and k not in vistos_ok and k not in vistos_ya_usados and k not in vistos_fail:
+        if (
+            k
+            and k not in vistos_ok
+            and k not in vistos_pwd
+            and k not in vistos_ya_usados
+            and k not in vistos_fail
+        ):
             fail_unique.append(c.strip())
             vistos_fail.add(k)
 
@@ -4377,15 +5787,21 @@ def _imprimir_resumen_opcion4(
     print(f"{Color.BLUE}{Color.BOLD}   RESUMEN OPCIÓN 4 — INVITACIONES FAMILIARES{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
     print(f" Total en menú: {len(correos_menu or [])}")
-    print(f" {Color.GREEN}Aceptadas OK: {len(ok_unique)}{Color.ENDC}")
+    print(f" {Color.GREEN}Aceptadas: {len(ok_unique)}{Color.ENDC}")
+    print(f" {Color.FAIL}Contraseña incorrecta: {len(pwd_unique)}{Color.ENDC}")
     if ya_usados_unique:
         print(f" {Color.CYAN}Enlace previamente utilizado (ya aceptado o caducado): {len(ya_usados_unique)}{Color.ENDC}")
-    print(f" {Color.FAIL}Pendientes / fallidas: {len(fail_unique)}{Color.ENDC}")
+    print(f" {Color.FAIL}Errores: {len(fail_unique)}{Color.ENDC}")
 
     if ok_unique:
-        print(f"\n{Color.GREEN}{Color.BOLD}✓ Procesadas correctamente:{Color.ENDC}")
+        print(f"\n{Color.GREEN}{Color.BOLD}✓ Aceptadas:{Color.ENDC}")
         for i, c in enumerate(ok_unique, 1):
             print(f"  {Color.GREEN}{i:2d}. {c}{Color.ENDC}")
+
+    if pwd_unique:
+        print(f"\n{Color.FAIL}{Color.BOLD}✗ Contraseña incorrecta:{Color.ENDC}")
+        for i, c in enumerate(pwd_unique, 1):
+            print(f"  {Color.FAIL}{i:2d}. {c}{Color.ENDC}  (clave de sesiones_imap_cuentas.txt rechazada)")
 
     if ya_usados_unique:
         print(f"\n{Color.CYAN}{Color.BOLD}ℹ Enlace previamente utilizado (ya aceptado o caducado):{Color.ENDC}")
@@ -4393,11 +5809,11 @@ def _imprimir_resumen_opcion4(
             print(f"  {Color.CYAN}{i:2d}. {c}{Color.ENDC}")
 
     if fail_unique:
-        print(f"\n{Color.FAIL}{Color.BOLD}✗ Faltan / fallaron:{Color.ENDC}")
+        print(f"\n{Color.FAIL}{Color.BOLD}✗ Errores:{Color.ENDC}")
         for i, c in enumerate(fail_unique, 1):
             motivo = "sin enlace IMAP" if _norm(c) in sin_enlace_set else "no aceptada / error"
             print(f"  {Color.FAIL}{i:2d}. {c}{Color.ENDC}  ({motivo})")
-    elif not ya_usados_unique:
+    elif not ya_usados_unique and not pwd_unique:
         print(f"\n{Color.GREEN}✗ No quedan pendientes.{Color.ENDC}")
 
     print(f"{Color.BLUE}{Color.BOLD}" + "=" * 60 + f"{Color.ENDC}")
@@ -4427,10 +5843,13 @@ def abrir_enlace_restablecimiento_con_autocierre(
     else:
         print(f"    [Reset] [{correo}] Contraseña a restablecer cargada desde sesiones_imap_cuentas.txt.")
 
-    if not proxy_pe or not proxy_pe.get("server"):
+    if not MODO_SIN_PROXY and (not proxy_pe or not proxy_pe.get("server")):
         print(f"    {Color.FAIL}[Navegador] [{correo}] Sin proxy de Perú disponible. Se omite el "
               f"restablecimiento antes de exponer tu IP real.{Color.ENDC}")
         return False
+    if MODO_SIN_PROXY:
+        print(f"    {Color.CYAN}[Sin Proxy] [{correo}] Restablecimiento con IP real.{Color.ENDC}")
+        proxy_pe = proxy_pe or {}
 
     email_safe = re.sub(r'[^a-zA-Z0-9]', '_', correo)
     profile_dir = Path(tempfile.gettempdir()) / f"tidal_reset_link_{email_safe}_{random.randint(1000, 9999)}"
@@ -4446,15 +5865,12 @@ def abrir_enlace_restablecimiento_con_autocierre(
         def abrir_contexto(proxy, prof_dir):
             kwargs = dict(base_launch_kwargs)
             kwargs["user_data_dir"] = str(prof_dir)
-            p_serv = proxy.get("server", "")
-            if p_serv and not p_serv.startswith("http"):
-                p_serv = "http://" + p_serv
-            kwargs["proxy"] = {
-                "server": p_serv,
-                "username": proxy.get("username", ""),
-                "password": proxy.get("password", ""),
-            }
-            print(f"    [Proxy PE] [{correo}] Conectando mediante proxy de Perú: {p_serv}")
+            anexar_proxy_launch(kwargs, proxy=proxy or {})
+            if MODO_SIN_PROXY or not (proxy or {}).get("server"):
+                print(f"    [Sin Proxy] [{correo}] Conectando con IP real.")
+            else:
+                print(f"    [Proxy PE] [{correo}] Conectando mediante proxy de Perú: "
+                      f"{(proxy or {}).get('server')}")
             try:
                 ctx = p.chromium.launch_persistent_context(**kwargs)
             except Exception as e:
@@ -6379,7 +7795,25 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
         try:
             from otp_worker_client import reclamar_invites_para_aliases
             w_ok, aliases_unicos = reclamar_invites_para_aliases(aliases_unicos, max_age)
-            asignados.update(w_ok)
+            vistos_invite = {_invite_url_identidad(u) for u in asignados.values() if u}
+            for al, link in list((w_ok or {}).items()):
+                ident = _invite_url_identidad(link)
+                em_link = _invite_email_en_url(link)
+                if em_link and not correos_iguales_exacto(em_link, al):
+                    print(f"    {Color.WARNING}[WORKER]{Color.ENDC} {al}: el invite es de "
+                          f"{em_link}, no se usa.")
+                    if al not in aliases_unicos:
+                        aliases_unicos.append(al)
+                    continue
+                if ident and ident in vistos_invite:
+                    print(f"    {Color.WARNING}[WORKER]{Color.ENDC} {al}: invite duplicado, "
+                          f"se busca el suyo por IMAP.")
+                    if al not in aliases_unicos:
+                        aliases_unicos.append(al)
+                    continue
+                asignados[al] = link
+                if ident:
+                    vistos_invite.add(ident)
             if not aliases_unicos:
                 continue
         except Exception as e_w:
@@ -6404,7 +7838,17 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
                     exigir_destinatario_exacto=True,
                 )
             if enlace and "resetpass" not in (enlace or "").lower():
-                asignados[solo] = enlace
+                ident = _invite_url_identidad(enlace)
+                em_link = _invite_email_en_url(enlace)
+                if em_link and not correos_iguales_exacto(em_link, solo):
+                    print(f"    {Color.WARNING}[IMAP]{Color.ENDC} {solo}: el invite es de "
+                          f"{em_link}, no se usa.")
+                elif ident and ident in {
+                    _invite_url_identidad(u) for u in asignados.values() if u
+                }:
+                    print(f"    {Color.WARNING}[IMAP]{Color.ENDC} {solo}: invite duplicado.")
+                else:
+                    asignados[solo] = enlace
             elif enlace:
                 print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Se ignoró un enlace resetpass "
                       f"para {solo} (no es invitación familiar).")
@@ -6414,6 +7858,13 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
         pendientes = list(aliases_unicos)
         uids_usados: set[int] = set()
         links_usados: set[str] = set()
+        for u in asignados.values():
+            if not u:
+                continue
+            links_usados.add(u)
+            ident_prev = _invite_url_identidad(u)
+            if ident_prev:
+                links_usados.add(ident_prev)
         invitaciones: list[dict] = []
 
         def _asignar(alias: str, uid: int, link: str, score: int, tipo: str) -> None:
@@ -6421,7 +7872,11 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
                 return
             if uid and uid in uids_usados:
                 return
-            if link in links_usados:
+            ident = _invite_url_identidad(link)
+            if (link in links_usados) or (ident and ident in links_usados):
+                return
+            em_link = _invite_email_en_url(link)
+            if em_link and not correos_iguales_exacto(em_link, alias):
                 return
             if uid and not _reclamar_uid_correo(buzon_clave, uid):
                 return
@@ -6430,6 +7885,8 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
             if uid:
                 uids_usados.add(uid)
             links_usados.add(link)
+            if ident:
+                links_usados.add(ident)
             color = Color.GREEN if score >= 85 else Color.WARNING
             print(f"    {color}[IMAP]{Color.ENDC} Invitación UID {uid} → {alias} "
                   f"({tipo}, score={score})")
@@ -7997,6 +9454,392 @@ def construir_bypass_pasarelas() -> str:
         pass
     return ",".join(dominios)
 
+
+def proxy_chrome_dict(server=None, username=None, password=None, proxy=None) -> dict | None:
+    """Dict de Playwright para proxy, o None para salir por la IP real."""
+    if MODO_SIN_PROXY:
+        return None
+    if isinstance(proxy, dict):
+        server = server or proxy.get("server")
+        if username is None:
+            username = proxy.get("username") or ""
+        if password is None:
+            password = proxy.get("password") or ""
+    p_serv = (server or "").strip()
+    if not p_serv:
+        return None
+    if not p_serv.startswith(("http://", "https://", "socks5://")):
+        p_serv = "http://" + p_serv
+    d = {"server": p_serv}
+    if username:
+        d["username"] = username
+    if password:
+        d["password"] = password
+    try:
+        d["bypass"] = construir_bypass_pasarelas()
+    except Exception:
+        pass
+    return d
+
+
+def anexar_proxy_launch(kwargs: dict, **proxy_kw) -> dict:
+    """Añade kwargs['proxy'] solo si hay residencial; en MODO_SIN_PROXY lo omite."""
+    d = proxy_chrome_dict(**proxy_kw)
+    if d:
+        kwargs["proxy"] = d
+    else:
+        kwargs.pop("proxy", None)
+    return kwargs
+
+
+def _flush_dns_windows() -> None:
+    try:
+        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
+def _geoip_parsear_json(data: dict, fuente: str) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    if fuente == "ip-api" and str(data.get("status") or "").lower() == "fail":
+        return {}
+    ip = str(data.get("query") or data.get("ip") or "").strip()
+    code = str(
+        data.get("countryCode")
+        or data.get("country_code")
+        or data.get("country_iso")
+        or ""
+    ).strip().upper()
+    name = str(data.get("country") or data.get("country_name") or "").strip()
+    if not code and len(name) == 2:
+        code = name.upper()
+        name = ""
+    if name.upper() == code:
+        name = ""
+    if not ip and not code:
+        return {}
+    return {"ip": ip, "country_code": code, "country": name, "fuente": fuente}
+
+
+def _geoip_es_nigeria(info: dict) -> bool:
+    code = (info.get("country_code") or "").upper()
+    name = (info.get("country") or "").casefold()
+    return code == "NG" or "nigeria" in name
+
+
+def consultar_geoip_publica(*, preferir=None) -> dict:
+    """IP pública y país. Prueba varias fuentes (ip-api a veces se queda en la IP vieja)."""
+    stamp = int(time.time() * 1000)
+    endpoints = (
+        (f"http://ip-api.com/json/?fields=status,country,countryCode,query&_={stamp}", "ip-api"),
+        (f"https://ipinfo.io/json?_={stamp}", "ipinfo"),
+        ("https://ifconfig.co/json", "ifconfig"),
+        (f"https://api.country.is/?_={stamp}", "country.is"),
+    )
+    headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+    visto = []
+    for url, fuente in endpoints:
+        try:
+            r = requests.get(url, timeout=6, headers=headers)
+            if r.status_code != 200:
+                continue
+            info = _geoip_parsear_json(r.json() if r.content else {}, fuente)
+            if not info:
+                continue
+            visto.append(info)
+            if preferir is not None and preferir(info):
+                return info
+        except Exception:
+            continue
+    if visto:
+        return visto[0]
+    return _geoip_via_curl()
+
+
+def _geoip_via_curl() -> dict:
+    """Misma geo por curl.exe (por si requests no sale por la VPN)."""
+    stamp = int(time.time() * 1000)
+    url = f"http://ip-api.com/json/?fields=status,country,countryCode,query&_={stamp}"
+    kw = {"capture_output": True, "text": True, "timeout": 12, "encoding": "utf-8", "errors": "replace"}
+    if sys.platform == "win32":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        res = subprocess.run(["curl.exe", "-s", "-m", "8", url], **kw)
+        if res.returncode != 0 or not (res.stdout or "").strip():
+            return {}
+        return _geoip_parsear_json(json.loads(res.stdout), "curl")
+    except Exception:
+        return {}
+
+
+def ip_publica_es_nigeria(info: dict | None = None) -> tuple[bool, str]:
+    info = consultar_geoip_publica(preferir=_geoip_es_nigeria) if info is None else info
+    if not info:
+        return False, "sin geoip (¿red caída / kill switch?)"
+    ip = info.get("ip") or "?"
+    fuente = info.get("fuente") or ""
+    extra = (info.get("country_code") or info.get("country") or "?")
+    ok = _geoip_es_nigeria(info)
+    return ok, f"{ip} {extra} ({fuente})"
+
+
+def _surfshark_subprocess(args: list[str], timeout_s: float = 90.0) -> bool:
+    script = SCRIPT_DIR / "surfshark_reconectar.py"
+    if not script.is_file():
+        print(f"  {Color.FAIL}[VPN] No se encontró {script.name} junto a sesiones_imap.py.{Color.ENDC}")
+        return False
+    kw = {
+        "capture_output": True,
+        "text": True,
+        "timeout": timeout_s,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if sys.platform == "win32":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        res = subprocess.run([sys.executable, str(script), *args], **kw)
+        out = (res.stdout or "").strip()
+        err = (res.stderr or "").strip()
+        for line in (out.splitlines() + err.splitlines())[-12:]:
+            if line.strip():
+                print(f"    {line}")
+        return res.returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"  {Color.WARNING}[VPN] Timeout ({timeout_s:.0f}s) en la UI de Surfshark.{Color.ENDC}")
+        return False
+    except Exception as e:
+        print(f"  {Color.WARNING}[VPN] Error al lanzar Surfshark: {e}{Color.ENDC}")
+        return False
+
+
+def _esperar_geo_nigeria(timeout_s: float = 18.0, ip_anterior: str = "") -> tuple[bool, str]:
+    deadline = time.time() + timeout_s
+    ultimo = "sin respuesta"
+    while time.time() < deadline:
+        ok, detalle = ip_publica_es_nigeria()
+        ultimo = detalle
+        if ok:
+            return True, detalle
+        if ip_anterior and ip_anterior in detalle:
+            print(f"  [VPN] Geo aún en IP anterior ({detalle})...")
+        else:
+            print(f"  [VPN] Geo aún no es Nigeria ({detalle})...")
+        time.sleep(2.0)
+    curl_info = _geoip_via_curl()
+    if curl_info:
+        ok = _geoip_es_nigeria(curl_info)
+        detalle = f"{curl_info.get('ip') or '?'} {curl_info.get('country_code') or '?'} (curl)"
+        if ok:
+            return True, detalle
+        ultimo = detalle
+    return False, ultimo
+
+
+def asegurar_vpn_nigeria_para_registro(*, reciclar: bool, motivo: str, intentos_auto: int = 2) -> bool:
+    """Deja Surfshark en Nigeria y arranca. No se queda 3 minutos en geo-checks viejos.
+
+    reciclar=True: desconecta y vuelve a conectar Nigeria (IP nueva).
+    reciclar=False: si ya es NG, no toca la VPN; si no, conecta a Nigeria.
+    Si la UI de Surfshark queda en Nigeria pero ip-api sigue en PE (túnel/caché),
+    se considera OK: Chrome sale por la VPN, no por requests de Python.
+    """
+    print(f"\n  {Color.CYAN}[VPN] {motivo} — hace falta Nigeria (NG) en Surfshark.{Color.ENDC}")
+    ip_antes = ""
+    if not reciclar:
+        ok, detalle = ip_publica_es_nigeria()
+        if ok:
+            print(f"  {Color.GREEN}[VPN] [OK] Ya en Nigeria: {detalle}{Color.ENDC}")
+            return True
+        print(f"  {Color.WARNING}[VPN] IP actual no es Nigeria ({detalle}). "
+              f"Conectando Surfshark a Nigeria...{Color.ENDC}")
+        ip_antes = (detalle.split() or [""])[0]
+
+    for intento in range(1, intentos_auto + 1):
+        print(f"  [VPN] Ciclo Surfshark {intento}/{intentos_auto}: Nigeria (un solo paso)...")
+        # Un proceso: desconectar si hace falta + clic en Nigeria, Lagos + esperar «Desconectar».
+        ok_ui = _surfshark_subprocess(
+            ["--ubicacion", "nigeria", "--espera", "3", "--timeout-busqueda", "8"],
+            timeout_s=75.0,
+        )
+        print("  [VPN] Flush DNS...")
+        _flush_dns_windows()
+        time.sleep(3.0)
+        ok, detalle = _esperar_geo_nigeria(16.0, ip_anterior=ip_antes)
+        if ok:
+            print(f"  {Color.GREEN}[VPN] [OK] IP en Nigeria: {detalle}{Color.ENDC}")
+            return True
+        if ok_ui:
+            print(f"  {Color.WARNING}[VPN] Surfshark UI conectada a Nigeria, pero geoip "
+                  f"sigue en ({detalle}). Python a veces no sale por la VPN; Chrome sí.{Color.ENDC}")
+            print(f"  {Color.GREEN}[VPN] [OK] Se arranca el registro: Surfshark está en Nigeria.{Color.ENDC}")
+            return True
+        print(f"  {Color.WARNING}[VPN] Tras el ciclo, ni UI ni geo confirman Nigeria ({detalle}).{Color.ENDC}")
+
+    print(f"  {Color.FAIL}[VPN] No se confirmó Nigeria en automático.{Color.ENDC}")
+    print(f"  {Color.FAIL}[VPN] Conecta Surfshark a NIGERIA a mano. "
+          f"No se registra con otra IP.{Color.ENDC}")
+    while True:
+        try:
+            input(">>> Presiona Enter cuando Surfshark esté en NIGERIA (Conectado y seguro) <<< ")
+        except EOFError:
+            return False
+        _flush_dns_windows()
+        time.sleep(2.0)
+        ok, detalle = ip_publica_es_nigeria()
+        if ok:
+            print(f"  {Color.GREEN}[VPN] [OK] IP en Nigeria: {detalle}{Color.ENDC}")
+            return True
+        print(f"  {Color.WARNING}[VPN] Geoip aún no es Nigeria ({detalle}). "
+              f"Si Surfshark muestra Nigeria, Lagos — se arranca igual.{Color.ENDC}")
+        try:
+            conf = input(">>> ¿Surfshark muestra Nigeria conectado? (s/n) <<< ").strip().lower()
+        except EOFError:
+            return False
+        if conf in ("s", "si", "y", "yes"):
+            print(f"  {Color.GREEN}[VPN] [OK] Confirmado a mano. Arrancando registro.{Color.ENDC}")
+            return True
+
+
+# LATAM para opciones 4 y 9: cualquier IP vale; se rota entre estos países para no quemar una sola.
+SURFSHARK_LATAM_UBICS = (
+    "peru",
+    "bolivia",
+    "chile",
+    "brasil",
+    "ecuador",
+    "colombia",
+    "costa rica",
+    "argentina",
+)
+SURFSHARK_LATAM_CODIGOS = frozenset({"PE", "BO", "CL", "BR", "EC", "CO", "CR", "AR"})
+_SURFSHARK_LATAM_NOMBRES = (
+    "peru", "perú", "bolivia", "chile", "brazil", "brasil",
+    "ecuador", "colombia", "costa rica", "argentina",
+)
+_surfshark_latam_rr = 0
+
+
+def _geoip_es_latam_preferida(info: dict) -> bool:
+    code = (info.get("country_code") or "").upper()
+    if code in SURFSHARK_LATAM_CODIGOS:
+        return True
+    name = (info.get("country") or "").casefold()
+    return any(n in name for n in _SURFSHARK_LATAM_NOMBRES)
+
+
+def _geo_detalle(info: dict) -> str:
+    if not info:
+        return "sin geoip (¿red caída / kill switch?)"
+    ip = info.get("ip") or "?"
+    extra = info.get("country_code") or info.get("country") or "?"
+    fuente = info.get("fuente") or ""
+    return f"{ip} {extra} ({fuente})"
+
+
+def _siguiente_ubicacion_latam() -> str:
+    global _surfshark_latam_rr
+    u = SURFSHARK_LATAM_UBICS[_surfshark_latam_rr % len(SURFSHARK_LATAM_UBICS)]
+    _surfshark_latam_rr += 1
+    return u
+
+
+def asegurar_vpn_latam_para_oleadas(*, reciclar: bool, motivo: str, intentos_auto: int = 2) -> bool:
+    """Opciones 4 y 9: recicla Surfshark en LATAM. Cualquier IP sirve; no bloquea el lote.
+
+    reciclar=False: si ya estamos en PE/BO/CL/BR/EC/CO/CR/AR, no toca la VPN.
+    reciclar=True: desconecta y conecta el siguiente país de la lista (IP nueva).
+    """
+    print(f"\n  {Color.CYAN}[VPN] {motivo} — LATAM preferida "
+          f"(Perú, Bolivia, Chile, Brasil, Ecuador, Colombia, Costa Rica, Argentina). "
+          f"Cualquier IP vale.{Color.ENDC}")
+    if not reciclar:
+        info = consultar_geoip_publica(preferir=_geoip_es_latam_preferida)
+        if info and _geoip_es_latam_preferida(info):
+            print(f"  {Color.GREEN}[VPN] [OK] Ya en LATAM: {_geo_detalle(info)}{Color.ENDC}")
+            return True
+        print(f"  {Color.WARNING}[VPN] IP actual no es LATAM preferida ({_geo_detalle(info)}). "
+              f"Conectando Surfshark...{Color.ENDC}")
+
+    for intento in range(1, intentos_auto + 1):
+        ubicacion = _siguiente_ubicacion_latam()
+        print(f"  [VPN] Ciclo Surfshark {intento}/{intentos_auto}: {ubicacion.title()}...")
+        ok_ui = _surfshark_subprocess(
+            ["--ubicacion", ubicacion, "--espera", "3", "--timeout-busqueda", "8"],
+            timeout_s=75.0,
+        )
+        print("  [VPN] Flush DNS...")
+        _flush_dns_windows()
+        time.sleep(3.0)
+        deadline = time.time() + 12.0
+        ultimo = "sin geoip"
+        while time.time() < deadline:
+            info = consultar_geoip_publica(preferir=_geoip_es_latam_preferida)
+            ultimo = _geo_detalle(info)
+            if info and _geoip_es_latam_preferida(info):
+                print(f"  {Color.GREEN}[VPN] [OK] IP LATAM: {ultimo}{Color.ENDC}")
+                return True
+            time.sleep(2.0)
+        if ok_ui:
+            print(f"  {Color.WARNING}[VPN] Surfshark UI conectada a {ubicacion.title()}, "
+                  f"geoip={ultimo}. Se continúa (Chrome usa la VPN).{Color.ENDC}")
+            return True
+        print(f"  {Color.WARNING}[VPN] No se confirmó {ubicacion.title()} ({ultimo}).{Color.ENDC}")
+
+    print(f"  {Color.WARNING}[VPN] No se pudo reciclar Surfshark. "
+          f"Se sigue con la IP actual (opción 4/9 admite cualquier país).{Color.ENDC}")
+    return True
+
+
+def vpn_latam_antes_de_oleada(*, oleadas_completadas: int, n_oleada: int, n_total: int) -> None:
+    """Cada 2 oleadas recicla Surfshark LATAM. En la primera, conecta si no estamos ya ahí."""
+    if not MODO_SIN_PROXY:
+        return
+    reciclar = oleadas_completadas > 0 and oleadas_completadas % 2 == 0
+    if reciclar:
+        motivo = (f"tras {oleadas_completadas} oleada(s) — reciclar IP LATAM "
+                  f"(antes de oleada {n_oleada}/{n_total})")
+    else:
+        motivo = f"antes de oleada {n_oleada}/{n_total}"
+    asegurar_vpn_latam_para_oleadas(reciclar=reciclar, motivo=motivo)
+
+
+def reiniciar_chrome_ip_real(manager) -> None:
+    """Cierra y reabre Chrome sin proxy (antibot / recarga en MODO_SIN_PROXY)."""
+    correo = getattr(manager, "client_email", "") or ""
+    print(f"  [Sin Proxy] [{correo}] Reiniciando Chrome con IP real...")
+    try:
+        if getattr(manager, "context", None):
+            manager.context.close()
+    except Exception:
+        pass
+    try:
+        if getattr(manager, "playwright", None):
+            manager.playwright.stop()
+    except Exception:
+        pass
+    manager.context = None
+    manager.page = None
+    manager.playwright = None
+    if hasattr(manager, "use_proxy"):
+        manager.use_proxy = False
+    for attr in ("proxy_ng_server", "proxy_pe_server", "proxy_ng_user", "proxy_pe_user",
+                 "proxy_ng_pass", "proxy_pe_pass"):
+        if hasattr(manager, attr):
+            setattr(manager, attr, None)
+    time.sleep(1.2)
+    perfil = getattr(manager, "main_profile", None) or getattr(manager, "perfil_dir", None)
+    if perfil:
+        try:
+            reparar_perfil_corrupto(perfil)
+        except Exception:
+            pass
+    if hasattr(manager, "asegurar_navegador_abierto"):
+        manager.asegurar_navegador_abierto()
+    elif hasattr(manager, "abrir_navegador"):
+        manager.abrir_navegador()
+
 def reparar_perfil_corrupto(profile_dir):
     """Repara un perfil de Chrome corrupto eliminando archivos problemáticos y suprimiendo avisos de restauración/contraseñas."""
     profile_path = Path(profile_dir)
@@ -8207,6 +10050,18 @@ def url_es_pagina_marketing(url: str) -> bool:
     )) or u.rstrip("/").endswith("tidal.com") or u.rstrip("/").endswith("www.tidal.com")
 
 
+def url_path_tidal(url: str) -> str:
+    """Path de una URL Tidal (sin query/fragment). El host no forma parte del path.
+
+    Evita falsos positivos tipo '/account' dentro de 'https://account.tidal.com'.
+    """
+    u = (url or "").split("#", 1)[0].split("?", 1)[0]
+    m = re.search(r"https?://[^/]+(/[^?#]*)?$", u, re.I)
+    if not m:
+        return "/"
+    return (m.group(1) or "/").lower()
+
+
 def url_es_login_o_cuenta(url: str) -> bool:
     """True solo si ya estamos en el flujo de cuenta/login (no en marketing)."""
     u = (url or "").lower()
@@ -8226,6 +10081,18 @@ def url_llegada_coincide_destino(url_actual: str, url_destino: str) -> bool:
     # Calentamiento a /pricing: basta con estar en tidal.com
     if "/pricing" in destino:
         return "tidal.com" in actual
+    # Destino /profile: login.tidal.com/authorize (formulario vacío) NO es llegada válida.
+    # Antes se aceptaba cualquier URL de login/cuenta, y la opción 10 dejaba ventanas
+    # en "Regístrate o Inicia Sesión" como si el login hubiera funcionado.
+    if "account.tidal.com" in destino and "/profile" in destino:
+        if "login.tidal.com" in actual or "/authorize" in actual:
+            return False
+        path = url_path_tidal(actual)
+        return (
+            "account.tidal.com" in actual
+            and "/login" not in path
+            and path.startswith("/profile")
+        )
     # Destino login/cuenta: quedarse en /pricing NO cuenta como éxito
     if "account.tidal.com" in destino or "login.tidal.com" in destino:
         return url_es_login_o_cuenta(actual)
@@ -10219,13 +12086,13 @@ class TidalRegisterManager:
                  cancel_event=None):
         self.client_email = client_email
         self.client_pwd = client_pwd
-        self.use_proxy = proxy_ng_server is not None
-        self.proxy_ng_server = proxy_ng_server
-        self.proxy_ng_user = proxy_ng_user
-        self.proxy_ng_pass = proxy_ng_pass
-        self.proxy_pe_server = proxy_pe_server
-        self.proxy_pe_user = proxy_pe_user
-        self.proxy_pe_pass = proxy_pe_pass
+        self.use_proxy = False if MODO_SIN_PROXY else (proxy_ng_server is not None)
+        self.proxy_ng_server = None if MODO_SIN_PROXY else proxy_ng_server
+        self.proxy_ng_user = None if MODO_SIN_PROXY else proxy_ng_user
+        self.proxy_ng_pass = None if MODO_SIN_PROXY else proxy_ng_pass
+        self.proxy_pe_server = None if MODO_SIN_PROXY else proxy_pe_server
+        self.proxy_pe_user = None if MODO_SIN_PROXY else proxy_pe_user
+        self.proxy_pe_pass = None if MODO_SIN_PROXY else proxy_pe_pass
         # El proceso arranca siempre en la fase de Nigeria; cambiar_a_proxy_peru() conmuta después a PE
         self.current_proxy_type = "NG"
         self.headless = headless
@@ -10408,6 +12275,9 @@ class TidalRegisterManager:
 
     def rotar_proxy_contexto(self, tipo="NG"):
         global valid_ng_list, valid_pe_list
+        if MODO_SIN_PROXY:
+            reiniciar_chrome_ip_real(self)
+            return
         proxy_tipo = tipo if tipo in ("NG", "PE") else (self.current_proxy_type or "NG")
         print(f"\n  [Proxy Rotation] Rotando proxy de {'Perú' if proxy_tipo == 'PE' else 'Nigeria'} por uno nuevo...")
         try:
@@ -10465,6 +12335,12 @@ class TidalRegisterManager:
         self.asegurar_navegador_abierto()
 
     def cambiar_a_proxy_peru(self):
+        if MODO_SIN_PROXY:
+            print(f"\n  [Sin Proxy] [{self.client_email}] Checkout/pago con la misma IP real "
+                  f"(sin cambiar a proxy PE).")
+            self.current_proxy_type = "PE"
+            self.use_proxy = False
+            return
         print(f"\n  [Proxy Switch] [{self.client_email}] Registro inicial finalizado.")
         print(f"  [Proxy Switch] [{self.client_email}] Cambiando a proxy de PERÚ para el proceso de pago...")
         try:
@@ -10550,7 +12426,7 @@ class TidalRegisterManager:
         reparar_perfil_corrupto(self.main_profile)
         launch_args = list(CHROME_SILENT_ARGS)
         proxy_dict = None
-        if self.use_proxy:
+        if not MODO_SIN_PROXY and self.use_proxy:
             if self.current_proxy_type == "PE" and self.proxy_pe_server:
                 p_serv = self.proxy_pe_server
                 if p_serv and not p_serv.startswith("http"):
@@ -10571,6 +12447,8 @@ class TidalRegisterManager:
                 if self.proxy_ng_pass:
                     proxy_dict["password"] = self.proxy_ng_pass
                 print(f"  [Proxy] Usando proxy de NIGERIA: {p_serv}")
+        elif MODO_SIN_PROXY:
+            print(f"  [Sin Proxy] [{self.client_email}] Chrome con IP real.")
 
         if proxy_dict:
             # Sin esta exclusión el iframe de la tarjeta (Adyen) recibe ERR_TUNNEL_CONNECTION_FAILED
@@ -10584,10 +12462,10 @@ class TidalRegisterManager:
             "ignore_default_args": ["--enable-automation", "--no-sandbox"],
             "viewport": {"width": 1280, "height": 800},
             "locale": "es-ES",
-            "proxy": proxy_dict,
             "channel": "chrome",
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
+        anexar_proxy_launch(launch_kwargs, proxy=proxy_dict)
             
         try:
             self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -10867,23 +12745,36 @@ class TidalRegisterManager:
                     except Exception:
                         pass
 
-                time.sleep(0.85)
-            
-            # Verificar si pide contraseña (cuenta ya registrada)
-            pwd_input_check = encontrar_locator_en_frames(self.page, ['input[type="password"]', 'input[name="password"]'])
-            if pwd_input_check:
-                print(f"  {Color.WARNING}[Registro] La cuenta {self.client_email} ya está registrada en TIDAL. Omitiendo...{Color.ENDC}")
-                registro_exitoso = True
-                return True
+                time.sleep(0.4)
+
+            # Tras Continuar: alta (Crea tu cuenta) vs cuenta ya registrada (contraseña o código).
+            self._registro_cuenta_existente = False
+            for _w_exist in range(40):
+                try:
+                    self.page = pagina_vigente(self.page)
+                except Exception:
+                    pass
+                if _tidal_es_login_cuenta_existente(self.page):
+                    print(f"  {Color.WARNING}[Registro] La cuenta {self.client_email} ya está "
+                          f"registrada en TIDAL (login: contraseña o código). "
+                          f"Se cierra Chrome y se omite el alta.{Color.ENDC}")
+                    self._registro_cuenta_existente = True
+                    registro_exitoso = True
+                    return True
+                if _invite_es_formulario_registro(self.page):
+                    break
+                time.sleep(0.2)
 
             print("  [Registro] Rellenando fecha de nacimiento (15/08/1995) y términos...")
             # Esperar a que Tidal pinte DOB (Crea tu cuenta) tras Continuar; si se rellena
             # antes, el helper ve 0 selects y Suscríbete se pulsa disabled → no sale OTP.
             for _w_dob in range(24):
-                if encontrar_locator_en_frames(
-                    self.page, ['input[type="password"]', 'input[name="password"]']
-                ):
-                    break
+                if _tidal_es_login_cuenta_existente(self.page):
+                    print(f"  {Color.WARNING}[Registro] La cuenta {self.client_email} ya está "
+                          f"registrada en TIDAL. Se cierra Chrome y se omite el alta.{Color.ENDC}")
+                    self._registro_cuenta_existente = True
+                    registro_exitoso = True
+                    return True
                 if _invite_es_formulario_registro(self.page):
                     break
                 time.sleep(0.25)
@@ -11048,15 +12939,28 @@ class TidalRegisterManager:
                     # ~7s de poll rápido; worker cada ciclo, IMAP cada ~1.4s
                     for poll in range(20):
                         self._abortar_si_oleada_cancelada()
+                        if _tidal_es_login_cuenta_existente(self.page):
+                            print(f"  {Color.WARNING}[Registro] [{self.client_email}] Login de "
+                                  f"cuenta existente (contraseña/código). Se omite el alta.{Color.ENDC}")
+                            self._registro_cuenta_existente = True
+                            return False
                         if _pantalla_otp_registro() or self._sesion_post_registro_detectada():
                             return True
                         peek_ahora = usa_worker_otp or (poll > 0 and poll % 4 == 0)
                         if peek_ahora:
                             _peek_otp_llegado(silencioso=True)
+                            if _tidal_es_login_cuenta_existente(self.page):
+                                self._registro_cuenta_existente = True
+                                return False
                             if _pantalla_otp_registro() or self._sesion_post_registro_detectada():
                                 return True
                         time.sleep(0.25 if usa_worker_otp else 0.35)
 
+                    if _tidal_es_login_cuenta_existente(self.page):
+                        print(f"  {Color.WARNING}[Registro] [{self.client_email}] Login de "
+                              f"cuenta existente (contraseña/código). Se omite el alta.{Color.ENDC}")
+                        self._registro_cuenta_existente = True
+                        return False
                     if _pantalla_otp_registro() or self._sesion_post_registro_detectada():
                         return True
 
@@ -11089,12 +12993,9 @@ class TidalRegisterManager:
 
                     # Cuenta ya existente → no hace falta OTP de registro
                     try:
-                        if encontrar_locator_en_frames(
-                            self.page,
-                            ['input[type="password"]', 'input[name="password"]']
-                        ) and not _sigue_en_formulario_registro():
+                        if _tidal_es_login_cuenta_existente(self.page) and not _sigue_en_formulario_registro():
                             print(f"  {Color.WARNING}[Registro] [{self.client_email}] Apareció "
-                                  f"login por contraseña (cuenta ya existente).{Color.ENDC}")
+                                  f"login (contraseña o código): cuenta ya existente.{Color.ENDC}")
                             self._registro_cuenta_existente = True
                             return False
                     except Exception:
@@ -11220,9 +13121,7 @@ class TidalRegisterManager:
                     except Exception:
                         pass
                     time.sleep(0.85)
-                    if encontrar_locator_en_frames(
-                        self.page, ['input[type="password"]', 'input[name="password"]']
-                    ):
+                    if _tidal_es_login_cuenta_existente(self.page):
                         self._registro_cuenta_existente = True
                         break
                     for _w_dob2 in range(20):
@@ -11239,7 +13138,7 @@ class TidalRegisterManager:
 
             if getattr(self, "_registro_cuenta_existente", False):
                 print(f"  {Color.WARNING}[Registro] La cuenta {self.client_email} ya está "
-                      f"registrada en TIDAL. Omitiendo...{Color.ENDC}")
+                      f"registrada en TIDAL. Cerrando Chrome y omitiendo el alta...{Color.ENDC}")
                 registro_exitoso = True
                 return True
 
@@ -12341,11 +14240,14 @@ class TidalRegisterManager:
                     self.use_proxy = True
                     print(f"  [TuneMyMusic] [{self.client_email}] Usando proxy de PERÚ: {p_serv}")
                 else:
-                    # No exponer IP real a DataDome vía TMM
-                    raise RuntimeError(
-                        f"Sin proxy de Perú para TuneMyMusic ({self.client_email}). "
-                        f"Se omite la transferencia antes de exponer tu IP real."
-                    )
+                    if MODO_SIN_PROXY:
+                        print(f"  [TuneMyMusic] [{self.client_email}] Sin proxy: transferencia con IP real.")
+                    else:
+                        # No exponer IP real a DataDome vía TMM
+                        raise RuntimeError(
+                            f"Sin proxy de Perú para TuneMyMusic ({self.client_email}). "
+                            f"Se omite la transferencia antes de exponer tu IP real."
+                        )
 
                 launch_args = [
                     "--credentials-enable-service=false",
@@ -12363,9 +14265,9 @@ class TidalRegisterManager:
                     "ignore_default_args": ["--enable-automation", "--no-sandbox"],
                     "viewport": {"width": 1280, "height": 800},
                     "locale": "es-ES",
-                    "proxy": proxy_dict,
                     "channel": "chrome",
                 }
+                anexar_proxy_launch(launch_kwargs, proxy=proxy_dict)
                 reparar_perfil_corrupto(self.main_profile)
                 ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
                 ctx.set_default_navigation_timeout(60000)
@@ -12629,10 +14531,10 @@ class TidalResetPasswordManager:
     def __init__(self, client_email, target_pwd, proxy_pe_server=None, proxy_pe_user=None, proxy_pe_pass=None, headless=False, barreras=None, thread_index=1):
         self.client_email = client_email
         self.target_pwd = target_pwd
-        self.use_proxy = proxy_pe_server is not None
-        self.proxy_pe_server = proxy_pe_server
-        self.proxy_pe_user = proxy_pe_user
-        self.proxy_pe_pass = proxy_pe_pass
+        self.use_proxy = False if MODO_SIN_PROXY else (proxy_pe_server is not None)
+        self.proxy_pe_server = None if MODO_SIN_PROXY else proxy_pe_server
+        self.proxy_pe_user = None if MODO_SIN_PROXY else proxy_pe_user
+        self.proxy_pe_pass = None if MODO_SIN_PROXY else proxy_pe_pass
         self.headless = headless
         self.barreras = barreras or {}
         self.thread_index = thread_index
@@ -12763,6 +14665,9 @@ class TidalResetPasswordManager:
 
     def rotar_proxy_contexto(self, tipo="PE"):
         global GLOBAL_PE_PROXY_POOL
+        if MODO_SIN_PROXY:
+            reiniciar_chrome_ip_real(self)
+            return
         print(f"\n  [Proxy Rotation PE] Rotando proxy de Perú por bloqueo antirobot...")
         try:
             if self.context:
@@ -12811,8 +14716,11 @@ class TidalResetPasswordManager:
             return res
 
     def _garantizar_proxy_pe(self) -> None:
-        """Asegura proxy PE válido antes de abrir Chrome. Sin esto, asegurar_navegador_abierto
-        lanza RuntimeError y puede tumbar la sincronización del lote entero."""
+        """Asegura proxy PE válido antes de abrir Chrome. En MODO_SIN_PROXY no exige pool."""
+        if MODO_SIN_PROXY:
+            self.use_proxy = False
+            self.proxy_pe_server = None
+            return
         if self.proxy_pe_server:
             self.use_proxy = True
             return
@@ -12842,18 +14750,18 @@ class TidalResetPasswordManager:
             from playwright.sync_api import sync_playwright
             self.playwright = sync_playwright().start()
             
-        p_serv = self.proxy_pe_server
-        if p_serv and not p_serv.startswith("http"):
-            p_serv = "http://" + p_serv
-        proxy_dict = {"server": p_serv}
-        if self.proxy_pe_user:
-            proxy_dict["username"] = self.proxy_pe_user
-        if self.proxy_pe_pass:
-            proxy_dict["password"] = self.proxy_pe_pass
-        print(f"  [Proxy PE] [{self.client_email}] Usando proxy de PERÚ para el restablecimiento: {p_serv}")
-            
         launch_kwargs = kwargs_launch_persistent(self.main_profile, headless=self.headless)
-        launch_kwargs["proxy"] = proxy_dict
+        if MODO_SIN_PROXY or not self.proxy_pe_server:
+            print(f"  [Sin Proxy] [{self.client_email}] Restablecimiento con IP real.")
+        else:
+            anexar_proxy_launch(
+                launch_kwargs,
+                server=self.proxy_pe_server,
+                username=self.proxy_pe_user,
+                password=self.proxy_pe_pass,
+            )
+            print(f"  [Proxy PE] [{self.client_email}] Usando proxy de PERÚ para el restablecimiento: "
+                  f"{self.proxy_pe_server}")
             
         try:
             self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -14631,7 +16539,11 @@ class TidalFamilyInviter:
     def abrir_navegador(self):
         global GLOBAL_PE_PROXY_POOL
 
-        if not self.proxy_pe_server:
+        if MODO_SIN_PROXY:
+            self.use_proxy = False
+            self.proxy_pe_server = None
+            print(f"  [Sin Proxy] [Inviter Titular] Chrome con IP real.")
+        elif not self.proxy_pe_server:
             # Reservar el proxy en el pool evita que el invitador comparta IP con los hilos de
             # restablecimiento, que es lo que disparaba el antirobot en la ventana del titular.
             # Sin fallback a random.choice: escogía un proxy sin reservarlo en el pool y podía
@@ -14643,13 +16555,9 @@ class TidalFamilyInviter:
             self.proxy_pe_server = p_pe.get("server", "")
             self.proxy_pe_user = p_pe.get("username", "")
             self.proxy_pe_pass = p_pe.get("password", "")
-        self.use_proxy = True
+            self.use_proxy = True
 
         reparar_perfil_corrupto(self.perfil_dir)
-
-        p_serv = self.proxy_pe_server
-        if p_serv and not p_serv.startswith("http"):
-            p_serv = "http://" + p_serv
 
         launch_kwargs = {
             "user_data_dir": str(self.perfil_dir),
@@ -14661,13 +16569,15 @@ class TidalFamilyInviter:
             "viewport": {"width": 1280, "height": 800},
             "locale": "es-ES",
             "channel": "chrome",
-            "proxy": {
-                "server": p_serv,
-                "username": self.proxy_pe_user or "",
-                "password": self.proxy_pe_pass or ""
-            }
         }
-        print(f"  [Inviter Titular] Conectando mediante proxy de Perú: {p_serv}")
+        if not MODO_SIN_PROXY and self.proxy_pe_server:
+            anexar_proxy_launch(
+                launch_kwargs,
+                server=self.proxy_pe_server,
+                username=self.proxy_pe_user,
+                password=self.proxy_pe_pass,
+            )
+            print(f"  [Inviter Titular] Conectando mediante proxy de Perú: {self.proxy_pe_server}")
 
         from playwright.sync_api import sync_playwright
         if not self.playwright:
@@ -14689,6 +16599,9 @@ class TidalFamilyInviter:
 
     def rotar_proxy_contexto(self, tipo="PE"):
         global GLOBAL_PE_PROXY_POOL
+        if MODO_SIN_PROXY:
+            reiniciar_chrome_ip_real(self)
+            return
         print("\n  [Proxy Rotation PE] Rotando proxy del invitador familiar por bloqueo antirobot...")
         try:
             if self.context:
@@ -15668,13 +17581,18 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
     fail_list: list[str] = []
 
     num_cuentas = len(correos_lista)
-    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para restablecimiento (Opción 9)...{Color.ENDC}")
-    valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas + 5)
-    if not valid_pe_list:
-        return _pause_o_return(
-            f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige "
-            f"(solicitud y enlace de restablecimiento). Valida la lista con la opción 13 antes de continuar."
-        )
+    if MODO_SIN_PROXY:
+        print(f"\n{Color.CYAN}[Sin Proxy] Opción 9 con IP real (sin proxies residenciales).{Color.ENDC}")
+        valid_pe_list = []
+        asegurar_vpn_latam_para_oleadas(reciclar=False, motivo="inicio opción 9")
+    else:
+        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para restablecimiento (Opción 9)...{Color.ENDC}")
+        valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas + 5)
+        if not valid_pe_list:
+            return _pause_o_return(
+                f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige "
+                f"(solicitud y enlace de restablecimiento). Valida la lista con la opción 13 antes de continuar."
+            )
 
     inviter_threads: list[threading.Thread] = []
     # Invitar solo los correos procesados, cada uno al titular de su bloque en titular_familiar.txt
@@ -15765,11 +17683,19 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
     n_oleadas = max(1, (total_cuentas + batch_size - 1) // batch_size)
     if total_cuentas > batch_size:
         print(f"\n{Color.CYAN}{Color.BOLD}[Opción 9] {total_cuentas} cuentas → {n_oleadas} oleadas "
-              f"de hasta {batch_size} ventanas en simultáneo (solo proxy PE)...{Color.ENDC}\n")
+              f"de hasta {batch_size} ventanas en simultáneo"
+              f"{' (IP real / Surfshark LATAM)' if MODO_SIN_PROXY else ' (solo proxy PE)'}...{Color.ENDC}")
     else:
         print(f"\n{Color.CYAN}{Color.BOLD}[Opción 9] Restableciendo {total_cuentas} cuenta(s) "
-              f"(hasta {batch_size} ventanas en simultáneo, solo proxy PE)...{Color.ENDC}\n")
+              f"(hasta {batch_size} ventanas en simultáneo"
+              f"{', IP real / Surfshark LATAM' if MODO_SIN_PROXY else ', solo proxy PE'})...{Color.ENDC}")
+    if MODO_SIN_PROXY:
+        print(f"{Color.CYAN}VPN: cualquier IP vale. Se prefiere LATAM (Perú, Bolivia, Chile, Brasil, "
+              f"Ecuador, Colombia, Costa Rica, Argentina). Si el proceso es largo, cada 2 oleadas "
+              f"se recicla Surfshark a otro de esos países.{Color.ENDC}")
+    print()
 
+    oleadas_completadas = 0
     for b_start in range(0, total_cuentas, batch_size):
         lote_correos = correos_lista[b_start : b_start + batch_size]
         num_cuentas_lote = len(lote_correos)
@@ -15789,6 +17715,9 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
                   f"({b_start + 1}-{b_start + num_cuentas_lote} de {total_cuentas}) ==={Color.ENDC}")
             for c_o in lote_correos:
                 print(f"    • {c_o}")
+        vpn_latam_antes_de_oleada(
+            oleadas_completadas=oleadas_completadas, n_oleada=n_oleada, n_total=n_oleadas
+        )
 
         def restablecer_un_correo(idx_rel, correo):
             if idx_rel > 1:
@@ -15797,7 +17726,7 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
             idx_abs = b_start + idx_rel
             contrasena = cuentas_map[correo]
 
-            p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+            p_pe = None if MODO_SIN_PROXY else GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
             p_pe_server = p_pe.get("server") if p_pe else None
             p_pe_user = p_pe.get("username") if p_pe else None
             p_pe_pass = p_pe.get("password") if p_pe else None
@@ -15842,6 +17771,7 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
             print(f"  {Color.CYAN}[Opción 9] Oleada {n_oleada}/{n_oleadas} terminada. "
                   f"Pasando a la siguiente...{Color.ENDC}")
             time.sleep(1.5)
+        oleadas_completadas += 1
     vivos = [t for t in inviter_threads if t.is_alive()]
     if vivos:
         print(f"\n{Color.CYAN}Esperando a que finalicen {len(vivos)} invitador(es) familiar(es)...{Color.ENDC}")
@@ -15890,10 +17820,10 @@ class TidalAutoLoginManager:
                  mantener_ventana_si_falla=False):
         self.client_email = client_email
         self.target_pwd = target_pwd
-        self.proxy_pe_server = proxy_pe_server
-        self.proxy_pe_user = proxy_pe_user
-        self.proxy_pe_pass = proxy_pe_pass
-        self.use_proxy = proxy_pe_server is not None
+        self.proxy_pe_server = None if MODO_SIN_PROXY else proxy_pe_server
+        self.proxy_pe_user = None if MODO_SIN_PROXY else proxy_pe_user
+        self.proxy_pe_pass = None if MODO_SIN_PROXY else proxy_pe_pass
+        self.use_proxy = False if MODO_SIN_PROXY else (proxy_pe_server is not None)
         self.headless = headless
         self.barreras = barreras or {}
         self.thread_index = thread_index
@@ -15989,6 +17919,9 @@ class TidalAutoLoginManager:
 
     def rotar_proxy_contexto(self, tipo="PE"):
         global GLOBAL_PE_PROXY_POOL
+        if MODO_SIN_PROXY:
+            reiniciar_chrome_ip_real(self)
+            return
         print(f"\n  [Proxy Rotation PE] Rotando proxy de Perú por bloqueo antirobot...")
         try:
             if self.context:
@@ -16168,23 +18101,24 @@ class TidalAutoLoginManager:
 
     def iniciar_sesion_con_codigo_email(self, base_email_id: int = 0) -> bool:
         """Último recurso cuando Tidal no ofrece la opción de contraseña: usar el código de acceso."""
-        print(f"  [Login] [{self.client_email}] Recuperando el código de acceso desde el buzón...")
+        print(f"  [Login] [{self.client_email}] Recuperando el código de acceso (worker/IMAP)...")
         codigo = None
-        for intento in range(1, 13):  # 12 intentos * 10s = 2 minutos
-            codigo = obtener_codigo_via_imap(
-                gmail_user=self.client_email,
-                required_keywords=["código", "code", "inici"],
-                query_exclude=EXCLUDE_OTP_GENERICO,
-                after_email_id=base_email_id
+        for intento in range(1, 21):
+            codigo = reclamar_otp_login_para_alias(
+                self.client_email,
+                after_email_id=base_email_id,
+                max_age_minutes=20,
+                silencioso=(intento > 1),
             )
             if codigo:
                 break
-            if intento < 12:
-                print(f"  [Login] [{self.client_email}] Intento {intento}/12: el código de acceso aún no ha llegado...")
-                time.sleep(10.0)
+            if intento < 20:
+                if intento == 1 or intento % 4 == 0:
+                    print(f"  [Login] [{self.client_email}] Intento {intento}/20: el código aún no ha llegado...")
+                time.sleep(2.0)
 
         if not codigo:
-            print(f"  [Login] {Color.FAIL}[ERROR] [{self.client_email}] No llegó el código de acceso al buzón.{Color.ENDC}")
+            print(f"  [Login] {Color.FAIL}[ERROR] [{self.client_email}] No llegó el código de acceso.{Color.ENDC}")
             return False
 
         print(f"  [Login] [{self.client_email}] {Color.GREEN}Código de acceso obtenido: {codigo}{Color.ENDC}")
@@ -16202,7 +18136,10 @@ class TidalAutoLoginManager:
         )
         if btn_entrar:
             try:
-                btn_entrar.click(timeout=3000, force=True)
+                if not btn_entrar.is_disabled():
+                    btn_entrar.click(timeout=3000)
+                else:
+                    btn_entrar.click(timeout=3000, force=True)
             except Exception:
                 pass
 
@@ -16493,22 +18430,16 @@ class TidalAutoLoginManager:
             "accept_downloads": True
         }
 
-        if self.proxy_pe_server:
-            p_serv = self.proxy_pe_server
-            if not p_serv.startswith("http://") and not p_serv.startswith("https://") and not p_serv.startswith("socks5://"):
-                p_serv = "http://" + p_serv
-            proxy_dict = {"server": p_serv}
-            if self.proxy_pe_user:
-                proxy_dict["username"] = self.proxy_pe_user
-            if self.proxy_pe_pass:
-                proxy_dict["password"] = self.proxy_pe_pass
-            launch_kwargs["proxy"] = proxy_dict
-            print(f"  [Proxy PE] [{self.client_email}] Conectando obligatoriamente con proxy de Perú: {p_serv}")
-        else:
-            # Nunca salir por la IP real: DataDome la marcaría y bloquearía todo el proceso a futuro
-            raise RuntimeError(
-                f"Sin proxy de Perú disponible para {self.client_email}. Se aborta la cuenta antes de exponer tu IP real."
+        if self.proxy_pe_server and not MODO_SIN_PROXY:
+            anexar_proxy_launch(
+                launch_kwargs,
+                server=self.proxy_pe_server,
+                username=self.proxy_pe_user,
+                password=self.proxy_pe_pass,
             )
+            print(f"  [Proxy PE] [{self.client_email}] Conectando con proxy de Perú: {self.proxy_pe_server}")
+        else:
+            print(f"  [Sin Proxy] [{self.client_email}] Chrome con IP real.")
         
         try:
             self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -16579,6 +18510,7 @@ class TidalAutoLoginManager:
         try:
             self.page = pagina_vigente(self.page)
             url = self.page.url.lower()
+            path = url_path_tidal(url)
             # Puente OAuth tras contraseña: todavía no es sesión consolidada, pero tampoco es fallo
             if "/login/tidal/return" in url or "/login/tidal/callback" in url:
                 return False
@@ -16586,13 +18518,15 @@ class TidalAutoLoginManager:
                 return False
             if self.hay_formulario_login_visible():
                 return False
-            # Rutas de cuenta autenticada
+            # Rutas de cuenta autenticada (path real, no el host account.tidal.com)
             if "account.tidal.com" in url and any(
-                kw in url for kw in ["/profile", "/settings", "/subscription", "/family",
-                                     "/overview", "/payment", "/gift", "/account"]
+                path.startswith(kw) for kw in (
+                    "/profile", "/settings", "/subscription", "/family",
+                    "/overview", "/payment", "/gift",
+                )
             ):
                 return True
-            if "account.tidal.com" in url and "/login" not in url:
+            if "account.tidal.com" in url and not path.startswith("/login"):
                 body_txt = self.page.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''")
                 senales_cuenta = ["cerrar sesión", "sign out", "log out", "detalles de inicio de sesión",
                                   "login details", "editar perfil", "edit profile", "plan familiar",
@@ -16604,12 +18538,9 @@ class TidalAutoLoginManager:
                     return False
                 if any(s in body_txt for s in senales_cuenta):
                     return True
-                # account.tidal.com/ sin formulario de login tras OAuth = sesión casi siempre válida
-                if not encontrar_locator_en_frames(
-                    self.page,
-                    ['input[type="email"]', 'input[name="email"]', '#email', 'input[type="password"]']
-                ):
-                    return True
+                # Un flash vacío de account.tidal.com/ NO es sesión: Tidal redirige a
+                # login.tidal.com/authorize y la opción 10 dejaba el formulario vacío.
+                return False
         except Exception:
             pass
         return False
@@ -16632,7 +18563,22 @@ class TidalAutoLoginManager:
                     return False
                 if self.hay_formulario_login_visible():
                     return False
-                if "account.tidal.com" in url and "/login" not in url:
+                try:
+                    body_txt = (
+                        self.page.evaluate(
+                            "() => document.body ? document.body.innerText.toLowerCase() : ''"
+                        ) or ""
+                    )
+                except Exception:
+                    body_txt = ""
+                if any(s in body_txt for s in (
+                    "regístrate o inicia", "registrate o inicia", "introduce tu email",
+                    "introduce tu correo", "sign up or log in", "continuar con google",
+                    "continue with google",
+                )):
+                    return False
+                path = url_path_tidal(url)
+                if "account.tidal.com" in url and not path.startswith("/login"):
                     # Esperar un momento a que termine el return OAuth si aún está redirigiendo
                     if "/login/tidal/return" in url:
                         time.sleep(1.0)
@@ -16642,6 +18588,52 @@ class TidalAutoLoginManager:
         except Exception as e:
             print(f"  [Login] [{self.client_email}] [WARN] No se pudo confirmar sesión en perfil: {e}")
         return False
+
+    def _pagina_es_perfil_con_sesion(self) -> bool:
+        """True solo si la pestaña está en account.tidal.com con sesión (no authorize vacío)."""
+        try:
+            self.page = pagina_vigente(self.page)
+            url = (self.page.url or "").lower()
+            if "login.tidal.com" in url or "/authorize" in url:
+                return False
+            if self.hay_formulario_login_visible():
+                return False
+            path = url_path_tidal(url)
+            if "account.tidal.com" not in url or path.startswith("/login"):
+                return False
+            try:
+                body = (
+                    self.page.evaluate(
+                        "() => document.body ? document.body.innerText.toLowerCase() : ''"
+                    ) or ""
+                )
+            except Exception:
+                body = ""
+            if any(s in body for s in (
+                "regístrate o inicia", "registrate o inicia", "introduce tu email",
+                "introduce tu correo", "sign up or log in", "continuar con google",
+                "continue with google",
+            )):
+                return False
+            return any(path.startswith(p) for p in (
+                "/profile", "/settings", "/subscription", "/family",
+                "/overview", "/payment",
+            ))
+        except Exception:
+            return False
+
+    def _asegurar_en_perfil_autenticado(self) -> bool:
+        """Deja Chrome en /profile con sesión real. Si Tidal reabre authorize, reintenta el login.
+
+        Navegar a /profile sin cookies reabre login.tidal.com/authorize (formulario vacío)
+        y la opción 10 lo daba por bueno.
+        """
+        if self.confirmar_sesion_en_perfil(18.0) and self._pagina_es_perfil_con_sesion():
+            return True
+        print(f"  [Login] [{self.client_email}] /profile reabrió el login. Rehaciendo inicio de sesión...")
+        if not self.rehacer_login_credenciales():
+            return False
+        return bool(self.confirmar_sesion_en_perfil(18.0) and self._pagina_es_perfil_con_sesion())
 
     def confirmar_cuenta_eliminada(self, timeout_s: float = 10.0) -> bool:
         """Prueba definitiva post-borrado: /profile debe redirigir a login.tidal.com/authorize.
@@ -17004,7 +18996,10 @@ class TidalAutoLoginManager:
                     pass
 
             if self.es_sesion_activa():
-                return True
+                # Un flash de account.tidal.com no basta: hay que confirmar en /profile.
+                if self._pagina_es_perfil_con_sesion():
+                    return True
+                break
 
             # Ya salimos del dominio de login o estamos en el puente return → confirmar en perfil
             if "/login/tidal/return" in url or "/login/tidal/callback" in url:
@@ -17084,14 +19079,9 @@ class TidalAutoLoginManager:
                 return True
         except Exception:
             pass
-        # Fallback: React a veces deja el botón disabled aunque el correo ya es válido
+        # Fallback: Enter en el campo (clic JS en botón gris no avanza el login de Tidal)
         try:
-            btn.evaluate("""el => {
-                el.removeAttribute('disabled');
-                el.disabled = false;
-                el.setAttribute('aria-disabled', 'false');
-                el.click();
-            }""")
+            self.page.keyboard.press("Enter")
             return True
         except Exception:
             try:
@@ -17130,14 +19120,34 @@ class TidalAutoLoginManager:
             email_input.dispatch_event("blur")
         except Exception:
             pass
-        # Disparar InputEvent nativo por si Playwright no lo propaga al estado de React
+        # Si ya se tecleó, no pisar con setter nativo (Vue/React deja Continuar gris).
+
+    def escribir_password_login(self, pwd_input) -> None:
+        """Teclea la contraseña para que Vue/React habilite 'Inicia sesión'."""
         try:
-            email_input.evaluate("""(el, val) => {
-                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, val);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            }""", self.client_email)
+            pwd_input.click(timeout=3000)
+            pwd_input.fill("")
+            time.sleep(0.1)
+        except Exception:
+            pass
+        escrito = False
+        try:
+            pwd_input.press_sequentially(self.target_pwd, delay=20)
+            escrito = True
+        except Exception:
+            pass
+        if not escrito:
+            try:
+                pwd_input.type(self.target_pwd, delay=20)
+                escrito = True
+            except Exception:
+                pass
+        if not escrito:
+            rellenar_campo_humanizado(pwd_input, self.target_pwd)
+        time.sleep(0.25)
+        try:
+            pwd_input.dispatch_event("input")
+            pwd_input.dispatch_event("change")
         except Exception:
             pass
 
@@ -17189,24 +19199,30 @@ class TidalAutoLoginManager:
                 return False
 
             try:
-                pwd_input.fill("")
-                time.sleep(0.15)
-                pwd_input.fill(self.target_pwd)
+                pwd_input.click(timeout=3000)
             except Exception:
-                rellenar_campo_humanizado(pwd_input, self.target_pwd)
-            time.sleep(0.4)
+                pass
+            self.escribir_password_login(pwd_input)
+            time.sleep(0.35)
 
             btn_login = esperar_locator_en_frames(
                 self.page,
-                ["button[type='submit']", "button:has-text('Iniciar sesión')", "button:has-text('Log in')",
+                ["button[type='submit']", "button:has-text('Iniciar sesión')", "button:has-text('Inicia sesión')",
+                 "button:has-text('Log in')",
                  "button:has-text('Continuar')", "button:has-text('Continue')"],
                 timeout_s=8.0
             )
             if btn_login:
                 try:
-                    btn_login.click(timeout=2500, force=True)
+                    if btn_login.is_disabled():
+                        pwd_input.press("Enter")
+                    else:
+                        btn_login.click(timeout=2500)
                 except Exception:
-                    pass
+                    try:
+                        pwd_input.press("Enter")
+                    except Exception:
+                        pass
             else:
                 try:
                     pwd_input.press("Enter")
@@ -17457,6 +19473,36 @@ class TidalAutoLoginManager:
                             f"{self.client_email} tras fallos de red/túnel."
                         )
 
+                    if MODO_SIN_PROXY:
+                        rotaciones_proxy += 1
+                        print(f"  [Sin Proxy] [{self.client_email}] Fallo de red "
+                              f"({rotaciones_proxy}/{_max_rotaciones_proxy}). Reiniciando Chrome...")
+                        try:
+                            if self.context:
+                                self.context.close()
+                        except Exception:
+                            pass
+                        try:
+                            if self.playwright:
+                                self.playwright.stop()
+                        except Exception:
+                            pass
+                        self.context = None
+                        self.page = None
+                        self.playwright = None
+                        old_prof = self.main_profile
+                        email_safe = re.sub(r'[^a-zA-Z0-9]', '_', self.client_email)
+                        self.main_profile = Path(tempfile.gettempdir()) / f"tidal_chrome_profile_{email_safe}_{random.randint(1000, 9999)}"
+                        try:
+                            import shutil
+                            if old_prof.exists():
+                                shutil.rmtree(old_prof, ignore_errors=True)
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        self.asegurar_navegador_abierto()
+                        continue
+
                     global GLOBAL_PE_PROXY_POOL
                     proxy_quemado = self.proxy_pe_server
                     p_pe = GLOBAL_PE_PROXY_POOL.rotar_y_marcar_bloqueado(proxy_quemado)
@@ -17523,8 +19569,10 @@ class TidalAutoLoginManager:
             
             print(f"  [Navegador] {Color.GREEN}[Cargado] Ventana cargada y lista para: {self.client_email}{Color.ENDC}")
             
-            # Sincronización inicial: Esperar a que TODAS las ventanas de Chrome estén completamente cargadas
-            self.esperar_barrera("inicio")
+            # Opción 10: NO esperar a las demás. La barrera hacía que las 10 mandaran
+            # correo/contraseña a la vez y Tidal dejaba varias en código o botón gris.
+            if modo != "solo_login":
+                self.esperar_barrera("inicio")
             
             print(f"\n--- Procesando inicio de sesión para: {self.client_email} ---")
 
@@ -17797,30 +19845,8 @@ class TidalAutoLoginManager:
                             "No se localizó el campo de contraseña tras varios reintentos de recuperación."
                         )
 
-                    try:
-                        pwd_input.click(timeout=3000)
-                        pwd_input.fill("")
-                        time.sleep(0.15)
-                        pwd_input.fill(self.target_pwd)
-                    except Exception:
-                        rellenar_campo_humanizado(pwd_input, self.target_pwd)
-                    time.sleep(0.4)
-                    try:
-                        pwd_input.dispatch_event("input")
-                        pwd_input.dispatch_event("change")
-                    except Exception:
-                        pass
-                    # Forzar que React habilite "Inicia Sesión" (igual que Continuar con el correo)
-                    try:
-                        pwd_input.evaluate("""(el, val) => {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                            setter.call(el, val);
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                        }""", self.target_pwd)
-                    except Exception:
-                        pass
-                    time.sleep(0.5)
+                    self.escribir_password_login(pwd_input)
+                    time.sleep(0.35)
 
                     btn_login = esperar_locator_en_frames(
                         self.page,
@@ -17834,7 +19860,6 @@ class TidalAutoLoginManager:
                         ],
                         timeout_s=10.0
                     )
-                    # Esperar a que el botón deje de estar disabled (React lo habilita al escribir)
                     if btn_login:
                         limite_btn = time.time() + 6.0
                         while time.time() < limite_btn:
@@ -17846,21 +19871,15 @@ class TidalAutoLoginManager:
                             time.sleep(0.3)
                         try:
                             if btn_login.is_disabled():
-                                btn_login.evaluate("""el => {
-                                    el.removeAttribute('disabled');
-                                    el.disabled = false;
-                                    el.click();
-                                }""")
+                                print(f"  [Login] [{self.client_email}] Inicia sesión sigue gris; se pulsa Enter.")
+                                pwd_input.press("Enter")
                             else:
                                 btn_login.click(timeout=2500)
                         except Exception:
                             try:
-                                btn_login.click(timeout=2000, force=True)
+                                pwd_input.press("Enter")
                             except Exception:
-                                try:
-                                    pwd_input.press("Enter")
-                                except Exception:
-                                    pass
+                                pass
                     else:
                         try:
                             pwd_input.press("Enter")
@@ -17908,6 +19927,15 @@ class TidalAutoLoginManager:
                         print(f"  [Login] {Color.GREEN}[OK] [{self.client_email}] Sesión consolidada tras contraseña.{Color.ENDC}")
                         break
 
+                    if self.hay_pantalla_codigo_login() or self.hay_control_modo_contrasena():
+                        print(f"  [Login] [{self.client_email}] Tras la contraseña Tidal pidió código; "
+                              f"se completa con OTP...")
+                        if not base_login_id:
+                            base_login_id = obtener_max_email_id(self.client_email, "tidal")
+                        if self.iniciar_sesion_con_codigo_email(base_login_id):
+                            login_exitoso = True
+                            break
+
                 if not login_exitoso:
                     print(f"\n  {Color.FAIL}{Color.BOLD}✖ [LOGIN] NO SE PUDO INICIAR SESIÓN PARA: {self.client_email}{Color.ENDC}\n")
                     self.abortar_barreras()
@@ -17932,14 +19960,12 @@ class TidalAutoLoginManager:
                     self.esperar_establecimiento_sesion(15.0)
                 
             manejar_bloqueos_e_intervencion(self.page, "Login Tidal")
-            if not self.es_sesion_activa() and not self.confirmar_sesion_en_perfil(15.0):
-                # Último intento de recuperar sesión antes de tocar el perfil
-                if not self.rehacer_login_credenciales():
-                    print(f"\n  {Color.FAIL}{Color.BOLD}✖ [LOGIN] NO SE CONSOLIDÓ LA SESIÓN PARA: {self.client_email}{Color.ENDC}\n")
-                    self.abortar_barreras()
-                    return self.finalizar_sin_exito("Sesión no consolidada tras el login.")
+            if not self._asegurar_en_perfil_autenticado():
+                print(f"\n  {Color.FAIL}{Color.BOLD}✖ [LOGIN] NO SE CONSOLIDÓ LA SESIÓN PARA: {self.client_email}{Color.ENDC}\n")
+                self.abortar_barreras()
+                return self.finalizar_sin_exito("Sesión no consolidada: Tidal reabrió el login en /profile.")
             self.login_ok = True
-            print(f"  [Login] {Color.GREEN}[OK] [{self.client_email}] Inicio de sesión listo.{Color.ENDC}")
+            print(f"  [Login] {Color.GREEN}[OK] [{self.client_email}] Inicio de sesión listo en /profile.{Color.ENDC}")
 
             if modo == "eliminar":
                 return self._flujo_eliminar_cuenta_opcion15()
@@ -18474,30 +20500,35 @@ def iniciar_sesion_automatico_tidal(correos):
 
     success_count = 0
     fail_count = 0
+    correos_fallidos = []
     managers = []
 
     num_cuentas = len(correos_lista)
-    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para inicio de sesión (Opción 10)...{Color.ENDC}")
-    valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
-    if not valid_pe_list:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige. Valida la lista con la opción 13 antes de continuar.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
-
-    GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
-    st_pe = GLOBAL_PE_PROXY_POOL.estadisticas()
-    print(f"  [Proxy Pool PE] Disponibles: {st_pe['total']} total | {st_pe['libres']} libres "
-          f"(lote máximo 10 ventanas; rotaciones usan el resto).")
-
-    # Con menos proxies que cuentas, las cuentas sin proxy libre se omiten al llegar su turno
-    if len(valid_pe_list) < min(num_cuentas, 10):
-        print(f"\n{Color.WARNING}[Proxies PE]{Color.ENDC} Solo hay {len(valid_pe_list)} proxies de Perú válidos para {num_cuentas} cuentas "
-              f"(se usan hasta 10 ventanas por lote). Las cuentas sin proxy libre se omitirán.")
-        resp_proxy = input("¿Continuar de todas formas? (s/n, por defecto 'n'): ").strip().lower()
-        if resp_proxy not in ("s", "si", "sí", "yes", "y"):
-            print(f"{Color.CYAN}Proceso cancelado. Amplía la lista de proxies de Perú con la opción 13.{Color.ENDC}")
+    if MODO_SIN_PROXY:
+        print(f"\n{Color.CYAN}[Sin Proxy] Opción 10 con IP real (sin proxies residenciales).{Color.ENDC}")
+        valid_pe_list = []
+    else:
+        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para inicio de sesión (Opción 10)...{Color.ENDC}")
+        valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
+        if not valid_pe_list:
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige. Valida la lista con la opción 13 antes de continuar.")
             input(">>> Presiona Enter para volver al menú principal <<<")
             return
+
+        GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+        st_pe = GLOBAL_PE_PROXY_POOL.estadisticas()
+        print(f"  [Proxy Pool PE] Disponibles: {st_pe['total']} total | {st_pe['libres']} libres "
+              f"(lote máximo 10 ventanas; rotaciones usan el resto).")
+
+        # Con menos proxies que cuentas, las cuentas sin proxy libre se omiten al llegar su turno
+        if len(valid_pe_list) < min(num_cuentas, 10):
+            print(f"\n{Color.WARNING}[Proxies PE]{Color.ENDC} Solo hay {len(valid_pe_list)} proxies de Perú válidos para {num_cuentas} cuentas "
+                  f"(se usan hasta 10 ventanas por lote). Las cuentas sin proxy libre se omitirán.")
+            resp_proxy = input("¿Continuar de todas formas? (s/n, por defecto 'n'): ").strip().lower()
+            if resp_proxy not in ("s", "si", "sí", "yes", "y"):
+                print(f"{Color.CYAN}Proceso cancelado. Amplía la lista de proxies de Perú con la opción 13.{Color.ENDC}")
+                input(">>> Presiona Enter para volver al menú principal <<<")
+                return
 
     batch_size = 10
     total_cuentas = len(correos_lista)
@@ -18528,8 +20559,8 @@ def iniciar_sesion_automatico_tidal(correos):
             idx_abs = b_start + idx_rel
             contrasena = cuentas_map[correo]
             
-            p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
-            if not p_pe:
+            p_pe = None if MODO_SIN_PROXY else GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+            if not MODO_SIN_PROXY and not p_pe:
                 print(f"  {Color.FAIL}[Proxy PE] [{correo}] No queda ningún proxy de Perú disponible; se omite la cuenta.{Color.ENDC}")
                 # Liberar a los demás hilos del lote: esta cuenta ya no llegará a las barreras
                 for b in barreras_lote.values():
@@ -18539,9 +20570,9 @@ def iniciar_sesion_automatico_tidal(correos):
                         pass
                 return correo, False
 
-            p_pe_server = p_pe.get("server")
-            p_pe_user = p_pe.get("username")
-            p_pe_pass = p_pe.get("password")
+            p_pe_server = (p_pe or {}).get("server")
+            p_pe_user = (p_pe or {}).get("username")
+            p_pe_pass = (p_pe or {}).get("password")
 
             manager = TidalAutoLoginManager(
                 client_email=correo,
@@ -18573,9 +20604,11 @@ def iniciar_sesion_automatico_tidal(correos):
                         success_count += 1
                     else:
                         fail_count += 1
+                        correos_fallidos.append(c or correo)
                 except Exception as e:
                     print(f"  {Color.FAIL}[ERROR] Excepción al procesar {correo}: {e}{Color.ENDC}")
                     fail_count += 1
+                    correos_fallidos.append(correo)
 
     total_login = sum(1 for m in managers if getattr(m, "login_ok", False))
 
@@ -18585,6 +20618,10 @@ def iniciar_sesion_automatico_tidal(correos):
     print(f" Cuentas procesadas: {total_cuentas}")
     print(f" Inicios de sesión correctos: {total_login}")
     print(f" Procesos incompletos: {fail_count}")
+    if correos_fallidos:
+        print(f" {Color.FAIL}Correos que fallaron:{Color.ENDC}")
+        for mail_f in correos_fallidos:
+            print(f"   - {mail_f}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
 
     if fail_count and mantener_ventanas:
@@ -18644,13 +20681,17 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
     elim_lock = threading.Lock()
 
     num_cuentas = len(correos_lista)
-    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios (Fase 1 — eliminar)...{Color.ENDC}")
-    valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
-    if not valid_pe_list:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
-    GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+    if MODO_SIN_PROXY:
+        print(f"\n{Color.CYAN}[Sin Proxy] Opción 15 con IP real (sin proxies residenciales).{Color.ENDC}")
+        valid_pe_list = []
+    else:
+        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios (Fase 1 — eliminar)...{Color.ENDC}")
+        valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
+        if not valid_pe_list:
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige.")
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
+        GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
 
     batch_size = 10
     total_cuentas = len(correos_lista)
@@ -18687,8 +20728,8 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
             nonlocal_idx = idx_global + idx_rel
             contrasena = cuentas_map[correo]
 
-            p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
-            if not p_pe:
+            p_pe = None if MODO_SIN_PROXY else GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+            if not MODO_SIN_PROXY and not p_pe:
                 print(f"  {Color.FAIL}[Proxy PE] [{correo}] Sin proxy disponible; se omite.{Color.ENDC}")
                 for b in barreras_lote.values():
                     try:
@@ -18696,9 +20737,9 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
                     except Exception:
                         pass
                 return correo, False
-            p_pe_server = p_pe.get("server")
-            p_pe_user = p_pe.get("username")
-            p_pe_pass = p_pe.get("password")
+            p_pe_server = (p_pe or {}).get("server")
+            p_pe_user = (p_pe or {}).get("username")
+            p_pe_pass = (p_pe or {}).get("password")
 
             manager = TidalAutoLoginManager(
                 client_email=correo,
@@ -18782,46 +20823,51 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
 
     global valid_ng_list, CACHE_PROXIES_NG
     valid_ng_list = []
-    cargar_cache_proxies_validos_desde_disco()
-    if CACHE_PROXIES_NG:
-        valid_ng_list = list(CACHE_PROXIES_NG)
-        print(f"\n{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA "
-              f"previamente verificados.{Color.ENDC}")
+    if MODO_SIN_PROXY:
+        print(f"\n{Color.CYAN}[Sin Proxy] Opción 15 fase 2 (registro) con IP real.{Color.ENDC}")
+        use_proxy_ng = False
+        proxies_pe_reg = []
     else:
-        proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
-        if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
-            ng_list = proxies_cfg["proxy_ng_list"]
-            print(f"\nSe encontraron {len(ng_list)} proxies para NIGERIA.")
-            valid_ng_list = probar_y_seleccionar_mejor_proxy(
-                ng_list, "NIGERIA", max(len(correos_eliminados) * 4, len(correos_eliminados) + 15)
-            )
-            if valid_ng_list:
-                guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
+        cargar_cache_proxies_validos_desde_disco()
+        if CACHE_PROXIES_NG:
+            valid_ng_list = list(CACHE_PROXIES_NG)
+            print(f"\n{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA "
+                  f"previamente verificados.{Color.ENDC}")
         else:
-            print(f"\n{Color.WARNING}[Proxy]{Color.ENDC} No se encontraron proxies de Nigeria.")
+            proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
+            if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
+                ng_list = proxies_cfg["proxy_ng_list"]
+                print(f"\nSe encontraron {len(ng_list)} proxies para NIGERIA.")
+                valid_ng_list = probar_y_seleccionar_mejor_proxy(
+                    ng_list, "NIGERIA", max(len(correos_eliminados) * 4, len(correos_eliminados) + 15)
+                )
+                if valid_ng_list:
+                    guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
+            else:
+                print(f"\n{Color.WARNING}[Proxy]{Color.ENDC} No se encontraron proxies de Nigeria.")
 
-    alimentar_pool_proxies_nigeria(valid_ng_list)
-    GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
-    GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+        alimentar_pool_proxies_nigeria(valid_ng_list)
+        GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
+        GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
 
-    use_proxy_ng = bool(valid_ng_list)
-    if not use_proxy_ng:
-        print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Nigeria válidos.")
-        confirm = input("¿Continuar el registro con tu IP local/VPN? (s/n, por defecto 'n'): ").strip().lower()
-        if confirm not in ("s", "si", "yes", "y"):
-            print("Registro cancelado. Las cuentas ya fueron eliminadas.")
-            print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
-            return
+        use_proxy_ng = bool(valid_ng_list)
+        if not use_proxy_ng:
+            print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Nigeria válidos.")
+            confirm = input("¿Continuar el registro con tu IP local/VPN? (s/n, por defecto 'n'): ").strip().lower()
+            if confirm not in ("s", "si", "yes", "y"):
+                print("Registro cancelado. Las cuentas ya fueron eliminadas.")
+                print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+                return
 
-    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para el pago del registro...{Color.ENDC}")
-    proxies_pe_reg = asegurar_proxies_peru(cantidad_necesaria=len(correos_eliminados))
-    if not proxies_pe_reg:
-        print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies PE para el pago del registro.")
-        confirm_pe = input("¿Continuar el registro sin proxy PE? (s/n, por defecto 'n'): ").strip().lower()
-        if confirm_pe not in ("s", "si", "sí", "yes", "y"):
-            print("Registro cancelado. Las cuentas ya fueron eliminadas.")
-            print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
-            return
+        print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú para el pago del registro...{Color.ENDC}")
+        proxies_pe_reg = asegurar_proxies_peru(cantidad_necesaria=len(correos_eliminados))
+        if not proxies_pe_reg:
+            print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies PE para el pago del registro.")
+            confirm_pe = input("¿Continuar el registro sin proxy PE? (s/n, por defecto 'n'): ").strip().lower()
+            if confirm_pe not in ("s", "si", "sí", "yes", "y"):
+                print("Registro cancelado. Las cuentas ya fueron eliminadas.")
+                print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+                return
 
     reg_ok = 0
     reg_fail = 0
@@ -18955,41 +21001,45 @@ def registrar_cuentas_tidal(correos):
     global valid_ng_list, CACHE_PROXIES_NG
     valid_ng_list = []
 
-    # Cargar *_validos.txt completos (no un recorte al nº de correos)
-    cargar_cache_proxies_validos_desde_disco()
-    
-    if CACHE_PROXIES_NG:
-        valid_ng_list = list(CACHE_PROXIES_NG)
-        print(f"\n{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA previamente verificados.{Color.ENDC}")
+    if MODO_SIN_PROXY:
+        print(f"\n{Color.CYAN}[Sin Proxy] Opción 8 con IP real (sin proxies residenciales).{Color.ENDC}")
+        use_proxy = False
     else:
-        proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
-        if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
-            ng_list = proxies_cfg["proxy_ng_list"]
-            print(f"\nSe encontraron {len(ng_list)} proxies para NIGERIA.")
-            # Pedir margen para rotaciones; la función fusiona al caché completo (no lo reduce a len(correos))
-            valid_ng_list = probar_y_seleccionar_mejor_proxy(
-                ng_list, "NIGERIA", max(len(correos) * 4, len(correos) + 15)
-            )
-            if valid_ng_list:
-                guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
-        else:
-            print(f"\n{Color.WARNING}[Proxy]{Color.ENDC} No se encontraron proxies de Nigeria en 'lista_proxies_ng.txt' ni en 'proxies.txt'.")
+        # Cargar *_validos.txt completos (no un recorte al nº de correos)
+        cargar_cache_proxies_validos_desde_disco()
 
-    # Alimentar el pool NG con la lista COMPLETA
-    alimentar_pool_proxies_nigeria(valid_ng_list)
-    GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
-    GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
-        
-    use_proxy = False
-    
-    if valid_ng_list:
-        use_proxy = True
-    else:
-        print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Nigeria válidos disponibles.")
-        confirm = input("¿Deseas continuar con tu IP local/VPN actual? (s/n, por defecto 'n'): ").strip().lower()
-        if confirm not in ("s", "si", "yes", "y"):
-            print("Operación cancelada.")
-            return
+        if CACHE_PROXIES_NG:
+            valid_ng_list = list(CACHE_PROXIES_NG)
+            print(f"\n{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA previamente verificados.{Color.ENDC}")
+        else:
+            proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
+            if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
+                ng_list = proxies_cfg["proxy_ng_list"]
+                print(f"\nSe encontraron {len(ng_list)} proxies para NIGERIA.")
+                # Pedir margen para rotaciones; la función fusiona al caché completo (no lo reduce a len(correos))
+                valid_ng_list = probar_y_seleccionar_mejor_proxy(
+                    ng_list, "NIGERIA", max(len(correos) * 4, len(correos) + 15)
+                )
+                if valid_ng_list:
+                    guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
+            else:
+                print(f"\n{Color.WARNING}[Proxy]{Color.ENDC} No se encontraron proxies de Nigeria en 'lista_proxies_ng.txt' ni en 'proxies.txt'.")
+
+        # Alimentar el pool NG con la lista COMPLETA
+        alimentar_pool_proxies_nigeria(valid_ng_list)
+        GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
+        GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+
+        use_proxy = False
+
+        if valid_ng_list:
+            use_proxy = True
+        else:
+            print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Nigeria válidos disponibles.")
+            confirm = input("¿Deseas continuar con tu IP local/VPN actual? (s/n, por defecto 'n'): ").strip().lower()
+            if confirm not in ("s", "si", "yes", "y"):
+                print("Operación cancelada.")
+                return
 
     print(f"\n{Color.CYAN}[Opción 8] Solo registro Tidal (sin pago/TuneMyMusic): no se reservan proxies PE.{Color.ENDC}")
 
@@ -19034,15 +21084,39 @@ def registrar_cuentas_tidal(correos):
     total_cuentas = len(correos_lista)
     n_oleadas = max(1, (total_cuentas + batch_size - 1) // batch_size)
     print(f"\n{Color.CYAN}{Color.BOLD}Opción 8: {total_cuentas} cuenta(s) → {n_oleadas} oleada(s) "
-          f"de hasta {batch_size} ventanas en simultáneo (proxy NG, OTP worker por alias).{Color.ENDC}")
+          f"de hasta {batch_size} ventanas en simultáneo (IP Nigeria vía Surfshark, OTP worker por alias).{Color.ENDC}")
     print(f"{Color.CYAN}Un fallo no detiene el lote. Tras todas las oleadas se reintenta una vez "
-          f"lo que haya fallado.{Color.ENDC}\n")
+          f"lo que haya fallado.{Color.ENDC}")
+    if not use_proxy:
+        print(f"{Color.CYAN}VPN: se comprueba Nigeria (NG) antes de cada oleada. "
+              f"Si el proceso es largo, cada 2 oleadas se desconecta Surfshark y se "
+              f"vuelve a conectar a Nigeria para no bloquear la IP.{Color.ENDC}")
+    print()
 
     success_count = 0
     fail_count = 0
     ok_list: list[str] = []
     fail_list: list[str] = []
     estado_lock = threading.Lock()
+    oleadas_completadas = 0
+    vpn_ng_abortar = False
+
+    def _vpn_nigeria_antes_de_oleada(n_oleada: int, n_ol: int) -> bool:
+        """IP Nigeria antes de arrancar. Cada 2 oleadas: desconectar y reconectar Surfshark."""
+        nonlocal vpn_ng_abortar
+        if use_proxy:
+            return True
+        reciclar = oleadas_completadas > 0 and oleadas_completadas % 2 == 0
+        if reciclar:
+            motivo = (f"tras {oleadas_completadas} oleada(s) — reciclar IP "
+                      f"(antes de oleada {n_oleada}/{n_ol})")
+        else:
+            motivo = f"antes de oleada {n_oleada}/{n_ol}"
+        ok = asegurar_vpn_nigeria_para_registro(reciclar=reciclar, motivo=motivo)
+        if not ok:
+            vpn_ng_abortar = True
+            print(f"  {Color.FAIL}[VPN] No hay IP de Nigeria. Se detiene la opción 8.{Color.ENDC}")
+        return ok
 
     def _limpiar_tras_oleada(n_oleada: int, n_total: int) -> None:
         try:
@@ -19068,12 +21142,15 @@ def registrar_cuentas_tidal(correos):
             time.sleep(pausa)
 
     def _correr_oleadas(pendientes: list[str], etiqueta: str) -> tuple[list[str], list[str]]:
-        nonlocal success_count, fail_count
+        nonlocal success_count, fail_count, oleadas_completadas
         ok_esta: list[str] = []
         fail_esta: list[str] = []
         n_tot = len(pendientes)
         n_ol = max(1, (n_tot + batch_size - 1) // batch_size)
         for b_start in range(0, n_tot, batch_size):
+            if vpn_ng_abortar:
+                print(f"  {Color.FAIL}[VPN] Oleadas restantes canceladas: IP no es Nigeria.{Color.ENDC}")
+                break
             lote = pendientes[b_start:b_start + batch_size]
             n_oleada = (b_start // batch_size) + 1
             print(f"\n{Color.BLUE}{Color.BOLD}=== {etiqueta} oleada {n_oleada}/{n_ol}: "
@@ -19081,6 +21158,8 @@ def registrar_cuentas_tidal(correos):
                   f"({b_start + 1}-{b_start + len(lote)} de {n_tot}) ==={Color.ENDC}")
             for c_o in lote:
                 print(f"    • {c_o}")
+            if not _vpn_nigeria_antes_de_oleada(n_oleada, n_ol):
+                break
 
             cancel_oleada = threading.Event()
             managers_lote: dict[str, TidalRegisterManager] = {}
@@ -19236,6 +21315,7 @@ def registrar_cuentas_tidal(correos):
                     pass
 
             _limpiar_tras_oleada(n_oleada, n_ol)
+            oleadas_completadas += 1
         return ok_esta, fail_esta
 
     _correr_oleadas(correos_lista, "Opción 8")
@@ -19249,13 +21329,16 @@ def registrar_cuentas_tidal(correos):
             vistos_r.add(c)
             retry_lista.append(c)
     if retry_lista:
-        print(f"\n{Color.CYAN}{Color.BOLD}[Opción 8] Reintento de {len(retry_lista)} cuenta(s) "
-              f"fallida(s), otra vez en oleadas de {batch_size}...{Color.ENDC}\n")
-        time.sleep(2.0)
-        fail_count -= len(retry_lista)
-        fail_list[:] = [c for c in fail_list if c not in retry_lista]
-        _ok_r, _fail_r = _correr_oleadas(retry_lista, "Opción 8 reintento")
-        # fail_count / lists already updated inside _correr_oleadas
+        if vpn_ng_abortar:
+            print(f"\n{Color.FAIL}[Opción 8] Reintento omitido: no hay IP de Nigeria.{Color.ENDC}")
+        else:
+            print(f"\n{Color.CYAN}{Color.BOLD}[Opción 8] Reintento de {len(retry_lista)} cuenta(s) "
+                  f"fallida(s), otra vez en oleadas de {batch_size}...{Color.ENDC}\n")
+            time.sleep(2.0)
+            fail_count -= len(retry_lista)
+            fail_list[:] = [c for c in fail_list if c not in retry_lista]
+            _ok_r, _fail_r = _correr_oleadas(retry_lista, "Opción 8 reintento")
+            # fail_count / lists already updated inside _correr_oleadas
 
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO (opción 8){Color.ENDC}")
@@ -19512,12 +21595,14 @@ def invitar_al_plan_familiar_opcion11():
         print(f"\n  [Opción 11] Titulares cargados ({len(titulares)}): {[t['correo'] for t in titulares]}")
         print(f"  [Opción 11] Total de miembros a invitar ({len(miembros)}): {miembros}")
 
-    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para invitaciones familiares (Opción 11)...{Color.ENDC}")
-    valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=len(titulares))
-    if not valid_pe_list:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+    print(f"\n{Color.CYAN}[Sin Proxy] Opción 11 con IP real.{Color.ENDC}" if MODO_SIN_PROXY else
+          f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para invitaciones familiares (Opción 11)...{Color.ENDC}")
+    if not MODO_SIN_PROXY:
+        valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=len(titulares))
+        if not valid_pe_list:
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige.")
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
 
     def clean_email_loc(email):
         if not email:
@@ -19602,7 +21687,10 @@ def invitar_al_plan_familiar_opcion11():
 
         try:
             inviter.abrir_navegador()
-            print(f"  [Opción 11] Usando proxy de Perú único para {titular['correo']}: {inviter.proxy_pe_server}")
+            if MODO_SIN_PROXY:
+                print(f"  [Opción 11] [{titular['correo']}] Chrome con IP real (sin proxy).")
+            else:
+                print(f"  [Opción 11] Usando proxy de Perú único para {titular['correo']}: {inviter.proxy_pe_server}")
 
             if not inviter.asegurar_login_titular(titular):
                 print(f"  {Color.FAIL}[Opción 11] ERROR: No se pudo iniciar sesión en el titular {titular['correo']}.{Color.ENDC}")
@@ -19863,66 +21951,72 @@ def crear_cuentas_familiares_automatico_opcion14():
     headless = headless_opt in ("s", "si", "yes", "y")
 
     num_cuentas = len(correos_lista)
-    global valid_ng_list, CACHE_PROXIES_NG
+    global valid_ng_list, CACHE_PROXIES_NG, valid_pe_list, CACHE_PROXIES_PE
     valid_ng_list = []
 
-    print(f"\n{Color.CYAN}[Proxies Nigeria] Obteniendo proxies de Nigeria para el registro inicial...{Color.ENDC}")
-    cargar_cache_proxies_validos_desde_disco()
-    if CACHE_PROXIES_NG:
-        valid_ng_list = list(CACHE_PROXIES_NG)
-        print(f"{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA previamente validados.{Color.ENDC}")
+    if MODO_SIN_PROXY:
+        print(f"\n{Color.CYAN}[Sin Proxy] Opción 14 con IP real (registro + checkout sin residenciales).{Color.ENDC}")
+        valid_pe_list = []
     else:
-        try:
-            from config_migrar import proxies_cfg
-        except ImportError:
-            proxies_cfg = None
-
-        if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
-            ng_list = proxies_cfg["proxy_ng_list"]
+        print(f"\n{Color.CYAN}[Proxies Nigeria] Obteniendo proxies de Nigeria para el registro inicial...{Color.ENDC}")
+        cargar_cache_proxies_validos_desde_disco()
+        if CACHE_PROXIES_NG:
+            valid_ng_list = list(CACHE_PROXIES_NG)
+            print(f"{Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies de NIGERIA previamente validados.{Color.ENDC}")
         else:
-            proxies_cfg_local = cargar_proxies_desde_txt(preferir_validos=False)
-            ng_list = proxies_cfg_local.get("proxy_ng_list", []) if proxies_cfg_local else []
+            try:
+                from config_migrar import proxies_cfg
+            except ImportError:
+                proxies_cfg = None
 
-        if ng_list:
-            # Margen de repuestos: cada bloqueo antirobot quema el proxy de forma permanente y
-            # validar sólo tantos como cuentas dejaba el pool vacío en la primera rotación.
-            objetivo_ng = max(num_cuentas * 4, num_cuentas + 15)
-            valid_ng_list = probar_y_seleccionar_mejor_proxy(ng_list, "Nigeria", objetivo_ng)
-            if valid_ng_list:
-                guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
-        else:
-            print(f"{Color.WARNING}[WARN]{Color.ENDC} No se encontraron proxies de Nigeria en la configuración.")
+            if proxies_cfg and proxies_cfg.get("proxy_ng_list"):
+                ng_list = proxies_cfg["proxy_ng_list"]
+            else:
+                proxies_cfg_local = cargar_proxies_desde_txt(preferir_validos=False)
+                ng_list = proxies_cfg_local.get("proxy_ng_list", []) if proxies_cfg_local else []
 
-    # El registro debe verse desde Nigeria: sin proxy NG la cuenta se crearía con geo incorrecto
-    # y además expondría la IP real a DataDome, que la marcaría para todo el resto del proceso.
-    if not valid_ng_list:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Nigeria válidos y el registro los exige. "
-              f"Valida la lista con la opción 13 antes de reintentar.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+            if ng_list:
+                # Margen de repuestos: cada bloqueo antirobot quema el proxy de forma permanente y
+                # validar sólo tantos como cuentas dejaba el pool vacío en la primera rotación.
+                objetivo_ng = max(num_cuentas * 4, num_cuentas + 15)
+                valid_ng_list = probar_y_seleccionar_mejor_proxy(ng_list, "Nigeria", objetivo_ng)
+                if valid_ng_list:
+                    guardar_proxies_validos_txt(SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list)
+            else:
+                print(f"{Color.WARNING}[WARN]{Color.ENDC} No se encontraron proxies de Nigeria en la configuración.")
 
-    alimentar_pool_proxies_nigeria(valid_ng_list)
-    GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
-    GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+        # El registro debe verse desde Nigeria: sin proxy NG la cuenta se crearía con geo incorrecto
+        # y además expondría la IP real a DataDome, que la marcaría para todo el resto del proceso.
+        if not valid_ng_list:
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Nigeria válidos y el registro los exige. "
+                  f"Valida la lista con la opción 13 antes de reintentar.")
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
 
-    global valid_pe_list, CACHE_PROXIES_PE
-    print(f"\n{Color.CYAN}[Proxies Perú] Obteniendo proxies de Perú para el pago y checkout...{Color.ENDC}")
-    # asegurar_proxies_peru también alimenta GLOBAL_PE_PROXY_POOL, necesario para las rotaciones
-    # y para TuneMyMusic. Antes se construía la lista a mano y el pool quedaba vacío.
-    valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
-    if not valid_pe_list:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y el checkout los exige. "
-              f"Valida la lista con la opción 13 antes de reintentar.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        alimentar_pool_proxies_nigeria(valid_ng_list)
+        GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
+        GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
+
+        print(f"\n{Color.CYAN}[Proxies Perú] Obteniendo proxies de Perú para el pago y checkout...{Color.ENDC}")
+        # asegurar_proxies_peru también alimenta GLOBAL_PE_PROXY_POOL, necesario para las rotaciones
+        # y para TuneMyMusic. Antes se construía la lista a mano y el pool quedaba vacío.
+        valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
+        if not valid_pe_list:
+            print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y el checkout los exige. "
+                  f"Valida la lista con la opción 13 antes de reintentar.")
+            input(">>> Presiona Enter para volver al menú principal <<<")
+            return
 
     # Tope de 4: más ventanas en el alta saturan el Email Worker (OTP catch-all) y se
     # pisan códigos. También se limita al número de proxies NG/PE libres para no repetir IP.
     max_ventanas_opcion14 = 4
-    batch_size = max(1, min(max_ventanas_opcion14, len(valid_ng_list), len(valid_pe_list)))
-    if batch_size < min(max_ventanas_opcion14, num_cuentas):
-        print(f"{Color.WARNING}[Proxies]{Color.ENDC} Se procesarán {batch_size} ventana(s) a la vez "
-              f"para no repetir proxy entre ventanas simultáneas.")
+    if MODO_SIN_PROXY:
+        batch_size = min(max_ventanas_opcion14, num_cuentas)
+    else:
+        batch_size = max(1, min(max_ventanas_opcion14, len(valid_ng_list), len(valid_pe_list)))
+        if batch_size < min(max_ventanas_opcion14, num_cuentas):
+            print(f"{Color.WARNING}[Proxies]{Color.ENDC} Se procesarán {batch_size} ventana(s) a la vez "
+                  f"para no repetir proxy entre ventanas simultáneas.")
     total_cuentas = len(correos_lista)
     print(f"\n{Color.CYAN}{Color.BOLD}Iniciando creación de {total_cuentas} cuentas familiares "
           f"en bloques de máximo {batch_size} ventanas simultáneas "
@@ -19946,21 +22040,21 @@ def crear_cuentas_familiares_automatico_opcion14():
                 time.sleep((idx_rel - 1) * random.uniform(1.5, 3.0))
             pwd = cuentas_map[correo]
 
-            p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico() if valid_ng_list else None
+            p_ng = None if MODO_SIN_PROXY else (GLOBAL_NG_PROXY_POOL.obtener_proxy_unico() if valid_ng_list else None)
             p_server = p_ng.get("server") if p_ng else None
             p_user = p_ng.get("username") if p_ng else None
             p_pass = p_ng.get("password") if p_ng else None
-            if valid_ng_list and not p_server:
+            if not MODO_SIN_PROXY and valid_ng_list and not p_server:
                 print(f"  {Color.FAIL}[Proxy NG] [{correo}] Sin proxy de Nigeria libre; se omite la cuenta.{Color.ENDC}")
                 return correo, False
 
             # Reservar PE único del pool: el índice modular podía repetir IP si otra ventana
             # rotaba al mismo proxy, y el checkout/upgrade se bloqueaban juntos.
-            p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
+            p_pe = None if MODO_SIN_PROXY else GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
             p_pe_server = p_pe.get("server") if p_pe else None
             p_pe_user = p_pe.get("username") if p_pe else None
             p_pe_pass = p_pe.get("password") if p_pe else None
-            if not p_pe_server:
+            if not MODO_SIN_PROXY and not p_pe_server:
                 print(f"  {Color.FAIL}[Proxy PE] [{correo}] Sin proxy de Perú libre; se omite la cuenta.{Color.ENDC}")
                 try:
                     GLOBAL_NG_PROXY_POOL.liberar_proxy(p_server)
@@ -20169,12 +22263,16 @@ def menu_principal():
                     print(f"    {Color.FAIL}[IMAP] No se encontró enlace de restablecimiento para {correo}{Color.ENDC}")
 
             if enlaces_reset:
-                print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para abrir los enlaces...{Color.ENDC}")
-                proxies_pe = asegurar_proxies_peru(cantidad_necesaria=len(enlaces_reset))
-                if not proxies_pe:
-                    print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta acción los exige. "
-                          f"Valida la lista con la opción 13 antes de reintentar.")
+                if MODO_SIN_PROXY:
+                    print(f"\n{Color.CYAN}[Sin Proxy] Abriendo restablecimientos con IP real.{Color.ENDC}")
+                    proxies_pe = []
                 else:
+                    print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para abrir los enlaces...{Color.ENDC}")
+                    proxies_pe = asegurar_proxies_peru(cantidad_necesaria=len(enlaces_reset))
+                    if not proxies_pe:
+                        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta acción los exige. "
+                              f"Valida la lista con la opción 13 antes de reintentar.")
+                if MODO_SIN_PROXY or proxies_pe:
                     print(f"\nAbriendo {len(enlaces_reset)} restablecimientos en paralelo "
                           f"(auto-relleno de contraseña + cierre al éxito)...")
 
@@ -20182,9 +22280,11 @@ def menu_principal():
                         if idx > 1:
                             time.sleep((idx - 1) * random.uniform(1.5, 3.0))
                         correo, enlace = item
-                        p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico(espera_s=60.0)
-                        if not p_pe and proxies_pe:
-                            p_pe = proxies_pe[(idx - 1) % len(proxies_pe)]
+                        p_pe = None
+                        if not MODO_SIN_PROXY:
+                            p_pe = GLOBAL_PE_PROXY_POOL.obtener_proxy_unico(espera_s=60.0)
+                            if not p_pe and proxies_pe:
+                                p_pe = proxies_pe[(idx - 1) % len(proxies_pe)]
                         return abrir_enlace_restablecimiento_con_autocierre(enlace, correo, proxy_pe=p_pe)
 
                     ok_n, fail_n = 0, 0
@@ -20260,7 +22360,9 @@ def menu_principal():
                     origen_msg = "IMAP" if origen_enlaces == "imap" else "fuente elegida"
                     print(f"    {Color.FAIL}[{origen_msg}] No se encontró invitación para {c}{Color.ENDC}")
 
-            enlaces_map = {c: enlaces_map[c] for c in correos if enlaces_map.get(c)}
+            enlaces_map = _invite_filtrar_enlaces_unicos(
+                {c: enlaces_map[c] for c in correos if enlaces_map.get(c)}
+            )
             # Anotar en linksextraidos.txt (también los hallados por IMAP)
             if enlaces_map:
                 try:
@@ -20273,48 +22375,60 @@ def menu_principal():
             sin_enlace = [c for c in correos if not enlaces_map.get(c)]
             ok_list: list[str] = []
             ya_usados_list: list[str] = []
+            pwd_incorrecta_list: list[str] = []
             fail_list: list[str] = list(sin_enlace)  # sin invitación = pendiente/fallo
 
             if enlaces_map:
-                global valid_pe_list, CACHE_PROXIES_PE, valid_ng_list, CACHE_PROXIES_NG
-                # Para invitaciones familiares y registros en Tidal Nigeria, se utiliza
-                # directamente proxy de NIGERIA (NG) para garantizar la creación/registro en la región correcta.
-                print(f"\n{Color.CYAN}[Proxies NG] Habilitando proxies de Nigeria para invitaciones y altas...{Color.ENDC}")
-                cargar_cache_proxies_validos_desde_disco()
-                if CACHE_PROXIES_NG:
-                    valid_ng_list = list(CACHE_PROXIES_NG)
-                    print(f"  {Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies NG "
-                          f"verificados.{Color.ENDC}")
+                if MODO_SIN_PROXY:
+                    print(f"\n{Color.CYAN}[Sin Proxy] Opción 4 con IP real.{Color.ENDC}")
+                    proxies_ng = []
                 else:
-                    proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
-                    ng_list = (proxies_cfg or {}).get("proxy_ng_list") or []
-                    if ng_list:
-                        valid_ng_list = probar_y_seleccionar_mejor_proxy(
-                            ng_list, "NIGERIA", max(len(enlaces_map) * 4, len(enlaces_map) + 15)
-                        )
-                        if valid_ng_list:
-                            guardar_proxies_validos_txt(
-                                SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list
-                            )
+                    global valid_pe_list, CACHE_PROXIES_PE, valid_ng_list, CACHE_PROXIES_NG
+                    # Para invitaciones familiares y registros en Tidal Nigeria, se utiliza
+                    # directamente proxy de NIGERIA (NG) para garantizar la creación/registro en la región correcta.
+                    print(f"\n{Color.CYAN}[Proxies NG] Habilitando proxies de Nigeria para invitaciones y altas...{Color.ENDC}")
+                    cargar_cache_proxies_validos_desde_disco()
+                    if CACHE_PROXIES_NG:
+                        valid_ng_list = list(CACHE_PROXIES_NG)
+                        print(f"  {Color.GREEN}[Proxy Caché] Usando {len(valid_ng_list)} proxies NG "
+                              f"verificados.{Color.ENDC}")
                     else:
-                        valid_ng_list = []
-                alimentar_pool_proxies_nigeria(valid_ng_list)
-                GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
-                proxies_ng = list(valid_ng_list or [])
-                if not proxies_ng:
-                    print(f"\n{Color.FAIL}[Error]{Color.ENDC} Se requiere proxy de Nigeria y no hay "
-                          f"proxies NG disponibles. Valida con la opción 13.")
-                    fail_list.extend(list(enlaces_map.keys()))
-                    _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace, ya_usados_list)
-                    print()
-                    continue
+                        proxies_cfg = cargar_proxies_desde_txt(preferir_validos=False)
+                        ng_list = (proxies_cfg or {}).get("proxy_ng_list") or []
+                        if ng_list:
+                            valid_ng_list = probar_y_seleccionar_mejor_proxy(
+                                ng_list, "NIGERIA", max(len(enlaces_map) * 4, len(enlaces_map) + 15)
+                            )
+                            if valid_ng_list:
+                                guardar_proxies_validos_txt(
+                                    SCRIPT_DIR / "lista_proxies_ng_validos.txt", valid_ng_list
+                                )
+                        else:
+                            valid_ng_list = []
+                    alimentar_pool_proxies_nigeria(valid_ng_list)
+                    GLOBAL_NG_PROXY_POOL.reiniciar_bloqueos()
+                    proxies_ng = list(valid_ng_list or [])
+                    if not proxies_ng:
+                        print(f"\n{Color.FAIL}[Error]{Color.ENDC} Se requiere proxy de Nigeria y no hay "
+                              f"proxies NG disponibles. Valida con la opción 13.")
+                        fail_list.extend(list(enlaces_map.keys()))
+                        _imprimir_resumen_opcion4(
+                            correos, ok_list, fail_list, sin_enlace, ya_usados_list, pwd_incorrecta_list
+                        )
+                        print()
+                        continue
 
                 items = list(enlaces_map.items())
                 # Con 100+ invitaciones, 5 Chromes en paralelo saturan RAM/proxies; 4 es más estable.
                 tam_oleada = 4 if len(items) >= 40 else 5
                 oleadas = [items[i:i + tam_oleada] for i in range(0, len(items), tam_oleada)]
                 print(f"\n{Color.CYAN}[Opción 4] {len(items)} invitaciones → "
-                      f"{len(oleadas)} oleada(s) de hasta {tam_oleada} en paralelo con Proxy Nigeria.{Color.ENDC}")
+                      f"{len(oleadas)} oleada(s) de hasta {tam_oleada} en paralelo"
+                      f"{' (IP real / Surfshark LATAM)' if MODO_SIN_PROXY else ' con Proxy Nigeria'}.{Color.ENDC}")
+                if MODO_SIN_PROXY:
+                    print(f"{Color.CYAN}VPN: cualquier IP vale. Se prefiere LATAM (Perú, Bolivia, Chile, "
+                          f"Brasil, Ecuador, Colombia, Costa Rica, Argentina). Si el proceso es largo, "
+                          f"cada 2 oleadas se recicla Surfshark a otro de esos países.{Color.ENDC}")
 
                 def procesar_invitacion_hilo(idx, item, cancel_ev):
                     correo, enlace = item
@@ -20324,9 +22438,10 @@ def menu_principal():
                         return correo, False
                     p_ng = None
                     try:
-                        p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico(espera_s=30.0)
-                        if not p_ng and proxies_ng:
-                            p_ng = proxies_ng[(idx - 1) % len(proxies_ng)]
+                        if not MODO_SIN_PROXY:
+                            p_ng = GLOBAL_NG_PROXY_POOL.obtener_proxy_unico(espera_s=30.0)
+                            if not p_ng and proxies_ng:
+                                p_ng = proxies_ng[(idx - 1) % len(proxies_ng)]
                         res = abrir_enlace_familia_con_autocierre(
                             enlace, correo, proxy_pe=None, proxy_ng=p_ng,
                             forzar_proxy_ng=True,
@@ -20343,12 +22458,18 @@ def menu_principal():
                             except Exception:
                                 pass
 
+                oleadas_completadas_op4 = 0
                 for n_oleada, oleada in enumerate(oleadas, 1):
                     if len(oleadas) > 1:
                         print(f"\n{Color.BLUE}{Color.BOLD}=== Oleada {n_oleada}/{len(oleadas)}: "
                               f"{len(oleada)} invitación(es) ==={Color.ENDC}")
                         for correo_o, _ in oleada:
                             print(f"    • {correo_o}")
+                    vpn_latam_antes_de_oleada(
+                        oleadas_completadas=oleadas_completadas_op4,
+                        n_oleada=n_oleada,
+                        n_total=len(oleadas),
+                    )
                     workers = len(oleada)
                     cancel_oleada = threading.Event()
                     executor = ThreadPoolExecutor(max_workers=workers)
@@ -20370,6 +22491,10 @@ def menu_principal():
                                     c_res, res_status = future.result(timeout=1.0)
                                     if res_status in ("ok", True):
                                         ok_list.append(c_res)
+                                    elif res_status == "pwd_incorrecta":
+                                        pwd_incorrecta_list.append(c_res)
+                                    elif res_status == "invite_ajeno":
+                                        fail_list.append(c_res)
                                     elif res_status in ("ya_usado", "previamente_utilizado", "caducado"):
                                         ya_usados_list.append(c_res)
                                     else:
@@ -20422,10 +22547,13 @@ def menu_principal():
                         print(f"  {Color.CYAN}[Opción 4] Oleada {n_oleada} terminada. "
                               f"Pasando a la siguiente (pausa {pausa:.0f}s)...{Color.ENDC}")
                         time.sleep(pausa)
+                    oleadas_completadas_op4 += 1
             else:
                 print(f"\n{Color.FAIL}>>> No se encontró ningún enlace de invitación en las cuentas activas. <<<\n")
 
-            _imprimir_resumen_opcion4(correos, ok_list, fail_list, sin_enlace, ya_usados_list)
+            _imprimir_resumen_opcion4(
+                correos, ok_list, fail_list, sin_enlace, ya_usados_list, pwd_incorrecta_list
+            )
             print()
             
         elif opcion == "6":
