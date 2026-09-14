@@ -9528,6 +9528,65 @@ def _geoip_es_nigeria(info: dict) -> bool:
     return code == "NG" or "nigeria" in name
 
 
+SURFSHARK_PAISES_REGISTRO = {
+    "nigeria": {
+        "clave": "nigeria",
+        "nombre": "Nigeria",
+        "codigo": "NG",
+        "nombres_geo": ("nigeria",),
+        "ubicacion": "nigeria",
+        "ciudad": "Lagos",
+    },
+    "argentina": {
+        "clave": "argentina",
+        "nombre": "Argentina",
+        "codigo": "AR",
+        "nombres_geo": ("argentina",),
+        "ubicacion": "argentina",
+        "ciudad": "Buenos Aires",
+    },
+}
+
+
+def _geoip_es_pais_registro(info: dict, pais: dict) -> bool:
+    code = (info.get("country_code") or "").upper()
+    name = (info.get("country") or "").casefold()
+    if code == str(pais.get("codigo") or "").upper():
+        return True
+    return any(n in name for n in (pais.get("nombres_geo") or ()))
+
+
+def ip_publica_es_pais_registro(pais: dict, info: dict | None = None) -> tuple[bool, str]:
+    preferir = lambda inf: _geoip_es_pais_registro(inf, pais)
+    info = consultar_geoip_publica(preferir=preferir) if info is None else info
+    if not info:
+        return False, "sin geoip (¿red caída / kill switch?)"
+    ip = info.get("ip") or "?"
+    fuente = info.get("fuente") or ""
+    extra = (info.get("country_code") or info.get("country") or "?")
+    ok = _geoip_es_pais_registro(info, pais)
+    return ok, f"{ip} {extra} ({fuente})"
+
+
+def pedir_pais_vpn_opcion8() -> dict | None:
+    """Menú 1 Nigeria / 2 Argentina. Enter = Nigeria. None si se cancela."""
+    print(f"\n{Color.CYAN}{Color.BOLD}¿En qué IP de Surfshark registrar las cuentas?{Color.ENDC}")
+    print("  1. NIGERIA")
+    print("  2. ARGENTINA")
+    while True:
+        try:
+            op = input(">>> Escoge 1 o 2 (Enter = 1 Nigeria): ").strip().lower()
+        except EOFError:
+            return None
+        if op in ("", "1", "nigeria", "ng"):
+            return SURFSHARK_PAISES_REGISTRO["nigeria"]
+        if op in ("2", "argentina", "ar"):
+            return SURFSHARK_PAISES_REGISTRO["argentina"]
+        if op in ("n", "no", "salir", "q", "cancel"):
+            return None
+        print(f"  {Color.FAIL}Opción inválida. Escribe 1 (Nigeria) o 2 (Argentina).{Color.ENDC}")
+
+
 def consultar_geoip_publica(*, preferir=None) -> dict:
     """IP pública y país. Prueba varias fuentes (ip-api a veces se queda en la IP vieja)."""
     stamp = int(time.time() * 1000)
@@ -9614,22 +9673,25 @@ def _surfshark_subprocess(args: list[str], timeout_s: float = 90.0) -> bool:
         return False
 
 
-def _esperar_geo_nigeria(timeout_s: float = 18.0, ip_anterior: str = "") -> tuple[bool, str]:
+def _esperar_geo_pais_registro(
+    pais: dict, timeout_s: float = 18.0, ip_anterior: str = "",
+) -> tuple[bool, str]:
+    nombre = pais.get("nombre") or "Nigeria"
     deadline = time.time() + timeout_s
     ultimo = "sin respuesta"
     while time.time() < deadline:
-        ok, detalle = ip_publica_es_nigeria()
+        ok, detalle = ip_publica_es_pais_registro(pais)
         ultimo = detalle
         if ok:
             return True, detalle
         if ip_anterior and ip_anterior in detalle:
             print(f"  [VPN] Geo aún en IP anterior ({detalle})...")
         else:
-            print(f"  [VPN] Geo aún no es Nigeria ({detalle})...")
+            print(f"  [VPN] Geo aún no es {nombre} ({detalle})...")
         time.sleep(2.0)
     curl_info = _geoip_via_curl()
     if curl_info:
-        ok = _geoip_es_nigeria(curl_info)
+        ok = _geoip_es_pais_registro(curl_info, pais)
         detalle = f"{curl_info.get('ip') or '?'} {curl_info.get('country_code') or '?'} (curl)"
         if ok:
             return True, detalle
@@ -9637,69 +9699,95 @@ def _esperar_geo_nigeria(timeout_s: float = 18.0, ip_anterior: str = "") -> tupl
     return False, ultimo
 
 
-def asegurar_vpn_nigeria_para_registro(*, reciclar: bool, motivo: str, intentos_auto: int = 2) -> bool:
-    """Deja Surfshark en Nigeria y arranca. No se queda 3 minutos en geo-checks viejos.
+def _esperar_geo_nigeria(timeout_s: float = 18.0, ip_anterior: str = "") -> tuple[bool, str]:
+    return _esperar_geo_pais_registro(
+        SURFSHARK_PAISES_REGISTRO["nigeria"], timeout_s, ip_anterior,
+    )
 
-    reciclar=True: desconecta y vuelve a conectar Nigeria (IP nueva).
-    reciclar=False: si ya es NG, no toca la VPN; si no, conecta a Nigeria.
-    Si la UI de Surfshark queda en Nigeria pero ip-api sigue en PE (túnel/caché),
-    se considera OK: Chrome sale por la VPN, no por requests de Python.
+
+def asegurar_vpn_pais_para_registro(
+    *,
+    pais: dict,
+    reciclar: bool,
+    motivo: str,
+    intentos_auto: int = 2,
+) -> bool:
+    """Asegura Surfshark en el país elegido antes de registrar. No exige IP distinta.
+
+    reciclar=False: si ya está en ese país, no toca la VPN; si no, conecta.
+    reciclar=True: desconecta y vuelve a conectar el mismo país (cada 2 oleadas).
     """
-    print(f"\n  {Color.CYAN}[VPN] {motivo} — hace falta Nigeria (NG) en Surfshark.{Color.ENDC}")
+    nombre = pais.get("nombre") or "Nigeria"
+    ubicacion = pais.get("ubicacion") or "nigeria"
+    ciudad = pais.get("ciudad") or nombre
+    print(f"\n  {Color.CYAN}[VPN] {motivo} — hace falta {nombre} en Surfshark.{Color.ENDC}")
     ip_antes = ""
     if not reciclar:
-        ok, detalle = ip_publica_es_nigeria()
+        ok, detalle = ip_publica_es_pais_registro(pais)
         if ok:
-            print(f"  {Color.GREEN}[VPN] [OK] Ya en Nigeria: {detalle}{Color.ENDC}")
+            print(f"  {Color.GREEN}[VPN] [OK] Ya en {nombre}: {detalle}{Color.ENDC}")
             return True
-        print(f"  {Color.WARNING}[VPN] IP actual no es Nigeria ({detalle}). "
-              f"Conectando Surfshark a Nigeria...{Color.ENDC}")
+        print(f"  {Color.WARNING}[VPN] IP actual no es {nombre} ({detalle}). "
+              f"Conectando Surfshark a {nombre}...{Color.ENDC}")
         ip_antes = (detalle.split() or [""])[0]
 
     for intento in range(1, intentos_auto + 1):
-        print(f"  [VPN] Ciclo Surfshark {intento}/{intentos_auto}: Nigeria (un solo paso)...")
-        # Un proceso: desconectar si hace falta + clic en Nigeria, Lagos + esperar «Desconectar».
+        print(f"  [VPN] Ciclo Surfshark {intento}/{intentos_auto}: "
+              f"{'desconectar + conectar ' + nombre if reciclar else nombre}...")
+        if reciclar:
+            print("  [VPN] Desconectando Surfshark...")
+            _surfshark_subprocess(["--solo-desconectar"], timeout_s=40.0)
+            time.sleep(3.0)
         ok_ui = _surfshark_subprocess(
-            ["--ubicacion", "nigeria", "--espera", "3", "--timeout-busqueda", "8"],
+            ["--ubicacion", ubicacion, "--espera", "3", "--timeout-busqueda", "8"],
             timeout_s=75.0,
         )
         print("  [VPN] Flush DNS...")
         _flush_dns_windows()
         time.sleep(3.0)
-        ok, detalle = _esperar_geo_nigeria(16.0, ip_anterior=ip_antes)
+        ok, detalle = _esperar_geo_pais_registro(pais, 16.0, ip_anterior=ip_antes)
         if ok:
-            print(f"  {Color.GREEN}[VPN] [OK] IP en Nigeria: {detalle}{Color.ENDC}")
+            print(f"  {Color.GREEN}[VPN] [OK] IP en {nombre}: {detalle}{Color.ENDC}")
             return True
         if ok_ui:
-            print(f"  {Color.WARNING}[VPN] Surfshark UI conectada a Nigeria, pero geoip "
+            print(f"  {Color.WARNING}[VPN] Surfshark UI conectada a {nombre}, pero geoip "
                   f"sigue en ({detalle}). Python a veces no sale por la VPN; Chrome sí.{Color.ENDC}")
-            print(f"  {Color.GREEN}[VPN] [OK] Se arranca el registro: Surfshark está en Nigeria.{Color.ENDC}")
+            print(f"  {Color.GREEN}[VPN] [OK] Se arranca el registro: Surfshark está en {nombre}.{Color.ENDC}")
             return True
-        print(f"  {Color.WARNING}[VPN] Tras el ciclo, ni UI ni geo confirman Nigeria ({detalle}).{Color.ENDC}")
+        print(f"  {Color.WARNING}[VPN] Tras el ciclo, ni UI ni geo confirman {nombre} ({detalle}).{Color.ENDC}")
 
-    print(f"  {Color.FAIL}[VPN] No se confirmó Nigeria en automático.{Color.ENDC}")
-    print(f"  {Color.FAIL}[VPN] Conecta Surfshark a NIGERIA a mano. "
+    print(f"  {Color.FAIL}[VPN] No se confirmó {nombre} en automático.{Color.ENDC}")
+    print(f"  {Color.FAIL}[VPN] Conecta Surfshark a {nombre.upper()} a mano. "
           f"No se registra con otra IP.{Color.ENDC}")
     while True:
         try:
-            input(">>> Presiona Enter cuando Surfshark esté en NIGERIA (Conectado y seguro) <<< ")
+            input(f">>> Presiona Enter cuando Surfshark esté en {nombre.upper()} (Conectado y seguro) <<< ")
         except EOFError:
             return False
         _flush_dns_windows()
         time.sleep(2.0)
-        ok, detalle = ip_publica_es_nigeria()
+        ok, detalle = ip_publica_es_pais_registro(pais)
         if ok:
-            print(f"  {Color.GREEN}[VPN] [OK] IP en Nigeria: {detalle}{Color.ENDC}")
+            print(f"  {Color.GREEN}[VPN] [OK] IP en {nombre}: {detalle}{Color.ENDC}")
             return True
-        print(f"  {Color.WARNING}[VPN] Geoip aún no es Nigeria ({detalle}). "
-              f"Si Surfshark muestra Nigeria, Lagos — se arranca igual.{Color.ENDC}")
+        print(f"  {Color.WARNING}[VPN] Geoip aún no es {nombre} ({detalle}). "
+              f"Si Surfshark muestra {nombre}, {ciudad} — se arranca igual.{Color.ENDC}")
         try:
-            conf = input(">>> ¿Surfshark muestra Nigeria conectado? (s/n) <<< ").strip().lower()
+            conf = input(f">>> ¿Surfshark muestra {nombre} conectado? (s/n) <<< ").strip().lower()
         except EOFError:
             return False
         if conf in ("s", "si", "y", "yes"):
             print(f"  {Color.GREEN}[VPN] [OK] Confirmado a mano. Arrancando registro.{Color.ENDC}")
             return True
+
+
+def asegurar_vpn_nigeria_para_registro(*, reciclar: bool, motivo: str, intentos_auto: int = 2) -> bool:
+    return asegurar_vpn_pais_para_registro(
+        pais=SURFSHARK_PAISES_REGISTRO["nigeria"],
+        reciclar=reciclar,
+        motivo=motivo,
+        intentos_auto=intentos_auto,
+    )
 
 
 # LATAM para opciones 4 y 9: cualquier IP vale; se rota entre estos países para no quemar una sola.
@@ -20988,8 +21076,15 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
 
 def registrar_cuentas_tidal(correos):
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}   REGISTRO AUTOMÁTICO DE CUENTAS TIDAL (NIGERIA){Color.ENDC}")
+    print(f"{Color.BLUE}{Color.BOLD}   REGISTRO AUTOMÁTICO DE CUENTAS TIDAL{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
+
+    pais_vpn = pedir_pais_vpn_opcion8()
+    if not pais_vpn:
+        print(f"\n{Color.WARNING}[Opción 8] Cancelado: no se eligió país de IP.{Color.ENDC}")
+        return
+    nombre_vpn = pais_vpn.get("nombre") or "Nigeria"
+    print(f"\n  {Color.GREEN}[Opción 8] IP de registro: {nombre_vpn.upper()}.{Color.ENDC}")
     
     try:
         from playwright.sync_api import sync_playwright
@@ -21084,13 +21179,12 @@ def registrar_cuentas_tidal(correos):
     total_cuentas = len(correos_lista)
     n_oleadas = max(1, (total_cuentas + batch_size - 1) // batch_size)
     print(f"\n{Color.CYAN}{Color.BOLD}Opción 8: {total_cuentas} cuenta(s) → {n_oleadas} oleada(s) "
-          f"de hasta {batch_size} ventanas en simultáneo (IP Nigeria vía Surfshark, OTP worker por alias).{Color.ENDC}")
+          f"de hasta {batch_size} ventanas en simultáneo (IP {nombre_vpn} vía Surfshark, OTP worker por alias).{Color.ENDC}")
     print(f"{Color.CYAN}Un fallo no detiene el lote. Tras todas las oleadas se reintenta una vez "
           f"lo que haya fallado.{Color.ENDC}")
     if not use_proxy:
-        print(f"{Color.CYAN}VPN: se comprueba Nigeria (NG) antes de cada oleada. "
-              f"Si el proceso es largo, cada 2 oleadas se desconecta Surfshark y se "
-              f"vuelve a conectar a Nigeria para no bloquear la IP.{Color.ENDC}")
+        print(f"{Color.CYAN}VPN: se comprueba {nombre_vpn} antes de cada oleada. "
+              f"Cada 2 oleadas se desconecta Surfshark y se vuelve a conectar a {nombre_vpn}.{Color.ENDC}")
     print()
 
     success_count = 0
@@ -21102,20 +21196,22 @@ def registrar_cuentas_tidal(correos):
     vpn_ng_abortar = False
 
     def _vpn_nigeria_antes_de_oleada(n_oleada: int, n_ol: int) -> bool:
-        """IP Nigeria antes de arrancar. Cada 2 oleadas: desconectar y reconectar Surfshark."""
+        """País elegido antes de registrar. Cada 2 oleadas: Desconectar y conectar otra vez."""
         nonlocal vpn_ng_abortar
         if use_proxy:
             return True
         reciclar = oleadas_completadas > 0 and oleadas_completadas % 2 == 0
         if reciclar:
-            motivo = (f"tras {oleadas_completadas} oleada(s) — reciclar IP "
+            motivo = (f"tras {oleadas_completadas} oleada(s) — desconectar y conectar {nombre_vpn} "
                       f"(antes de oleada {n_oleada}/{n_ol})")
         else:
             motivo = f"antes de oleada {n_oleada}/{n_ol}"
-        ok = asegurar_vpn_nigeria_para_registro(reciclar=reciclar, motivo=motivo)
+        ok = asegurar_vpn_pais_para_registro(
+            pais=pais_vpn, reciclar=reciclar, motivo=motivo,
+        )
         if not ok:
             vpn_ng_abortar = True
-            print(f"  {Color.FAIL}[VPN] No hay IP de Nigeria. Se detiene la opción 8.{Color.ENDC}")
+            print(f"  {Color.FAIL}[VPN] No hay IP de {nombre_vpn}. Se detiene la opción 8.{Color.ENDC}")
         return ok
 
     def _limpiar_tras_oleada(n_oleada: int, n_total: int) -> None:
@@ -21149,7 +21245,7 @@ def registrar_cuentas_tidal(correos):
         n_ol = max(1, (n_tot + batch_size - 1) // batch_size)
         for b_start in range(0, n_tot, batch_size):
             if vpn_ng_abortar:
-                print(f"  {Color.FAIL}[VPN] Oleadas restantes canceladas: IP no es Nigeria.{Color.ENDC}")
+                print(f"  {Color.FAIL}[VPN] Oleadas restantes canceladas: IP no es {nombre_vpn}.{Color.ENDC}")
                 break
             lote = pendientes[b_start:b_start + batch_size]
             n_oleada = (b_start // batch_size) + 1
@@ -21330,7 +21426,7 @@ def registrar_cuentas_tidal(correos):
             retry_lista.append(c)
     if retry_lista:
         if vpn_ng_abortar:
-            print(f"\n{Color.FAIL}[Opción 8] Reintento omitido: no hay IP de Nigeria.{Color.ENDC}")
+            print(f"\n{Color.FAIL}[Opción 8] Reintento omitido: no hay IP de {nombre_vpn}.{Color.ENDC}")
         else:
             print(f"\n{Color.CYAN}{Color.BOLD}[Opción 8] Reintento de {len(retry_lista)} cuenta(s) "
                   f"fallida(s), otra vez en oleadas de {batch_size}...{Color.ENDC}\n")
@@ -22143,7 +22239,7 @@ def menu_principal():
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
         print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en el menú)")
         print(" 7. Salir")
-        print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria)")
+        print(" 8. Registrar cuenta(s) automáticamente en TIDAL (Nigeria / Argentina)")
         print(" 9. Restablecer contraseña(s) automáticamente en TIDAL")
         print(" 10. Iniciar sesión automática (solo login TIDAL, ventana abierta sin límite)")
         print(" 11. Invitar al plan familiar (Titulares e Invitaciones Automáticas)")

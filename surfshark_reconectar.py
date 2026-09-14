@@ -178,13 +178,19 @@ def _escribir_busqueda_surfshark(wnd, texto: str, timeout_s: float) -> bool:
     return False
 
 
-def _pulsar_resultado_ubicacion(wnd, texto_pais: str, timeout_s: float) -> bool:
-    """Clic en el resultado de ubicación (Nigeria / Perú / Costa Rica), no en el buscador."""
+def _pulsar_resultado_ubicacion(
+    wnd, texto_pais: str, timeout_s: float, indice: int = 0,
+) -> bool:
+    """Clic en el resultado de ubicación (Nigeria / Perú / Costa Rica), no en el buscador.
+
+    indice>0 elige otro resultado con el mismo país (otra ciudad/servidor) si existe.
+    """
     texto_pais_norm = _sin_acentos(texto_pais)
     tipos_ok = ("ListItem", "Button", "ListBoxItem", "DataItem")
     fin = time.time() + timeout_s
     while time.time() < fin:
         candidatos = []
+        vistos = set()
         try:
             for elem in wnd.descendants():
                 try:
@@ -199,22 +205,32 @@ def _pulsar_resultado_ubicacion(wnd, texto_pais: str, timeout_s: float) -> bool:
                         continue
                     if tipo not in tipos_ok:
                         continue
+                    prio = None
                     if name_cf == texto_pais_norm or name_cf.startswith(texto_pais_norm + ",") or name_cf.startswith(texto_pais_norm + " "):
-                        candidatos.append((0, elem, name))
+                        prio = 0
                     elif texto_pais_norm in name_cf and "surfshark." not in name_cf:
-                        candidatos.append((1, elem, name))
+                        prio = 1
+                    if prio is None:
+                        continue
+                    if name_cf in vistos:
+                        continue
+                    vistos.add(name_cf)
+                    candidatos.append((prio, elem, name))
                 except Exception:
                     continue
         except Exception:
             candidatos = []
         candidatos.sort(key=lambda x: x[0])
-        for _prio, elem, name in candidatos:
+        if candidatos:
+            idx = int(indice or 0) % len(candidatos)
+            _prio, elem, name = candidatos[idx]
             try:
                 elem.click_input()
             except Exception:
                 try:
                     elem.invoke()
                 except Exception:
+                    time.sleep(0.4)
                     continue
             return True
         time.sleep(0.4)
@@ -256,6 +272,7 @@ def _ciclo_ui_surfshark(
     ubicacion: str | None = None,
     solo_desconectar: bool = False,
     esperar_conectado: bool = True,
+    indice_resultado: int = 0,
 ) -> bool:
     """Desconectar → espera → Conexión rápida o búsqueda de ubicación específica."""
     wnd = _ventana_principal(app)
@@ -295,7 +312,9 @@ def _ciclo_ui_surfshark(
             if verbose:
                 print(f"  Surfshark: escrito «{ubicacion}». Buscando el resultado en la lista…")
             time.sleep(1.2)
-            if _pulsar_resultado_ubicacion(wnd, ubicacion, timeout_busqueda):
+            if _pulsar_resultado_ubicacion(
+                wnd, ubicacion, timeout_busqueda, indice=indice_resultado,
+            ):
                 if verbose:
                     print(f"  Surfshark: seleccionado «{ubicacion}» para conectar.")
                 if esperar_conectado:
@@ -339,6 +358,7 @@ def ejecutar_reconexion_surfshark(
     ubicacion: str | None = None,
     solo_desconectar: bool = False,
     esperar_conectado: bool = True,
+    indice_resultado: int = 0,
 ) -> bool:
     """
     Conecta o inicia Surfshark y ejecuta Desconectar → espera → Ubicación específica o Conexión rápida.
@@ -375,6 +395,7 @@ def ejecutar_reconexion_surfshark(
             ubicacion=ubicacion,
             solo_desconectar=solo_desconectar,
             esperar_conectado=esperar_conectado and not solo_desconectar,
+            indice_resultado=indice_resultado,
         )
     except Exception as e:
         if verbose:
@@ -419,6 +440,12 @@ def main() -> None:
         help="Nombre de la ubicación a buscar y conectar en Surfshark (ej. nigeria). Si se omite, usa Conexión rápida.",
     )
     parser.add_argument(
+        "--indice-resultado",
+        type=int,
+        default=0,
+        help="Si hay varios resultados del país, pulsa el N-ésimo (0=primero). Sirve para rotar servidor NG.",
+    )
+    parser.add_argument(
         "--solo-desconectar",
         action="store_true",
         help="Solo desconectar la VPN de Surfshark, sin volver a conectar.",
@@ -439,6 +466,7 @@ def main() -> None:
         ubicacion=args.ubicacion,
         solo_desconectar=args.solo_desconectar,
         esperar_conectado=not args.no_esperar_conectado,
+        indice_resultado=args.indice_resultado,
     )
     sys.exit(0 if ok else 3)
 
