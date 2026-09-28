@@ -23,9 +23,13 @@ Dominio `cheapmusic.best` → **Email** → **Email Routing**:
 
 1. Catch-all (o regla `*@cheapmusic.best`).
 2. Acción: **Send to a Worker** → `tidal-otp-worker`.
-3. El worker reenvía copia a `cakeseller1234@gmail.com` (`FORWARD_TO` en `wrangler.toml`).
+3. El worker guarda OTP/enlace en KV y responde por HTTP. Copia a Gmail
+   (`FORWARD_TO`) **solo invite y reset** (`FORWARD_KINDS=invite,reset`) para no
+   saturar Gmail en oleadas largas. OTP no se reenvía: el script los lee de KV.
+   En Email Routing el catch-all debe ser **solo** “Send to Worker”, no un
+   forward extra a Gmail (eso duplica el volumen).
 
-Si la UI no deja Worker + Gmail a la vez, deja solo Worker: el `forward()` del script hace la copia.
+El pipeline de `@cheapmusic.best` **no usa IMAP/Gmail** salvo `email_worker_imap_fallback=1`.
 
 ## 3. passwords.txt
 
@@ -41,6 +45,8 @@ No pongas `email_worker_imap_fallback=1` salvo que quieras IMAP de respaldo (Gma
 Abre `https://otp.cheapmusic.best/health` — debe devolver `{"ok":true,"service":"tidal-otp-worker"}`.
 
 Opción **12** del menú muestra si el worker responde. Opción **3** (OTP login) debe imprimir `[WORKER] login para titular-...@cheapmusic.best`.
+
+Opción **4**: Enter extrae los enlaces de invitación con `POST /list-many` (sin IMAP, segundos). `i` = IMAP de Gmail.
 
 | Flujo | Menú | kind worker |
 |---|---|---|

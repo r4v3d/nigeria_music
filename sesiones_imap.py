@@ -97,6 +97,100 @@ class BarreraTolerante:
                     self._cond.notify_all()
                 raise
 
+
+class CoordinadorOtpEliminacionLote:
+    """Todas las ventanas del lote (máx. 5):
+    1) llegan juntas al asistente,
+    2) piden el OTP a la vez,
+    3) cada una recoge su OTP del Worker en paralelo (sin IMAP),
+    4) escriben y cierran 1 a 1.
+    """
+
+    ESPERA_TRAS_PEDIR_S = 0.4
+
+    def __init__(self, n_ventanas: int):
+        self.n = max(1, int(n_ventanas))
+        self._cv = threading.Condition()
+        self._pendientes_listos = self.n
+        self._pendientes_pedir = self.n
+        self._estado: dict[str, str] = {}  # email -> activo|listo|pedido|fuera
+        self.escritura_lock = threading.Lock()
+
+    def _dec(self, attr: str) -> int:
+        val = getattr(self, attr)
+        if val > 0:
+            setattr(self, attr, val - 1)
+        return getattr(self, attr)
+
+    def _esperar_cero(self, attr: str, email: str, que: str) -> None:
+        quedan = getattr(self, attr)
+        print(f"  [Eliminación] [{email}] {que} ({quedan} pendiente(s))...")
+        deadline = time.time() + 180.0
+        while getattr(self, attr) > 0:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                print(f"  [Eliminación] [{email}] Timeout esperando al resto del lote "
+                      f"({getattr(self, attr)}). Se continúa.")
+                break
+            self._cv.wait(timeout=min(1.0, remaining))
+
+    def fallo(self, email: str | None = None) -> None:
+        """Una ventana no pedirá OTP. Libera al resto del lote (idempotente)."""
+        with self._cv:
+            if email:
+                st = self._estado.get(email, "activo")
+                if st == "fuera":
+                    return
+                if st == "activo":
+                    self._dec("_pendientes_listos")
+                    self._dec("_pendientes_pedir")
+                elif st == "listo":
+                    self._dec("_pendientes_pedir")
+                self._estado[email] = "fuera"
+            else:
+                self._dec("_pendientes_listos")
+                self._dec("_pendientes_pedir")
+            self._cv.notify_all()
+
+    def fallo_antes_otp(self, email: str | None = None) -> None:
+        self.fallo(email)
+
+    def esperar_para_pedir_otp(self, email: str) -> None:
+        with self._cv:
+            st = self._estado.get(email, "activo")
+            if st == "activo":
+                self._dec("_pendientes_listos")
+                self._estado[email] = "listo"
+            self._esperar_cero(
+                "_pendientes_listos",
+                email,
+                "Asistente listo. Esperando al resto para pedir el código a la vez",
+            )
+        print(f"  [Eliminación] [{email}] Lote sincronizado: pidiendo el OTP ahora.")
+
+    def esperar_despues_de_pedir_otp(self, email: str, recolectar=None) -> None:
+        with self._cv:
+            st = self._estado.get(email, "activo")
+            if st not in ("pedido", "fuera"):
+                self._dec("_pendientes_pedir")
+                self._estado[email] = "pedido"
+            self._esperar_cero(
+                "_pendientes_pedir",
+                email,
+                "OTP pedido. Esperando al resto",
+            )
+        if callable(recolectar):
+            print(f"  [Eliminación] [{email}] Lote listo. Recogiendo OTP del worker ahora...")
+            try:
+                recolectar()
+            except Exception as e_pre:
+                print(f"  [Eliminación] [{email}] Prefetch OTP: {e_pre}")
+            return
+        print(f"  [Eliminación] [{email}] Lote listo. Esperando {self.ESPERA_TRAS_PEDIR_S:.1f}s "
+              f"a que lleguen los mails...")
+        time.sleep(self.ESPERA_TRAS_PEDIR_S)
+
+
 # Protege 'tmm_cookies.json' de escrituras solapadas entre ventanas simultáneas.
 TMM_COOKIES_LOCK = threading.Lock()
 TMM_COOKIES_PATH = SCRIPT_DIR / "tmm_cookies.json"
@@ -580,20 +674,12 @@ def buscar_contrasena_cuenta(correo_solicitado: str) -> str | None:
             pass
 
     # 2. Fallback passwords.txt: solo match exacto del correo
-    path_pwds = SCRIPT_DIR / "passwords.txt"
-    if path_pwds.exists():
-        try:
-            for line in path_pwds.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k_clean = k.strip()
-                v_clean = v.strip().strip('"').strip("'")
-                if correos_iguales_exacto(k_clean, correo_solicitado) and v_clean:
-                    return v_clean
-        except Exception:
-            pass
+    try:
+        for k_clean, v_clean in _pares_passwords_txt():
+            if correos_iguales_exacto(k_clean, correo_solicitado) and v_clean:
+                return v_clean
+    except Exception:
+        pass
 
     return None
 
@@ -1060,8 +1146,10 @@ def _invite_continuar_esta_cargando(page) -> bool:
                 if (grande && /loading|cargando/.test(title)) return true;
                 if (grande && animando && (t.length < 3 || /loading|cargando/i.test(t))) return true;
                 if (dis && (t === '' || /^\\.{1,6}$/.test(t) || /loading|cargando/i.test(t))) return true;
+                // Inicia Sesión / Continuar GRISES con su etiqueta visible no son spinner:
+                // Tidal los deja disabled hasta que Vue tiene correo/clave.
                 if (/^(continuar|continue|inicia(?:r)?\\s*sesi[oó]n|log\\s*in)$/i.test(t)
-                    && (dis || aria === 'true' || spinner)) return true;
+                    && (aria === 'true' || (t.length < 3 && spinner))) return true;
             }
             if (Array.from(document.querySelectorAll('[aria-busy="true"]')).some(visible)) return true;
             return false;
@@ -1080,7 +1168,11 @@ def _invite_pwd_sigue_esperando_tidal(page, estado: dict) -> bool:
     if not estado.get("pwd_enviada"):
         return False
     ts = float(estado.get("pwd_enviada_ts") or 0)
-    return bool(ts) and (time.time() - ts) < _INVITE_PWD_GRACE_S
+    gracia = bool(ts) and (time.time() - ts) < _INVITE_PWD_GRACE_S
+    # Botón gris con el texto "Inicia Sesión": Vue no envió nada. Tras la gracia, reescribir.
+    if _invite_es_pantalla_password_login(page) and not _invite_login_cta_habilitado(page):
+        return gracia
+    return gracia
 
 
 def _invite_post_clave_recibida(page, estado: dict | None = None) -> bool:
@@ -1117,6 +1209,26 @@ def _invite_avisar_pwd_incorrecta(correo: str, estado: dict) -> None:
           f"Se omite al instante (sin reintentos).{Color.ENDC}")
 
 
+def _invite_login_oauth_bloqueado(page) -> bool:
+    """True en login.tidal.com/authorize (correo o clave), no en accept-invite."""
+    try:
+        u = (page.url or "").lower()
+    except Exception:
+        u = ""
+    if "login.tidal.com" not in u:
+        return _invite_es_pantalla_password_login(page)
+    if "/family" in u or "accept-invite" in u or "/accept/" in u:
+        return False
+    if "/authorize" in u or "/signin" in u or "/sign-in" in u:
+        return True
+    return _invite_es_pantalla_password_login(page)
+
+
+def _invite_reset_login_para_reintento(estado: dict) -> None:
+    estado["pwd_enviada"] = False
+    estado["aviso_login_esperando"] = False
+
+
 def _invite_esperar_respuesta_login(page, correo: str, estado: dict) -> str:
     """Tras Inicia Sesión: no declarar error mientras el botón sigue cargando."""
     if not estado.get("aviso_login_esperando"):
@@ -1127,6 +1239,15 @@ def _invite_esperar_respuesta_login(page, correo: str, estado: dict) -> str:
     while time.time() - t0 < 22.0:
         if _invite_detectar_exito(page):
             return "ok"
+        # Tidal a veces vuelve a /authorize con Inicia Sesión gris: no pulsar Aceptar ahí.
+        if _invite_login_oauth_bloqueado(page):
+            if not _invite_pwd_sigue_esperando_tidal(page, estado):
+                print(f"    [Invitación] [{correo}] Sigue en contraseña (Inicia Sesión gris). "
+                      f"Reescribiendo la clave...", flush=True)
+                _invite_reset_login_para_reintento(estado)
+                return "progreso"
+            time.sleep(0.15)
+            continue
         if _invite_queda_boton_aceptar(page):
             if _invite_pulsar_aceptar(page):
                 print(f"    [Invitación] [{correo}] Pulsado botón de aceptación.")
@@ -1138,6 +1259,11 @@ def _invite_esperar_respuesta_login(page, correo: str, estado: dict) -> str:
         time.sleep(0.15)
     if _invite_detectar_exito(page):
         return "ok"
+    if _invite_login_oauth_bloqueado(page):
+        print(f"    [Invitación] [{correo}] Login no avanzó; se reescribe la clave.",
+              flush=True)
+        _invite_reset_login_para_reintento(estado)
+        return "progreso"
     if _invite_queda_boton_aceptar(page) and _invite_pulsar_aceptar(page):
         print(f"    [Invitación] [{correo}] Pulsado botón de aceptación.")
         if _invite_esperar_ui(page, [lambda: _invite_detectar_exito(page)], max_s=4.0):
@@ -1363,33 +1489,67 @@ def _invite_hay_pantalla_codigo(page) -> bool:
 def _invite_es_pantalla_password_login(page) -> bool:
     """True en 'Introduce tu contraseña' + Inicia Sesión (cuenta ya registrada)."""
     try:
-        return bool(page.evaluate("""() => {
-            const visible = (el) => {
-                if (!el) return false;
-                const st = window.getComputedStyle(el);
-                if (st.display === 'none' || st.visibility === 'hidden'
-                    || parseFloat(st.opacity || '1') < 0.05) return false;
-                const r = el.getBoundingClientRect();
-                return r.width > 1 && r.height > 1;
-            };
-            const txt = (document.body ? document.body.innerText : '').toLowerCase();
-            const pwdEl = Array.from(document.querySelectorAll(
-                'input[type="password"], input[autocomplete="current-password"], input[placeholder*="contrase" i], input[placeholder*="password" i], input[aria-label*="contrase" i], input[aria-label*="password" i]'
-            )).filter(visible).filter(el => (el.getAttribute('maxlength') || '') !== '1');
-            const otpBoxes = Array.from(document.querySelectorAll(
-                'input[maxlength="1"], input[autocomplete="one-time-code"]'
-            )).filter(visible);
-            if (otpBoxes.length >= 4) return false;
-            const marcaPwd = /introduce tu contrase|enter your password|olvidaste tu contrase|forgot (your )?password|iniciar sesi[oó]n con c[oó]digo|log in with (a )?code/i.test(txt);
-            const btnLogin = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
-                .filter(visible)
-                .some(el => /^(inicia(?:r)?\\s*sesi[oó]n|log\\s*in|sign\\s*in|login)$/i.test(
-                    (el.innerText || el.textContent || el.value || '').trim()
-                ));
-            return Boolean(pwdEl.length && (marcaPwd || btnLogin));
-        }"""))
+        frames = list(getattr(page, "frames", None) or []) or [page]
     except Exception:
-        return False
+        frames = [page]
+    js = r"""() => {
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            if (st.display === 'none' || st.visibility === 'hidden'
+                || parseFloat(st.opacity || '1') < 0.05) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 1 && r.height > 1;
+        };
+        const deepInputs = (root) => {
+            const out = [];
+            const walk = (node) => {
+                if (!node) return;
+                try { node.querySelectorAll('input').forEach(el => out.push(el)); } catch (e) {}
+                try {
+                    (node.querySelectorAll ? node.querySelectorAll('*') : []).forEach(el => {
+                        if (el && el.shadowRoot) walk(el.shadowRoot);
+                    });
+                } catch (e) {}
+            };
+            walk(root);
+            return out;
+        };
+        const txt = (document.body ? document.body.innerText : '').toLowerCase();
+        const inputs = deepInputs(document);
+        const pwdEl = inputs.filter(visible).filter(el => {
+            const max = (el.getAttribute('maxlength') || '').trim();
+            if (max === '1') return false;
+            const t = (el.type || 'text').toLowerCase();
+            const ac = (el.autocomplete || '').toLowerCase();
+            const ph = ((el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')
+                + ' ' + (el.name || '')).toLowerCase();
+            if (t === 'password' || ac === 'current-password') return true;
+            return /contrase|password/.test(ph);
+        });
+        const otpBoxes = inputs.filter(visible).filter(el => {
+            const max = (el.getAttribute('maxlength') || '').trim();
+            const ac = (el.autocomplete || '').toLowerCase();
+            return max === '1' || ac === 'one-time-code';
+        });
+        if (otpBoxes.length >= 4) return false;
+        const marcaPwd = /introduce tu contrase|enter your password|olvidaste tu contrase|forgot (your )?password|iniciar sesi[oó]n con c[oó]digo|log in with (a )?code/i.test(txt);
+        const btnLogin = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+            .filter(visible)
+            .some(el => /^(inicia(?:r)?\s*sesi[oó]n|log\s*in|sign\s*in|login)$/i.test(
+                (el.innerText || el.textContent || el.value || '').trim()
+            ));
+        if (pwdEl.length && (marcaPwd || btnLogin)) return true;
+        // El input a veces no es type=password; el texto + CTA bastan.
+        return Boolean(marcaPwd && btnLogin);
+    }"""
+    for fr in frames:
+        try:
+            if fr.evaluate(js):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _invite_pwd_selectors() -> list:
@@ -1445,6 +1605,10 @@ def _invite_localizar_password_login(page):
                 except Exception:
                     continue
                 return el
+    _invite_info_password_viva(page)
+    loc = encontrar_locator_en_frames(page, ['input[data-tidal-invite-pwd="1"]'])
+    if loc:
+        return loc
     return None
 
 
@@ -1609,6 +1773,14 @@ def _invite_es_formulario_registro(page) -> bool:
         }"""))
     except Exception:
         return False
+
+
+def _registro_error_es_bloqueo(exc: BaseException) -> bool:
+    """Captcha/DataDome no es un alta completada. No se puede 'confirmar' después."""
+    d = str(exc or "").lower()
+    return any(x in d for x in (
+        "captcha", "bloqueo", "datadome", "antibot", "anti-bot", "antirobot",
+    ))
 
 
 def _tidal_es_login_cuenta_existente(page) -> bool:
@@ -2160,11 +2332,13 @@ def _invite_detectar_exito(page) -> bool:
 
 
 def _invite_queda_boton_aceptar(page) -> bool:
-    """True si aún hay CTA de aceptación visible (rápido, sin waits largos)."""
+    """True si aún hay CTA de aceptación o el modal Individual→Family."""
+    if _invite_login_oauth_bloqueado(page):
+        return False
     try:
         return bool(page.evaluate("""() => {
-            const re = /aceptar invitaci[oó]n|accept invitation|join family|join the family|unirse a la familia|unirse al plan/i;
-            const skip = /cookie|preferenc|onetrust/i;
+            const re = /aceptar invitaci[oó]n|accept invitation|únete al plan family|unete al plan family|únete al plan familiar|unete al plan familiar|join (the )?family plan|join family|join the family|unirse a la familia|unirse al plan/i;
+            const skip = /cookie|preferenc|onetrust|mantener tidal|keep tidal|keep individual|mantener el plan/i;
             for (const el of document.querySelectorAll('button, a, [role="button"]')) {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (!t || t.length > 80 || skip.test(t) || !re.test(t)) continue;
@@ -2179,10 +2353,80 @@ def _invite_queda_boton_aceptar(page) -> bool:
         return False
 
 
-def _invite_pulsar_aceptar(page) -> bool:
-    """Pulsa el CTA real de aceptación (nunca el 'Aceptar' de cookies)."""
-    _invite_limpiar_cookies_agresivo(page)
+def _invite_pulsar_unete_plan_family(page) -> bool:
+    """Modal cuando ya hay plan Individual: pulsa Únete al plan Family, nunca Mantener Tidal."""
+    if _invite_login_oauth_bloqueado(page):
+        return False
+    try:
+        clicked = page.evaluate("""() => {
+            const skip = /mantener tidal|keep tidal|keep individual|mantener el plan|cookie|onetrust/i;
+            const re = /únete al plan family|unete al plan family|únete al plan familiar|unete al plan familiar|join (the )?family plan|switch to family/i;
+            const visible = (el) => {
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden'
+                    || parseFloat(st.opacity || '1') < 0.1) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 2 && r.height > 2;
+            };
+            const cand = Array.from(document.querySelectorAll(
+                'button, a, [role="button"], [role="dialog"] button'
+            ));
+            for (const el of cand) {
+                const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!t || t.length > 90 || skip.test(t) || !re.test(t)) continue;
+                if (!visible(el)) continue;
+                el.click();
+                return t;
+            }
+            return '';
+        }""")
+        if clicked:
+            print(f"    [Invitación] Pulsado CTA de plan activo: {clicked}")
+            return True
+    except Exception:
+        pass
     selectores = [
+        "button:has-text('Únete al plan Family')",
+        "button:has-text('Unete al plan Family')",
+        "button:has-text('Únete al plan Familiar')",
+        "button:has-text('Join Family plan')",
+        "button:has-text('Join the Family plan')",
+        "[role='dialog'] button:has-text('Family')",
+    ]
+    btn = encontrar_locator_en_frames(page, selectores)
+    if not btn:
+        return False
+    try:
+        txt = (btn.inner_text(timeout=400) or "").strip()
+    except Exception:
+        txt = ""
+    if re.search(r"mantener|keep tidal|keep individual", txt, re.I):
+        return False
+    try:
+        btn.click(timeout=2500, force=True)
+        print(f"    [Invitación] Pulsado CTA de plan activo: {txt or 'Únete al plan Family'}")
+        return True
+    except Exception:
+        try:
+            btn.evaluate("b => b.click()")
+            print(f"    [Invitación] Pulsado CTA de plan activo: {txt or 'Únete al plan Family'}")
+            return True
+        except Exception:
+            return False
+
+
+def _invite_pulsar_aceptar(page) -> bool:
+    """Pulsa el CTA real de aceptación (nunca el 'Aceptar' de cookies ni Mantener Tidal)."""
+    if _invite_login_oauth_bloqueado(page):
+        return False
+    _invite_limpiar_cookies_agresivo(page)
+    # Si ya hay plan Individual, Tidal abre un modal encima de Aceptar invitación.
+    if _invite_pulsar_unete_plan_family(page):
+        time.sleep(0.35)
+        return True
+    selectores = [
+        "button:has-text('Únete al plan Family')",
+        "button:has-text('Join Family plan')",
         "button:has-text('Aceptar invitación')",
         "button:has-text('Accept invitation')",
         "button:has-text('Join family')",
@@ -2205,6 +2449,12 @@ def _invite_pulsar_aceptar(page) -> bool:
                 btn = None
         except Exception:
             pass
+        try:
+            txt_btn = (btn.inner_text(timeout=300) or "") if btn else ""
+        except Exception:
+            txt_btn = ""
+        if btn and re.search(r"mantener|keep tidal|keep individual", txt_btn, re.I):
+            btn = None
     if btn:
         try:
             btn.click(timeout=3000, force=True)
@@ -2215,25 +2465,32 @@ def _invite_pulsar_aceptar(page) -> bool:
                 return True
             except Exception:
                 pass
-    # Fallback JS: buscar botón/enlace con texto de invitación (evita cookies)
+    # Fallback JS: buscar botón/enlace con texto de invitación (evita cookies y Mantener Tidal)
     try:
         clicked = page.evaluate("""() => {
+            const reModal = /únete al plan family|unete al plan family|únete al plan familiar|join (the )?family plan/i;
             const re = /aceptar invitaci[oó]n|accept invitation|join family|join the family|unirse a la familia|unirse al plan/i;
-            const skip = /cookie|preferenc|configur|settings|manage|onetrust/i;
+            const skip = /cookie|preferenc|configur|settings|manage|onetrust|mantener tidal|keep tidal|keep individual|mantener el plan/i;
             const cand = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-            for (const el of cand) {
-                const t = (el.innerText || el.textContent || '').trim();
-                if (!t || t.length > 80) continue;
-                if (skip.test(t)) continue;
-                if (!re.test(t)) continue;
+            const visible = (el) => {
                 const st = window.getComputedStyle(el);
-                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
                 const r = el.getBoundingClientRect();
-                if (r.width < 2 || r.height < 2) continue;
-                el.click();
-                return true;
-            }
-            return false;
+                return r.width >= 2 && r.height >= 2;
+            };
+            const tryClick = (reHit) => {
+                for (const el of cand) {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (!t || t.length > 80) continue;
+                    if (skip.test(t)) continue;
+                    if (!reHit.test(t)) continue;
+                    if (!visible(el)) continue;
+                    el.click();
+                    return true;
+                }
+                return false;
+            };
+            return tryClick(reModal) || tryClick(re);
         }""")
         return bool(clicked)
     except Exception:
@@ -2481,6 +2738,40 @@ def _invite_pulsar_inicia_sesion(page) -> bool:
         }""")
         if clicked:
             print(f"    [Invitación] Pulsado CTA de login: {clicked}")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _invite_forzar_pulsar_inicia_sesion(page) -> bool:
+    """Habilita y pulsa Inicia Sesión si Vue lo dejó gris con la clave ya en el campo."""
+    try:
+        clicked = page.evaluate("""() => {
+            const re = /^(inicia(?:r)?\\s*sesi[oó]n|log\\s*in|sign\\s*in|login)$/i;
+            const visible = (el) => {
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden'
+                    || parseFloat(st.opacity || '1') < 0.05) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 2 && r.height > 2;
+            };
+            const hit = Array.from(document.querySelectorAll(
+                'button, [role="button"], input[type="submit"]'
+            )).find(el => visible(el) && re.test(
+                (el.innerText || el.textContent || el.value || '').trim()
+            ));
+            if (!hit) return false;
+            hit.removeAttribute('disabled');
+            hit.removeAttribute('aria-disabled');
+            hit.disabled = false;
+            try { hit.click(); } catch (e) {
+                hit.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+            }
+            return true;
+        }""")
+        if clicked:
+            print("    [Invitación] Pulsado CTA de login: Inicia Sesión (forzado)")
             return True
     except Exception:
         pass
@@ -2802,11 +3093,11 @@ def _invite_arrancar_prefetch_otp(estado: dict, correo: str, *, es_alta: bool) -
     return
 
 
-def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 45.0) -> str | None:
-    """Sondea el worker de forma ultra-rápida (cada ~80 ms) con resolución cruzada register/login.
+def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wait_s: float = 22.0) -> str | None:
+    """Sondea el Email Worker cada ~80 ms (register/login). Sin IMAP en @cheapmusic.best.
 
-    Siempre filtra por alias exacto y por otp_despues (clic Suscríbete de ESTA ventana)
-    para no tomar el código de otra cuenta de la misma oleada.
+    FORWARD_KINDS ya no reenvía OTP a Gmail: IMAP del forward no puede recuperar el código
+    y un SEARCH de miles de UIDs bloqueaba este bucle varios minutos.
     """
     primary_kind = "register" if es_alta else "login"
     alt_kind = "login" if es_alta else "register"
@@ -2821,22 +3112,19 @@ def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wa
         despues = time.time() - 8.0
     t0 = time.time()
     ultimo_hb = 0.0
-    ultimo_imap = 0.0
     try:
         from otp_worker_client import reclamar_desde_worker
     except Exception:
         reclamar_desde_worker = None
 
-    after_id = estado.get("baseline_id") or 0
-
-    while time.time() - t0 < max_wait_s:
+    tope = max(4.0, float(max_wait_s or 22.0))
+    while time.time() - t0 < tope:
         ev = estado.get("cancel_event")
         try:
             if ev is not None and ev.is_set():
                 return None
         except Exception:
             pass
-        # 1. Probar con worker kind principal (after_email_id=0: no filtrar OTP fresco)
         if reclamar_desde_worker:
             claimed = reclamar_desde_worker(
                 correo, primary_kind,
@@ -2846,7 +3134,6 @@ def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wa
                 consume=True,
                 despues_de=despues,
             )
-            # 2. Si no hay, probar inmediatamente con kind alternativo
             if not claimed:
                 claimed = reclamar_desde_worker(
                     correo, alt_kind,
@@ -2857,67 +3144,22 @@ def _invite_tomar_otp_worker(estado: dict, correo: str, *, es_alta: bool, max_wa
                     despues_de=despues,
                 )
             if claimed:
-                print(f"    {Color.GREEN}[WORKER] [{correo}] Código de {primary_kind} obtenido: {claimed} ({time.time() - t0:.1f}s){Color.ENDC}", flush=True)
+                print(
+                    f"    {Color.GREEN}[WORKER] [{correo}] Código de {primary_kind} obtenido: "
+                    f"{claimed} ({time.time() - t0:.1f}s){Color.ENDC}",
+                    flush=True,
+                )
                 return str(claimed)
 
         elapsed = time.time() - t0
-        # 3. Tras 2.5s también IMAP (forward Gmail) por si KV aún propaga
-        if elapsed >= 2.5 and (elapsed - ultimo_imap) >= 1.2:
-            ultimo_imap = elapsed
-            try:
-                if es_alta:
-                    codigo_imap = reclamar_otp_registro_para_alias(
-                        correo,
-                        after_email_id=after_id,
-                        max_age_minutes=25,
-                        silencioso=True,
-                        omitir_worker=True,
-                    )
-                else:
-                    codigo_imap = reclamar_otp_login_para_alias(
-                        correo,
-                        after_email_id=after_id,
-                        max_age_minutes=20,
-                        silencioso=True,
-                        omitir_worker=True,
-                    )
-                if codigo_imap:
-                    print(f"    {Color.GREEN}[IMAP/Gmail] [{correo}] Código de {primary_kind} obtenido: {codigo_imap} ({elapsed:.1f}s){Color.ENDC}", flush=True)
-                    return str(codigo_imap)
-            except Exception:
-                pass
-
-        if elapsed >= 1.5 and elapsed - ultimo_hb >= 2.0:
-            print(f"    [WORKER] [{correo}] Esperando código {primary_kind}... ({elapsed:.0f}s/{max_wait_s:.0f}s)",
-                  flush=True)
+        if elapsed >= 1.2 and elapsed - ultimo_hb >= 2.0:
+            print(
+                f"    [WORKER] [{correo}] Esperando código {primary_kind}... "
+                f"({elapsed:.0f}s/{tope:.0f}s)",
+                flush=True,
+            )
             ultimo_hb = elapsed
         time.sleep(0.08)
-
-    print(f"    [Invitación] [{correo}] Sondeo final de fallback IMAP en Gmail...")
-    for intento in range(1, 6):
-        try:
-            if es_alta:
-                codigo = reclamar_otp_registro_para_alias(
-                    correo,
-                    after_email_id=after_id,
-                    max_age_minutes=25,
-                    silencioso=(intento > 1),
-                    omitir_worker=True,
-                )
-            else:
-                codigo = reclamar_otp_login_para_alias(
-                    correo,
-                    after_email_id=after_id,
-                    max_age_minutes=20,
-                    silencioso=(intento > 1),
-                    omitir_worker=True,
-                )
-            if codigo:
-                print(f"    {Color.GREEN}[IMAP] [{correo}] Código {primary_kind} vía Gmail en intento {intento}{Color.ENDC}", flush=True)
-                return str(codigo)
-        except Exception:
-            pass
-        time.sleep(1.0)
     return None
 
 
@@ -3083,6 +3325,45 @@ def _invite_detectar_pwd_incorrecta(page) -> bool:
     return False
 
 
+def pagina_muestra_pwd_incorrecta(page) -> bool:
+    """True si Tidal muestra aviso de usuario/contraseña incorrectos (cualquier frame)."""
+    if page is None:
+        return False
+    try:
+        if _invite_detectar_pwd_incorrecta(page):
+            return True
+    except Exception:
+        pass
+    try:
+        frames = list(getattr(page, "frames", None) or []) or [page]
+    except Exception:
+        frames = [page]
+    frases = (
+        r"est[aá]\s+incorrecto\s+el\s+nombre\s+de\s+acceso",
+        r"contrase[ñn]a\s+incorrecta",
+        r"nombre\s+de\s+acceso\s+o\s+la\s+contrase",
+        r"incorrect\s+password",
+        r"invalid\s+password",
+        r"wrong\s+password",
+        r"password\s+is\s+incorrect",
+        r"username\s+or\s+password.{0,40}incorrect",
+        r"email\s+or\s+password.{0,40}incorrect",
+        r"no\s+son\s+correct",
+        r"no\s+es\s+correct",
+    )
+    for fr in frames:
+        try:
+            body = (
+                fr.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''")
+                or ""
+            )
+        except Exception:
+            continue
+        if any(re.search(p, body) for p in frases):
+            return True
+    return False
+
+
 def _invite_pwd_js_campo_vivo() -> str:
     """JS: localiza el input de contraseña visible (no OTP) y devuelve {val,x,y,w} o null."""
     return r"""() => {
@@ -3099,16 +3380,40 @@ def _invite_pwd_js_campo_vivo() -> str:
             const ac = (el.autocomplete || '').toLowerCase();
             return max === '1' || ac === 'one-time-code';
         };
-        const cands = Array.from(document.querySelectorAll(
-            'input[type="password"], input[name="password"], input[autocomplete="current-password"], input[placeholder*="contrase" i], input[placeholder*="password" i]'
-        )).filter(visible).filter(el => !esOtp(el));
+        const deepInputs = (root) => {
+            const out = [];
+            const walk = (node) => {
+                if (!node) return;
+                try { node.querySelectorAll('input').forEach(el => out.push(el)); } catch (e) {}
+                try {
+                    (node.querySelectorAll ? node.querySelectorAll('*') : []).forEach(el => {
+                        if (el && el.shadowRoot) walk(el.shadowRoot);
+                    });
+                } catch (e) {}
+            };
+            walk(root);
+            return out;
+        };
+        const score = (el) => {
+            const t = (el.type || 'text').toLowerCase();
+            const ac = (el.autocomplete || '').toLowerCase();
+            const ph = ((el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')
+                + ' ' + (el.name || '') + ' ' + (el.id || '')).toLowerCase();
+            if (t === 'password' || ac === 'current-password') return 0;
+            if (/contrase|password/.test(ph)) return 1;
+            if (['hidden','submit','button','checkbox','radio','email'].includes(t)) return 99;
+            if (ac === 'email' || ac === 'username') return 99;
+            if (t === 'text' || t === '' || t === 'tel') return 2;
+            return 99;
+        };
+        const txt = (document.body ? document.body.innerText : '').toLowerCase();
+        const pantallaPwd = /introduce tu contrase|enter your password|olvidaste tu contrase|forgot (your )?password|iniciar sesi[oó]n con c[oó]digo/i.test(txt);
+        const cands = deepInputs(document).filter(visible).filter(el => !esOtp(el) && score(el) < 90)
+            .filter(el => score(el) <= 1 || pantallaPwd);
+        cands.sort((a, b) => score(a) - score(b));
         if (!cands.length) return null;
-        cands.sort((a, b) => {
-            const ap = (a.autocomplete || '').toLowerCase() === 'current-password' ? 0 : 1;
-            const bp = (b.autocomplete || '').toLowerCase() === 'current-password' ? 0 : 1;
-            return ap - bp;
-        });
         const el = cands[0];
+        try { el.setAttribute('data-tidal-invite-pwd', '1'); } catch (e) {}
         const r = el.getBoundingClientRect();
         return {
             val: el.value || '',
@@ -3116,11 +3421,13 @@ def _invite_pwd_js_campo_vivo() -> str:
             y: r.y + r.height / 2,
             w: r.width,
             ac: el.autocomplete || '',
+            type: el.type || '',
         };
     }"""
 
 
-def _invite_leer_password_viva(page) -> str:
+def _invite_info_password_viva(page):
+    """Dict {val,x,y,w,...} del input de clave, o None."""
     js = _invite_pwd_js_campo_vivo()
     try:
         frames = list(page.frames or [])
@@ -3128,34 +3435,31 @@ def _invite_leer_password_viva(page) -> str:
         frames = []
     if not frames:
         frames = [page]
-    for fr in frames[:5]:
+    try:
+        main = page.main_frame
+        if main is not None:
+            frames = [main] + [f for f in frames if f != main]
+    except Exception:
+        pass
+    for fr in frames:
         try:
             info = fr.evaluate(js)
-            if isinstance(info, dict) and str(info.get("val") or ""):
-                return str(info.get("val") or "")
-            if isinstance(info, dict):
-                return str(info.get("val") or "")
+            if isinstance(info, dict) and float(info.get("w") or 0) >= 40:
+                return info
         except Exception:
             continue
+    return None
+
+
+def _invite_leer_password_viva(page) -> str:
+    info = _invite_info_password_viva(page)
+    if isinstance(info, dict):
+        return str(info.get("val") or "")
     return ""
 
 
 def _invite_hay_campo_password_vivo(page) -> bool:
-    js = _invite_pwd_js_campo_vivo()
-    try:
-        frames = list(page.frames or [])
-    except Exception:
-        frames = []
-    if not frames:
-        frames = [page]
-    for fr in frames[:5]:
-        try:
-            info = fr.evaluate(js)
-            if isinstance(info, dict) and float(info.get("w") or 0) >= 40:
-                return True
-        except Exception:
-            continue
-    return False
+    return _invite_info_password_viva(page) is not None
 
 
 def _invite_login_cta_habilitado(page) -> bool:
@@ -3411,6 +3715,33 @@ def _invite_teclear_password_en_locator(page, loc, valor: str) -> bool:
     return actual == valor
 
 
+def _invite_teclear_password_click_teclado(page, valor: str) -> bool:
+    """Clic por coordenadas + teclado si Playwright no engancha el locator."""
+    info = _invite_info_password_viva(page)
+    if not info:
+        return False
+    try:
+        page.mouse.click(float(info["x"]), float(info["y"]))
+    except Exception:
+        return False
+    time.sleep(0.08)
+    try:
+        page.keyboard.press("Control+a")
+        page.keyboard.press("Backspace")
+    except Exception:
+        pass
+    try:
+        page.keyboard.type(valor, delay=18)
+    except Exception:
+        try:
+            page.keyboard.insert_text(valor)
+        except Exception:
+            return False
+    time.sleep(0.15)
+    actual = _invite_leer_password_viva(page)
+    return actual == valor
+
+
 def _invite_escribir_password(page, valor: str, correo: str, estado: dict | None = None) -> bool:
     """Teclea la clave en el input de ESTA ventana y sincroniza el v-model de Vue."""
     fresco = buscar_contrasena_cuenta(correo)
@@ -3441,12 +3772,20 @@ def _invite_escribir_password(page, valor: str, correo: str, estado: dict | None
             except Exception:
                 pass
         if not loc:
+            if _invite_teclear_password_click_teclado(page, valor):
+                print(f"    [Invitación] [{correo}] Campo = archivo (clic+teclado): '{valor}'.",
+                      flush=True)
+                return True
             print(f"    {Color.WARNING}[Invitación] [{correo}] Sin campo contraseña "
                   f"(intento {intento}/4).{Color.ENDC}", flush=True)
             time.sleep(0.2)
             continue
 
         if not _invite_teclear_password_en_locator(page, loc, valor):
+            if _invite_teclear_password_click_teclado(page, valor):
+                print(f"    [Invitación] [{correo}] Campo = archivo (clic+teclado): '{valor}'.",
+                      flush=True)
+                return True
             print(f"    {Color.WARNING}[Invitación] [{correo}] No se pudo teclear "
                   f"(intento {intento}/4).{Color.ENDC}", flush=True)
             time.sleep(0.12)
@@ -3503,6 +3842,29 @@ def _invite_login_cuenta_archivo(page, correo: str, pwd_cuenta: str, estado: dic
     if _invite_detectar_exito(page):
         return "ok"
 
+    pwd_loc_ya = _invite_localizar_password_login(page)
+    en_pwd_ya = bool(
+        pwd_loc_ya
+        or _invite_hay_campo_password_vivo(page)
+        or _invite_es_pantalla_password_login(page)
+    )
+    if en_pwd_ya and estado.get("pwd_enviada"):
+        actual_ya = _invite_leer_password_viva(page)
+        try:
+            if pwd_loc_ya:
+                actual_ya = pwd_loc_ya.input_value() or actual_ya
+        except Exception:
+            pass
+        cta_ya = _invite_login_cta_habilitado(page)
+        if not _invite_continuar_esta_cargando(page) and (
+            actual_ya != pwd_cuenta or not cta_ya
+        ):
+            print(f"    [Invitación] [{correo}] 'Inicia Sesión' sigue gris o el campo "
+                  f"quedó vacío. Reescribiendo la clave...", flush=True)
+            _invite_reset_login_para_reintento(estado)
+        elif _invite_pwd_sigue_esperando_tidal(page, estado):
+            return _invite_esperar_respuesta_login(page, correo, estado)
+
     if estado.get("pwd_enviada") and _invite_pwd_sigue_esperando_tidal(page, estado):
         return _invite_esperar_respuesta_login(page, correo, estado)
 
@@ -3510,7 +3872,7 @@ def _invite_login_cuenta_archivo(page, correo: str, pwd_cuenta: str, estado: dic
         _invite_avisar_pwd_incorrecta(correo, estado)
         return "pwd_incorrecta"
 
-    if _invite_queda_boton_aceptar(page):
+    if (not en_pwd_ya) and _invite_queda_boton_aceptar(page):
         if _invite_pulsar_aceptar(page):
             print(f"    [Invitación] [{correo}] Pulsado botón de aceptación.")
             if _invite_esperar_ui(page, [lambda: _invite_detectar_exito(page)], max_s=4.0):
@@ -3595,15 +3957,11 @@ def _invite_login_cuenta_archivo(page, correo: str, pwd_cuenta: str, estado: dic
         _invite_esperar_ui(
             page,
             [
-                lambda: (
-                    (
-                        _invite_hay_campo_password_vivo(page)
-                        or bool(_invite_localizar_password_login(page))
-                    )
-                    and not _invite_hay_pantalla_codigo(page)
-                ),
+                lambda: _invite_es_pantalla_password_login(page),
+                lambda: _invite_hay_campo_password_vivo(page),
+                lambda: bool(_invite_localizar_password_login(page)),
             ],
-            max_s=6.0,
+            max_s=3.0,
         )
         pwd_loc = _invite_localizar_password_login(page)
         en_pwd = bool(
@@ -3616,7 +3974,11 @@ def _invite_login_cuenta_archivo(page, correo: str, pwd_cuenta: str, estado: dic
         if estado.get("pwd_enviada"):
             return _invite_esperar_respuesta_login(page, correo, estado)
 
-        if _invite_hay_pantalla_codigo(page) and not _invite_hay_campo_password_vivo(page):
+        if (
+            _invite_hay_pantalla_codigo(page)
+            and not _invite_hay_campo_password_vivo(page)
+            and not _invite_es_pantalla_password_login(page)
+        ):
             return "progreso"
 
         print(f"    [Invitación] [{correo}] Escribiendo clave de sesiones_imap_cuentas.txt...")
@@ -3635,32 +3997,42 @@ def _invite_login_cuenta_archivo(page, correo: str, pwd_cuenta: str, estado: dic
         except Exception:
             actual_env = ""
         if actual_env != pwd_cuenta:
+            actual_env = _invite_leer_password_viva(page)
+        if actual_env != pwd_cuenta:
             print(f"    {Color.WARNING}[Invitación] [{correo}] Antes de enviar el campo ya no "
                   f"tiene la clave ('{actual_env}'). Se reescribe.{Color.ENDC}", flush=True)
             return "progreso"
+
+        _invite_esperar_ui(page, [lambda: _invite_login_cta_habilitado(page)], max_s=2.5)
         enviado = False
-        btn = _invite_localizar_boton_inicia_sesion(page)
-        try:
-            if btn:
-                btn.click(timeout=2500)
-                enviado = True
-                print("    [Invitación] Pulsado CTA de login: Inicia Sesión")
-        except Exception:
-            enviado = False
-        if not enviado:
+        if _invite_login_cta_habilitado(page):
+            btn = _invite_localizar_boton_inicia_sesion(page)
             try:
-                page.get_by_role(
-                    "button",
-                    name=re.compile(r"^inicia(?:r)?\s*sesi[oó]n$", re.I),
-                ).first.click(timeout=2500)
-                enviado = True
-                print("    [Invitación] Pulsado CTA de login: Inicia Sesión")
+                if btn:
+                    btn.click(timeout=2500)
+                    enviado = True
+                    print("    [Invitación] Pulsado CTA de login: Inicia Sesión")
             except Exception:
-                pass
+                enviado = False
+            if not enviado:
+                enviado = _invite_pulsar_inicia_sesion(page)
+        if not enviado and _invite_login_cta_habilitado(page):
+            try:
+                if loc_env:
+                    loc_env.press("Enter")
+                else:
+                    page.keyboard.press("Enter")
+                enviado = True
+                print("    [Invitación] Inicia Sesión habilitado; se envía con Enter.")
+            except Exception:
+                enviado = False
         if not enviado:
-            if not _invite_pulsar_inicia_sesion(page):
-                print(f"    {Color.WARNING}[Invitación] [{correo}] No se pudo pulsar Inicia Sesión.{Color.ENDC}")
-                return "progreso"
+            enviado = _invite_forzar_pulsar_inicia_sesion(page)
+        if not enviado:
+            print(f"    {Color.WARNING}[Invitación] [{correo}] Inicia Sesión sigue gris; "
+                  f"no se marca el login como enviado.{Color.ENDC}")
+            _invite_reset_login_para_reintento(estado)
+            return "progreso"
 
         _invite_marcar_login_enviado(estado)
         return _invite_esperar_respuesta_login(page, correo, estado)
@@ -4403,7 +4775,7 @@ def abrir_enlace_familia_con_autocierre(
     - Links desde linksextraidos.txt: forzar_proxy_ng=True → siempre NG (una sola ventana).
     - cancel_event: si se setea (timeout de oleada), aborta y cierra Chrome.
     Devuelve True/'ok' si la invitación quedó aceptada, 'ya_usado',
-    'pwd_incorrecta' o False.
+    'pwd_incorrecta', 'captcha' (bloqueo de IP; el pipeline rota VPN) o False.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -4412,11 +4784,23 @@ def abrir_enlace_familia_con_autocierre(
         abrir_enlace_en_perfil_chrome(url, correo)
         return False
 
-    # Evitar ablink en Chrome+proxy NG (ERR_TUNNEL crónico). Resolver a accept directo.
+    # Preferir URL directa (accept-invite). El ablink del logo cae en tidal.com/?lid=.
     url_orig = (url or "").strip()
-    url = _resolver_ablink_a_invitacion(url_orig)
-    if url != url_orig and _es_url_invitacion_directa(url):
-        print(f"    {Color.CYAN}[Invitación] [{correo}] Usando URL directa (sin ablink).{Color.ENDC}")
+    url = preparar_enlace_invitacion_para_abrir(correo, url_orig)
+    if url != url_orig:
+        url_orig = url
+    if _url_es_resetpass(url) or _url_es_resetpass(url_orig):
+        print(
+            f"    {Color.FAIL}[Invitación] [{correo}] El enlace es resetpass "
+            f"({(url or url_orig)[:90]}). No se abre Chrome.{Color.ENDC}"
+        )
+        return False
+    if not enlace_invitacion_es_usable(url):
+        print(
+            f"    {Color.FAIL}[Invitación] [{correo}] El enlace no es de plan familiar "
+            f"({(url_orig or url)[:90]}). No se abre Chrome.{Color.ENDC}"
+        )
+        return False
 
     pwd_cuenta = buscar_contrasena_cuenta(correo)
     em_invite = _invite_email_en_url(url)
@@ -4511,7 +4895,7 @@ def abrir_enlace_familia_con_autocierre(
         page = None
         nav_inv_ok = False
         motivo_fallo = "desconocido"
-        _max_intentos_inv = 5
+        _max_intentos_inv = 3
 
         def _cerrar_contexto():
             """Cierre rápido en EL MISMO hilo (Playwright sync no admite close desde otro thread)."""
@@ -4608,6 +4992,27 @@ def abrir_enlace_familia_con_autocierre(
                 pass
             _liberar_proxy_actual()
             return "invite_ajeno"
+
+        def _salir_captcha():
+            """DataDome/captcha en IP real: no reiniciar Chrome sobre la misma IP."""
+            print(f"    {Color.WARNING}[Invitación] [{correo}] Bloqueo de IP / DataDome. "
+                  f"Cerrando Chrome; el pipeline cambia de país (la IP no se descarta).{Color.ENDC}")
+            _cerrar_contexto()
+            try:
+                prof = profile_dir
+
+                def _rm_async_cap(p_dir):
+                    time.sleep(0.4)
+                    try:
+                        shutil.rmtree(p_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_rm_async_cap, args=(Path(prof),), daemon=True).start()
+            except Exception:
+                pass
+            _liberar_proxy_actual()
+            return "captcha"
 
         def _rotar_proxy_y_perfil(razon: str) -> bool:
             """Rota al pool del país actual y descarta el perfil. False si no hay IP."""
@@ -4721,24 +5126,8 @@ def abrir_enlace_familia_con_autocierre(
                     context = abrir_contexto(current_proxy, profile_dir, proxy_tipo)
                     page = context.pages[0] if context.pages else context.new_page()
 
-                    print(f"    [Invitación] [{correo}] Calentando reputación "
-                          f"(proxy {proxy_tipo}, intento reopen {intento}/{max_intentos})...")
-                    navegar_tidal_tolerante(page, "https://tidal.com/pricing", timeout_ms=45000)
-                    time.sleep(random.uniform(1.2, 2.2))
-                    aceptar_cookies_con_espera(page)
-                    _invite_limpiar_cookies_agresivo(page)
-                    time.sleep(0.4)
-
-                    try:
-                        navegar_tidal_tolerante(
-                            page, "https://account.tidal.com/",
-                            referer="https://tidal.com/pricing",
-                            timeout_ms=35000,
-                        )
-                        time.sleep(0.6)
-                    except Exception:
-                        pass
-
+                    print(f"    [Invitación] [{correo}] Reabriendo enlace "
+                          f"(intento reopen {intento}/{max_intentos}, sin /pricing)...")
                     destino = url
                     # Si sigue siendo ablink, intentar resolver otra vez antes del goto
                     if "ablink." in (destino or "").lower():
@@ -4753,7 +5142,6 @@ def abrir_enlace_familia_con_autocierre(
                     try:
                         navegar_tidal_tolerante(
                             page, destino,
-                            referer="https://tidal.com/pricing",
                             timeout_ms=60000,
                         )
                     except Exception as e_goto:
@@ -4773,7 +5161,6 @@ def abrir_enlace_familia_con_autocierre(
                                 url = destino3
                                 navegar_tidal_tolerante(
                                     page, destino3,
-                                    referer="https://tidal.com/pricing",
                                     timeout_ms=60000,
                                 )
                             else:
@@ -4833,53 +5220,15 @@ def abrir_enlace_familia_con_autocierre(
                         _invite_instalar_parche_login(page, correo, pwd_cuenta, None)
 
                 try:
-                    if pwd_cuenta:
-                        print(f"    [Invitación] [{correo}] Abriendo invitación "
-                              f"(intento {intento_inv}/{_max_intentos_inv})...")
-                        try:
-                            navegar_tidal_tolerante(
-                                page, "https://tidal.com/pricing", timeout_ms=25000
-                            )
-                            time.sleep(0.3)
-                            aceptar_cookies_con_espera(page)
-                        except Exception:
-                            pass
-                    else:
-                        print(f"    [Invitación] [{correo}] Calentando reputación en tidal.com/pricing "
-                              f"(intento {intento_inv}/{_max_intentos_inv}, proxy {proxy_tipo})...")
-                        navegar_tidal_tolerante(page, "https://tidal.com/pricing", timeout_ms=45000)
-                        time.sleep(random.uniform(1.2, 2.2))
-                        aceptar_cookies_con_espera(page)
-                        _invite_limpiar_cookies_agresivo(page)
-                        time.sleep(random.uniform(0.35, 0.7))
-
-                        # Calentar account antes del ablink (reduce ERR_TUNNEL en tracking links)
-                        try:
-                            navegar_tidal_tolerante(
-                                page, "https://account.tidal.com/",
-                                referer="https://tidal.com/pricing",
-                                timeout_ms=35000,
-                            )
-                            time.sleep(0.5)
-                        except Exception:
-                            pass
-
-                    # Re-resolver por si el enlace IMAP quedó en ablink
-                    if "ablink." in (url or "").lower():
-                        resuelto0 = _resolver_ablink_a_invitacion(url)
-                        if _es_url_invitacion_directa(resuelto0):
-                            url = resuelto0
+                    print(f"    [Invitación] [{correo}] Abriendo invitación "
+                          f"(intento {intento_inv}/{_max_intentos_inv}) en perfil limpio...")
+                    # No ir a /pricing antes: Tidal convierte el ablink en https://tidal.com/?lid=...
 
                     destino_inv = url
                     print(f"    [Invitación] [{correo}] Cargando enlace "
-                          f"{'(directo) ' if _es_url_invitacion_directa(destino_inv) else '(tracking) '}"
-                          f"con referer orgánico...")
+                          f"{'(directo) ' if _es_url_invitacion_directa(destino_inv) else '(tracking) '}...")
                     try:
-                        navegar_tidal_tolerante(
-                            page, destino_inv,
-                            referer="https://tidal.com/pricing",
-                            timeout_ms=60000,
-                        )
+                        navegar_tidal_tolerante(page, destino_inv, timeout_ms=60000)
                     except Exception as e_goto:
                         try:
                             u_now = (page.url or "").lower()
@@ -4896,35 +5245,63 @@ def abrir_enlace_familia_con_autocierre(
                                 url = destino_alt
                                 navegar_tidal_tolerante(
                                     page, destino_alt,
-                                    referer="https://tidal.com/pricing",
                                     timeout_ms=60000,
                                 )
                             else:
-                                raise
+                                # El ablink a veces cae un segundo en tidal.com/?lid= y luego redirige.
+                                pass
                         else:
                             raise
-                    time.sleep(0.4 if pwd_cuenta else 2.0)
-                    _invite_limpiar_cookies_agresivo(page)
+                    try:
+                        u_mid = (page.url or "").lower()
+                    except Exception:
+                        u_mid = ""
+                    if not url_es_flujo_invitacion_familiar(u_mid):
+                        if _url_es_resetpass(u_mid):
+                            raise RuntimeError(
+                                f"El enlace era resetpass, no invitación familiar: "
+                                f"{(u_mid or '?')[:90]}"
+                            )
+                        print(f"    [Invitación] [{correo}] Esperando redirección a accept/family "
+                              f"(ahora: {(u_mid or '?')[:70]})...")
+                        deadline_redir = time.time() + 12.0
+                        while time.time() < deadline_redir:
+                            try:
+                                u_mid = (page.url or "").lower()
+                            except Exception:
+                                u_mid = ""
+                            if _url_es_resetpass(u_mid):
+                                raise RuntimeError(
+                                    f"El enlace era resetpass, no invitación familiar: "
+                                    f"{(u_mid or '?')[:90]}"
+                                )
+                            if url_es_flujo_invitacion_familiar(u_mid):
+                                print(f"    [Invitación] [{correo}] Redirigió a {u_mid[:80]}")
+                                break
+                            time.sleep(0.45)
+                    time.sleep(0.4 if pwd_cuenta else 1.0)
                     try:
                         url_post = (page.url or "").lower()
                     except Exception:
                         url_post = ""
+                    if url_es_flujo_invitacion_familiar(url_post):
+                        _invite_limpiar_cookies_agresivo(page)
                     if "chrome-error" in url_post or "chromewebdata" in url_post:
-                        # Último recurso: resolver ablink fuera de Chrome y reintentar directo
                         alt = _resolver_ablink_a_invitacion(url_orig if "ablink." in (url_orig or "").lower() else url)
                         if _es_url_invitacion_directa(alt):
                             url = alt
-                            navegar_tidal_tolerante(
-                                page, alt,
-                                referer="https://tidal.com/pricing",
-                                timeout_ms=60000,
-                            )
+                            navegar_tidal_tolerante(page, alt, timeout_ms=60000)
                             time.sleep(1.0)
                             try:
                                 url_post = (page.url or "").lower()
                             except Exception:
                                 url_post = ""
                     if url_es_pagina_marketing(url_post) or not url_es_flujo_invitacion_familiar(url_post):
+                        if _url_es_resetpass(url_post):
+                            raise RuntimeError(
+                                f"El enlace era resetpass, no invitación familiar: "
+                                f"{(url_post or '?')[:90]}"
+                            )
                         raise RuntimeError(
                             f"Tras abrir el enlace de invitación la pestaña sigue en "
                             f"{(url_post or '?')[:90]} (se esperaba login/accept/family, no pricing)."
@@ -4932,13 +5309,34 @@ def abrir_enlace_familia_con_autocierre(
                 except Exception as e_inv:
                     print(f"    [Invitación] [WARN] Intento {intento_inv}/{_max_intentos_inv} de carga "
                           f"falló para {correo}: {e_inv}")
+                    msg_inv = str(e_inv).lower()
+                    if "resetpass" in msg_inv or "reset-password" in msg_inv:
+                        motivo_fallo = "enlace_resetpass"
+                        print(f"    {Color.FAIL}[Invitación] [{correo}] El enlace era resetpass "
+                              f"(restablecer contraseña), no invitación familiar. Se omite.{Color.ENDC}")
+                        break
+                    quedo_en_lid = "lid=" in msg_inv or "tidal.com/?" in msg_inv or "sigue en" in msg_inv
+                    if quedo_en_lid:
+                        motivo_fallo = "enlace_tracking"
+                        if intento_inv >= _max_intentos_inv:
+                            break
+                        prep2 = preparar_enlace_invitacion_para_abrir(correo, url_orig or url)
+                        if prep2 and prep2 != url:
+                            url = prep2
+                            url_orig = prep2
+                            print(f"    [Invitación] [{correo}] Reintento con URL directa/CTA "
+                                  f"{'(directo) ' if _es_url_invitacion_directa(url) else ''}...")
+                        elif not prep2:
+                            print(f"    [Invitación] [{correo}] Sin CTA usable tras ?lid=; se omite.")
+                            break
+                        _cerrar_contexto()
+                        time.sleep(0.8)
+                        continue
                     motivo_fallo = "proxy/red"
                     if intento_inv >= _max_intentos_inv:
                         break
-                    msg_inv = str(e_inv).lower()
-                    quedo_en_pricing = "pricing" in msg_inv or "sigue en" in msg_inv
-                    if es_error_proxy_o_red(e_inv) or "timeout" in msg_inv or quedo_en_pricing:
-                        if not _rotar_proxy_y_perfil("Fallo de túnel/proxy o redirección a pricing al abrir la invitación"):
+                    if es_error_proxy_o_red(e_inv) or "timeout" in msg_inv:
+                        if not _rotar_proxy_y_perfil("Fallo de túnel/proxy al abrir la invitación"):
                             break
                     elif es_error_navegacion_abortada(e_inv):
                         time.sleep(2.0)
@@ -4963,13 +5361,21 @@ def abrir_enlace_familia_con_autocierre(
                     break
 
                 motivo_fallo = "antirobot"
+                if MODO_SIN_PROXY:
+                    break
                 if intento_inv >= _max_intentos_inv:
                     break
                 if not _rotar_proxy_y_perfil("Antirobot detectado"):
                     break
 
             if not nav_inv_ok:
-                if motivo_fallo == "proxy/red":
+                if motivo_fallo == "enlace_resetpass":
+                    print(f"    {Color.FAIL}[Invitación] [{correo}] El enlace era de restablecer "
+                          f"contraseña (resetpass), no de plan familiar. Se omite.{Color.ENDC}")
+                elif motivo_fallo == "enlace_tracking":
+                    print(f"    {Color.FAIL}[Invitación] [{correo}] El enlace abrió la home de campaña "
+                          f"(?lid=) en vez de accept/family. Se omite.{Color.ENDC}")
+                elif motivo_fallo == "proxy/red":
                     print(f"    {Color.FAIL}[Invitación] [{correo}] No se pudo abrir el enlace por fallo "
                           f"de proxy/red tras {_max_intentos_inv} intentos. Se omite esta invitación.{Color.ENDC}")
                 else:
@@ -4977,6 +5383,10 @@ def abrir_enlace_familia_con_autocierre(
                           f"antirobot. Se omite esta invitación.{Color.ENDC}")
                 _cerrar_contexto()
                 _liberar_proxy_actual()
+                if MODO_SIN_PROXY and motivo_fallo == "antirobot":
+                    return "captcha"
+                if motivo_fallo == "enlace_resetpass":
+                    return "enlace_resetpass"
                 return False
 
             aceptar_cookies_con_espera(page)
@@ -5041,8 +5451,8 @@ def abrir_enlace_familia_con_autocierre(
             t_verif_dispositivo = 0.0
             recargas_stuck = 0
             print(f"    [Invitación] [{correo}] Completando aceptación automática "
-                  f"(login PE o alta NG, hasta 4 minutos)...")
-            t_limite = time.time() + 240.0
+                  f"(login PE o alta NG, hasta 2 min)...")
+            t_limite = time.time() + 120.0
             check_sec = 0
             while time.time() < t_limite:
                 check_sec += 1
@@ -5259,6 +5669,8 @@ def abrir_enlace_familia_con_autocierre(
                             hay_antibot = False
 
                         if hay_antibot:
+                            if MODO_SIN_PROXY:
+                                return _salir_captcha()
                             if rotaciones_antibot_loop >= max_rotaciones_antibot_loop:
                                 print(f"    {Color.FAIL}[Invitación] [{correo}] Antibot persistente tras "
                                       f"{max_rotaciones_antibot_loop} rotaciones. Se omite.{Color.ENDC}")
@@ -5661,18 +6073,81 @@ def guardar_enlaces_en_linksextraidos(
     return path
 
 
+def extraer_enlaces_invitacion_via_worker(
+    correos: list[str],
+    max_age_minutes: int | None = None,
+    max_wait_s: float = 8.0,
+) -> dict[str, str]:
+    """Opción 4: saca los CTA de invitación del Email Worker (sin IMAP)."""
+    from otp_worker_client import (
+        extraer_invites_worker,
+        worker_cubre_alias,
+        worker_habilitado,
+        worker_salud,
+    )
+
+    cubiertos = [c for c in (correos or []) if worker_cubre_alias(c)]
+    if not cubiertos:
+        print(f"    {Color.WARNING}[WORKER] Ningún correo @cheapmusic.best; "
+              f"el worker no aplica.{Color.ENDC}")
+        return {}
+    if not worker_habilitado():
+        print(f"    {Color.FAIL}[WORKER] Falta email_worker_url / email_worker_secret "
+              f"en passwords.txt.{Color.ENDC}")
+        return {}
+    ok_h, det_h = worker_salud()
+    if not ok_h:
+        print(f"    {Color.FAIL}[WORKER] No responde: {det_h}{Color.ENDC}")
+        return {}
+
+    max_age = int(max_age_minutes or MAX_AGE_INVITACION_FAMILIAR_MIN)
+    print(f"    {Color.CYAN}[WORKER]{Color.ENDC} Extrayendo {len(cubiertos)} invitación(es) "
+          f"en otp.cheapmusic.best (sin IMAP, ventana {max_age // 60} h)...")
+    t0 = time.time()
+    crudos = extraer_invites_worker(
+        cubiertos, max_age_minutes=max_age, max_wait_s=max_wait_s, silencioso=False,
+    )
+    mapa: dict[str, str] = {}
+    por_norm = {(k or "").strip().lower(): v for k, v in (crudos or {}).items() if v}
+    for c in correos or []:
+        hit = por_norm.get((c or "").strip().lower())
+        if hit:
+            mapa[c] = hit
+    dt = time.time() - t0
+    print(f"    {Color.GREEN}[WORKER]{Color.ENDC} {len(mapa)}/{len(cubiertos)} enlace(s) "
+          f"en {dt:.1f}s.")
+    gmail_nativo = [c for c in (correos or []) if usar_imap_gmail(c)]
+    if gmail_nativo:
+        print(f"    {Color.CYAN}[WORKER]{Color.ENDC} {len(gmail_nativo)} Gmail nativo "
+              f"siguen por IMAP.")
+    return mapa
+
+
 def pedir_fuente_enlaces_opcion4(correos: list[str]) -> tuple[dict[str, str] | None, str]:
-    """Pregunta fuente opcional de enlaces para la opción 4.
+    """Pregunta fuente de enlaces para la opción 4.
 
     Returns:
-      (enlaces_map, origen) — enlaces_map es None si hay que buscar por IMAP.
-      origen: 'imap' | 'pegar' | 'archivo'
+      (enlaces_map, origen)
+      origen: 'worker' | 'imap' | 'pegar' | 'archivo'
+      enlaces_map es None solo si hay que buscar por IMAP.
     """
+    n_worker = 0
+    try:
+        from otp_worker_client import worker_cubre_alias, worker_habilitado
+        if worker_habilitado():
+            n_worker = sum(1 for c in (correos or []) if worker_cubre_alias(c))
+    except Exception:
+        n_worker = 0
+
     print(f"\n{Color.CYAN}Fuente de enlaces de invitación:{Color.ENDC}")
-    print("  [Enter] Buscar por IMAP (como siempre)")
+    print("  [Enter] Email Worker Cloudflare (sin IMAP, segundos)")
+    print("  i       Buscar por IMAP (Gmail)")
     print("  p       Pegar enlaces manualmente ahora")
     print(f"  a       Usar {LINKS_EXTRAIDOS_PATH.name} (correos activos)")
-    elec = input(f"{Color.BOLD}Elige [Enter/p/a]:{Color.ENDC} ").strip().lower()
+    if n_worker:
+        print(f"  {Color.CYAN}{n_worker}/{len(correos or [])} cuenta(s) "
+              f"@cheapmusic.best irán por el worker.{Color.ENDC}")
+    elec = input(f"{Color.BOLD}Elige [Enter/i/p/a]:{Color.ENDC} ").strip().lower()
 
     if elec in ("a", "archivo", "f", "file"):
         mapa = leer_enlaces_desde_linksextraidos(correos)
@@ -5699,7 +6174,6 @@ def pedir_fuente_enlaces_opcion4(correos: list[str]) -> tuple[dict[str, str] | N
             if not (line or "").strip():
                 if buf:
                     break
-                # primera vacía: salir sin datos
                 break
             buf.append(line)
         mapa = parsear_pares_enlace_invitacion("\n".join(buf), correos_preferidos=correos)
@@ -5715,7 +6189,32 @@ def pedir_fuente_enlaces_opcion4(correos: list[str]) -> tuple[dict[str, str] | N
                       f"{LINKS_EXTRAIDOS_PATH.name}: {e}{Color.ENDC}")
         return mapa, "pegar"
 
-    return None, "imap"
+    if elec in ("i", "imap", "gmail"):
+        return None, "imap"
+
+    # Enter / w: Email Worker. Gmail nativo (si hay) se completa por IMAP después.
+    mapa = extraer_enlaces_invitacion_via_worker(correos)
+    gmail_rest: list[str] = []
+    try:
+        from otp_worker_client import usar_imap_gmail
+        hay = {(k or "").strip().lower() for k in (mapa or {})}
+        gmail_rest = [
+            c for c in (correos or [])
+            if (c or "").strip().lower() not in hay and usar_imap_gmail(c)
+        ]
+    except Exception:
+        gmail_rest = []
+    if gmail_rest:
+        print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Completando {len(gmail_rest)} "
+              f"Gmail nativo...")
+        extra = asignar_enlaces_invitacion_a_correos(gmail_rest)
+        for c, u in (extra or {}).items():
+            if u and c not in mapa:
+                mapa[c] = u
+    if mapa:
+        print(f"    {Color.GREEN}[Enlaces] {len(mapa)} enlace(s) listos "
+              f"(worker, sin IMAP en @cheapmusic.best).{Color.ENDC}")
+    return mapa or {}, "worker"
 
 
 def _imprimir_resumen_opcion4(
@@ -6252,29 +6751,83 @@ def abrir_enlace_restablecimiento_con_autocierre(
     return success_detected
 
 
+def _catch_all_sin_imap(alias: str) -> bool:
+    """True si @cheapmusic.best debe leer OTP/enlaces solo del Worker (sin Gmail)."""
+    try:
+        from otp_worker_client import worker_cubre_alias, usar_imap_gmail
+        return bool(worker_cubre_alias(alias) and not usar_imap_gmail(alias))
+    except Exception:
+        a = (alias or "").strip().lower()
+        return a.endswith("@cheapmusic.best") or a.endswith("@cheapmusic.beast")
+
+
 # Catch-all Cloudflare Email Routing: el alias @dominio llega a un Gmail real (IMAP).
 # Se puede ampliar/cambiar en passwords.txt:
 #   imap_forward_cheapmusic.best=otro@gmail.com
 _FORWARD_IMAP_DEFAULT = {
-    "cheapmusic.best": "cakeseller1234@gmail.com",
+    "cheapmusic.best": "getspooky2758@gmail.com",
 }
+
+# tidal nigeria/passwords.txt + Documentos/multiscript/passwords.txt (claves nuevas se suman).
+_PWD_PARES_CACHE: tuple[tuple[float, ...], tuple[str, ...], list[tuple[str, str]]] | None = None
+
+
+def _rutas_passwords_txt() -> list[Path]:
+    candidatos = [
+        SCRIPT_DIR / "passwords.txt",
+        SCRIPT_DIR.parent / "multiscript" / "passwords.txt",
+    ]
+    out: list[Path] = []
+    vistos: set[str] = set()
+    for p in candidatos:
+        try:
+            rp = p.resolve()
+        except Exception:
+            continue
+        if not rp.is_file():
+            continue
+        clave = str(rp).lower()
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        out.append(rp)
+    return out
 
 
 def _pares_passwords_txt() -> list[tuple[str, str]]:
-    pwd_file = SCRIPT_DIR / "passwords.txt"
-    if not pwd_file.exists():
-        return []
-    try:
-        lines = pwd_file.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return []
+    """Lee App Passwords IMAP de ambos passwords.txt. La primera clave gana."""
+    global _PWD_PARES_CACHE
+    rutas = _rutas_passwords_txt()
+    stamp_mt: list[float] = []
+    stamp_n: list[str] = []
+    for p in rutas:
+        try:
+            stamp_mt.append(p.stat().st_mtime)
+        except Exception:
+            stamp_mt.append(0.0)
+        stamp_n.append(str(p).lower())
+    stamp = (tuple(stamp_mt), tuple(stamp_n))
+    if _PWD_PARES_CACHE and _PWD_PARES_CACHE[0] == stamp[0] and _PWD_PARES_CACHE[1] == stamp[1]:
+        return _PWD_PARES_CACHE[2]
+
+    seen: set[str] = set()
     pares: list[tuple[str, str]] = []
-    for line in lines:
-        raw = (line or "").strip()
-        if not raw or raw.startswith("#") or "=" not in raw:
+    for path in rutas:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
             continue
-        key, val = raw.split("=", 1)
-        pares.append((key.strip().lower(), val.strip().strip('"').strip("'")))
+        for line in lines:
+            raw = (line or "").strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, val = raw.split("=", 1)
+            k = key.strip().lower()
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            pares.append((k, val.strip().strip('"').strip("'")))
+    _PWD_PARES_CACHE = (stamp[0], stamp[1], pares)
     return pares
 
 
@@ -6310,72 +6863,61 @@ def obtener_credenciales_imap_reales(gmail_user_solicitado: str) -> tuple[str | 
     """Busca en passwords.txt el usuario real de IMAP y su App Password.
 
     Alias de dominio catch-all (p. ej. titular-0003@cheapmusic.best) se resuelven
-    al Gmail de destino (cakeseller1234@gmail.com o imap_forward_<dominio>=).
+    al Gmail de destino (imap_forward_<dominio>= o _FORWARD_IMAP_DEFAULT).
+    Gmail nativo (p. ej. getmushroom.1.0.59@gmail.com) usa su propia App Password
+    (puntos ignorados, igual que Gmail).
     """
-    pwd_file = SCRIPT_DIR / "passwords.txt"
-    if not pwd_file.exists():
-        print(f"{Color.FAIL}[Error]{Color.ENDC} No se encuentra el archivo 'passwords.txt' en {pwd_file}.")
+    pares = _pares_passwords_txt()
+    if not pares:
+        rutas = _rutas_passwords_txt()
+        print(f"{Color.FAIL}[Error]{Color.ENDC} No se encuentra 'passwords.txt' "
+              f"(buscado en: {', '.join(str(p) for p in rutas) or (SCRIPT_DIR / 'passwords.txt')}).")
         return None, None
-        
-    try:
-        lines = pwd_file.read_text(encoding="utf-8").splitlines()
-    except Exception as e:
-        print(f"{Color.FAIL}[Error]{Color.ENDC} No se pudo leer 'passwords.txt': {e}")
-        return None, None
-    
+
     # 1. Limpiar el correo solicitado (invisibles Unicode + puntos del username de Gmail)
     gmail_user_solicitado = clean_email(gmail_user_solicitado)
     if gmail_user_solicitado:
         gmail_user_solicitado = destino_imap_de_alias(gmail_user_solicitado)
     if not gmail_user_solicitado or "@" not in gmail_user_solicitado:
         return None, None
-    if "@gmail.com" in gmail_user_solicitado:
+    if "@gmail.com" in gmail_user_solicitado or "@googlemail.com" in gmail_user_solicitado:
         username, domain = gmail_user_solicitado.split("@", 1)
         solicitado_no_dots = username.replace(".", "") + "@" + domain
     else:
         solicitado_no_dots = gmail_user_solicitado
 
     user_clean_key = solicitado_no_dots.replace("@", "_at_").replace(".", "_")
-    
-    # 2. Buscar si hay contraseña específica para el correo solicitado
-    for line in lines:
-        if "=" in line:
-            key, val = line.split("=", 1)
-            key_name = key.strip().lower()
-            if key_name.startswith("gmail_app_password_") or key_name.startswith("imap_password_"):
-                email_part = key_name[19:].strip() if key_name.startswith("gmail_app_password_") else key_name[14:].strip()
-                if "@" in email_part:
-                    usr, dom = email_part.split("@", 1)
-                    email_part_no_dots = usr.replace(".", "") + "@" + dom
-                    if email_part_no_dots == solicitado_no_dots:
-                        return email_part, val.strip().strip('"').strip("'")
-            
-            key_clean = key.strip().lower().replace("@", "_at_").replace(".", "_")
-            if (key_clean == f"gmail_app_password_{user_clean_key}" or 
-                key_clean == f"gmail_app_password_{solicitado_no_dots}" or
-                key_clean == f"imap_password_{user_clean_key}" or
-                key_clean == f"imap_password_{solicitado_no_dots}"):
-                return solicitado_no_dots, val.strip().strip('"').strip("'")
 
-    # 3. Fallback general: buscar gmail_app_password= o imap_password=
-    for line in lines:
-        if "=" in line:
-            key, val = line.split("=", 1)
-            key_stripped = key.strip().lower()
-            if key_stripped in ("gmail_app_password", "imap_password"):
-                if "cakeseller1234" in solicitado_no_dots:
-                    return "cakeseller1234@gmail.com", val.strip().strip('"').strip("'")
-                return solicitado_no_dots, val.strip().strip('"').strip("'")
-
-    # 4. Fallback a la primera cuenta específica
-    for line in lines:
-        if "=" in line and line.strip().lower().startswith("gmail_app_password_"):
-            key, val = line.split("=", 1)
-            key_name = key.strip().lower()
-            email_part = key_name[19:].strip()
+    # 2. App Password específica de ese buzón (gmail_app_password_correo=)
+    for key_name, val in pares:
+        if not val:
+            continue
+        prefix = ""
+        if key_name.startswith("gmail_app_password_"):
+            prefix = "gmail_app_password_"
+        elif key_name.startswith("imap_password_"):
+            prefix = "imap_password_"
+        if prefix:
+            email_part = key_name[len(prefix):].strip()
             if "@" in email_part:
-                return email_part, val.strip().strip('"').strip("'")
-                
+                usr, dom = email_part.split("@", 1)
+                email_part_no_dots = usr.replace(".", "") + "@" + dom
+                if email_part_no_dots == solicitado_no_dots:
+                    return email_part, val
+        key_clean = key_name.replace("@", "_at_").replace(".", "_")
+        if key_clean in (
+            f"gmail_app_password_{user_clean_key}",
+            f"gmail_app_password_{solicitado_no_dots}",
+            f"imap_password_{user_clean_key}",
+            f"imap_password_{solicitado_no_dots}",
+        ):
+            return solicitado_no_dots, val
+
+    # 3. Solo el catch-all cakeseller puede usar gmail_app_password= genérico.
+    if "cakeseller1234" in solicitado_no_dots:
+        for key_name, val in pares:
+            if key_name in ("gmail_app_password", "imap_password") and val:
+                return "cakeseller1234@gmail.com", val
     return None, None
 
 
@@ -6544,23 +7086,11 @@ def listar_buzones_imap_de_passwords() -> list[str]:
     Sirve para buscar un OTP de Tidal cuando llega a otro Gmail distinto del perfil.
     Cada entrada es el correo canónico de login IMAP (suele ser sin puntos).
     """
-    pwd_file = SCRIPT_DIR / "passwords.txt"
-    if not pwd_file.exists():
-        return []
-    try:
-        lines = pwd_file.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return []
-
     vistos: set[str] = set()
     out: list[str] = []
-    for line in lines:
-        if "=" not in line:
+    for key_name, val in _pares_passwords_txt():
+        if not val:
             continue
-        key, val = line.split("=", 1)
-        if not val.strip().strip('"').strip("'"):
-            continue
-        key_name = key.strip().lower()
         email_part = ""
         if key_name.startswith("gmail_app_password_"):
             email_part = key_name[len("gmail_app_password_"):].strip()
@@ -6573,7 +7103,6 @@ def listar_buzones_imap_de_passwords() -> list[str]:
         # Claves tipo getmushroom1052_at_gmail_com → getmushroom1052@gmail.com
         if "_at_" in email_part and "@" not in email_part:
             email_part = email_part.replace("_at_", "@").replace("_", ".")
-            # Evitar get.mushroom... si la clave era sin puntos: re-normalizar gmail
             if "@gmail." in email_part or "@googlemail." in email_part:
                 email_part = _norm_dots_gmail(email_part)
         email_part = email_part.strip().lower()
@@ -6774,7 +7303,7 @@ def _extraer_codigos_otp(texto: str, preferir_len: int | None = None) -> list[st
     # 1b) 5 dígitos cerca de palabras clave de código
     for m in re.finditer(
         r"(?:c[oó]digo|code|sign[-\s]?up\s*code|verification\s*code|one[-\s]?time|"
-        r"introduce|ingresa|enter|confirma)[^\d]{0,60}(\d{5})",
+        r"introduce|ingresa|enter|confirma)[^\d]{0,240}(\d{5})",
         texto,
         flags=re.I,
     ):
@@ -6847,6 +7376,8 @@ KEYWORDS_ELIMINACION_CUENTA = [
     "verify deletion", "verifica la eliminación", "verifica la eliminacion",
     "account deletion verification", "código de verificación", "codigo de verificacion",
     "verification code", "security code", "código de seguridad", "codigo de seguridad",
+    "verify tidal account deletion", "confirm you want to delete",
+    "confirm the deletion of your account", "tidal account deletion",
 ]
 
 # Asuntos/cuerpos que NO son el OTP de borrado de cuenta (opción 15).
@@ -6881,7 +7412,27 @@ KEYWORDS_RESTABLECER_PWD = [
     "reset your password",
     "link to reset your password",
     "login.tidal.com/resetpass/",
+    "login.tidal.com/resetpass?",
+    "resetpass?user=",
 ]
+
+
+def _texto_es_mail_reset_no_invite(texto: str) -> bool:
+    t = (texto or "").lower()
+    if not t:
+        return False
+    if not any(x in t for x in (
+        "resetpass", "reset-password", "restablecer tu contrase", "restablecer tu contrasena",
+        "resetting your tidal", "reset your password", "forgot your password",
+        "restaurar su contrase", "link to reset",
+    )):
+        return False
+    if any(x in t for x in (
+        "invites you to join", "te ha invitado", "join their tidal",
+        "invited to a tidal family", "accept-invite", "unirte a su plan",
+    )):
+        return False
+    return True
 
 
 def _texto_excluido_por_frases(texto: str, frases) -> bool:
@@ -6894,8 +7445,9 @@ def _texto_excluido_por_frases(texto: str, frases) -> bool:
 
 KEYWORDS_INVITACION_FAMILIAR = [
     "invites you to join", "welcome to the family", "family plan", "family subscription",
-    "plan familiar", "bienvenida a la familia", "unirte a su plan", "invited to a tidal family",
-    "join their tidal family", "has invited you", "te ha invitado",
+    "plan familiar", "bienvenida a la familia", "unirte a su plan", "unirte a un plan",
+    "invited to a tidal family", "join their tidal family", "has invited you", "te ha invitado",
+    "has recibido una invitaci", "invitaci", "plan tidal family",
 ]
 
 
@@ -6946,6 +7498,36 @@ def _extraer_cuerpo_y_html_msg(msg) -> tuple[str, str]:
     except Exception:
         pass
     return body_text or "", html_raw or ""
+
+
+def _url_es_resetpass(url: str) -> bool:
+    u = (url or "").lower().replace("&amp;", "&")
+    return "resetpass" in u or "reset-password" in u or "forgot-password" in u
+
+
+def enlace_invitacion_es_usable(url: str) -> bool:
+    """True si el enlace puede abrir el flujo familiar (CTA /ls/click o accept/family).
+
+    Rechaza el ablink del logo (upn corto → tidal.com/?lid=), resetpass y homes de campaña.
+    """
+    u = (url or "").strip()
+    if not u.lower().startswith("http"):
+        return False
+    ul = u.lower()
+    if _url_es_resetpass(ul):
+        return False
+    if _url_es_home_campana_lid(u):
+        return False
+    try:
+        from otp_worker_client import enlace_invite_completo
+        return bool(enlace_invite_completo(u))
+    except Exception:
+        if _es_url_invitacion_directa(u):
+            return True
+        if "ablink." in ul and "tidal" in ul and "/ls/click" in ul and "upn=" in ul:
+            upn = ul.split("upn=", 1)[1].split("&")[0].split("_")[0]
+            return len(upn) >= 140
+        return False
 
 
 def _es_url_invitacion_directa(url: str) -> bool:
@@ -7021,6 +7603,10 @@ def _resolver_ablink_a_invitacion(url: str, timeout_s: float = 18.0) -> str:
         picked = _pick_direct(list(reversed(historial)))
         if picked:
             return picked
+        if any(_url_es_resetpass(h) for h in historial) or _url_es_resetpass(final):
+            print(f"    {Color.WARNING}[Invitación]{Color.ENDC} ablink resolvió a resetpass; "
+                  f"no es invitación familiar.")
+            return ""
 
         html = ""
         try:
@@ -7038,12 +7624,18 @@ def _resolver_ablink_a_invitacion(url: str, timeout_s: float = 18.0) -> str:
         picked = _pick_direct(html_cands)
         if picked:
             return picked
+        if any(_url_es_resetpass(h) for h in html_cands):
+            print(f"    {Color.WARNING}[Invitación]{Color.ENDC} el HTML del ablink es resetpass; "
+                  f"no es invitación familiar.")
+            return ""
 
-        if final and "tidal.com" in final.lower() and "ablink." not in final.lower():
+        if _es_url_invitacion_directa(final):
             return final
+        # tidal.com/?lid= no es accept; se conserva el ablink solo si NO es resetpass.
     except Exception as e1:
-        print(f"    {Color.WARNING}[Invitación]{Color.ENDC} Resolver ablink (requests) falló: "
-              f"{type(e1).__name__}: {e1}")
+        err = f"{type(e1).__name__}: {e1}"
+        if "403" not in err and "forbidden" not in err.lower():
+            print(f"    {Color.WARNING}[Invitación]{Color.ENDC} Resolver ablink (requests) falló: {err}")
 
     # 2) Fallback urllib (a veces requests se atasca en el proxy de sistema)
     try:
@@ -7078,17 +7670,44 @@ def _resolver_ablink_a_invitacion(url: str, timeout_s: float = 18.0) -> str:
         picked = _pick_direct(cands2)
         if picked:
             return picked
-        if final2 and "tidal.com" in final2.lower() and "ablink." not in final2.lower():
+        if any(_url_es_resetpass(h) for h in cands2) or _url_es_resetpass(final2):
+            print(f"    {Color.WARNING}[Invitación]{Color.ENDC} ablink resolvió a resetpass; "
+                  f"no es invitación familiar.")
+            return ""
+        if _es_url_invitacion_directa(final2):
             return final2
     except Exception as e2:
-        print(f"    {Color.WARNING}[Invitación]{Color.ENDC} No se pudo resolver ablink "
-              f"({type(e2).__name__}: {e2}). Se usará el tracking (puede fallar por túnel).")
+        err = f"{type(e2).__name__}: {e2}"
+        if "403" not in err and "forbidden" not in err.lower():
+            print(f"    {Color.WARNING}[Invitación]{Color.ENDC} No se pudo resolver ablink ({err}). "
+                  f"Se usará el tracking.")
     return url
 
 
 def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") -> str | None:
     """Solo enlaces reales de invitación familiar (nunca resetpass ni footers genéricos)."""
+    blob_l = f"{body_text or ''} {html_raw or ''}".lower()
+    if any(x in blob_l for x in (
+        "resetpass", "reset-password", "restablecer tu contrase", "restablecer tu contrasena",
+        "resetting your tidal password", "reset your password", "forgot your password",
+        "restaurar su contrase", "link to reset",
+    )):
+        invite_fuerte = (
+            "invites you to join", "te ha invitado", "join their tidal",
+            "invited to a tidal family", "plan familiar", "unirte a su plan",
+            "has invited you", "accept-invite",
+        )
+        if not any(x in blob_l for x in invite_fuerte):
+            return None
     JOIN_TEXTS = ["join", "unir", "nete", "accept invitation", "aceptar invit", "unirse"]
+    invite_lang = any(
+        kw.lower() in blob_l
+        for kw in (
+            "invites you to join", "has invited you", "te ha invitado",
+            "has recibido una invitaci", "unirte a un plan", "unirte a su plan",
+            "plan familiar", "tidal family", "invited to a tidal family",
+        )
+    )
 
     def _es_enlace_invitacion(url: str) -> bool:
         u = (url or "").lower()
@@ -7101,11 +7720,11 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
             return False
         return (
             "login.tidal.com/family" in u
+            or "account.tidal.com/family" in u
             or "/family/" in u
             or "/accept/" in u
             or "/join/" in u
             or ("ablink." in u and "tidal" in u and any(k in u for k in ("family", "invite", "accept", "join")))
-            or ("ablink." in u and "tidal" in u)  # CTA tracking genérico de Tidal
         )
 
     def _es_ablink_tidal(url: str) -> bool:
@@ -7115,6 +7734,7 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
         return "ablink." in u and "tidal" in u
 
     candidatos_fuertes: list[str] = []
+    candidatos_cta: list[str] = []
     candidatos_ablink: list[str] = []
 
     if html_raw:
@@ -7123,17 +7743,23 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
                 r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>', html_raw, re.I
             )
             for href, inner_html in a_tags_full:
-                href = (href or "").strip()
-                inner_text = re.sub(r'<[^>]+>', '', inner_html or "").strip().lower()
+                href = (href or "").replace("&amp;", "&").strip()
+                inner_text = re.sub(r'<[^>]+>', '', inner_html or "")
+                inner_text = inner_text.replace("&uacute;", "u").replace("&#250;", "u")
+                inner_text = inner_text.replace("&Uacute;", "u").replace("&#218;", "u")
+                inner_text = inner_text.strip().lower()
+                if any(x in inner_text for x in ("resetpass", "reset password", "restablec", "forgot")):
+                    continue
                 if _es_enlace_invitacion(href) and not _es_ablink_tidal(href):
                     candidatos_fuertes.append(href)
+                    continue
+                es_cta = any(jt in inner_text for jt in JOIN_TEXTS)
+                if _es_ablink_tidal(href) and (es_cta or invite_lang):
+                    candidatos_cta.append(href)
                     continue
                 if _es_enlace_invitacion(href) and _es_ablink_tidal(href):
                     candidatos_ablink.append(href)
                     continue
-                # CTA "Join / Accept" cuyo href es ablink de tracking de Tidal
-                if _es_ablink_tidal(href) and any(jt in inner_text for jt in JOIN_TEXTS):
-                    candidatos_ablink.append(href)
         except Exception:
             pass
 
@@ -7161,8 +7787,9 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
     for link in enlaces:
         if _es_enlace_invitacion(link) and not _es_ablink_tidal(link):
             candidatos_fuertes.append(link)
-        elif _es_ablink_tidal(link):
-            candidatos_ablink.append(link)
+        elif _es_ablink_tidal(link) and not _url_es_resetpass(link):
+            if invite_lang or _es_enlace_invitacion(link):
+                candidatos_ablink.append(link)
 
     def _rank_directa(u: str) -> tuple:
         ul = u.lower()
@@ -7177,12 +7804,223 @@ def _extraer_enlace_invitacion_de_contenido(body_text: str, html_raw: str = "") 
     if candidatos_fuertes:
         candidatos_fuertes.sort(key=_rank_directa)
         elegido = candidatos_fuertes[0]
-        return elegido if _es_url_invitacion_directa(elegido) else _resolver_ablink_a_invitacion(elegido)
+        return elegido if _es_url_invitacion_directa(elegido) else elegido
 
-    # Solo ablink: resolver a URL final antes de devolver (evita ERR_TUNNEL en Chrome+proxy)
-    if candidatos_ablink:
-        return _resolver_ablink_a_invitacion(candidatos_ablink[0])
+    # CTA "Join/Accept"; exige upn largo. El logo (upn corto) cae en tidal.com/?lid=.
+    try:
+        from otp_worker_client import enlace_invite_completo, upn_token_invite
+        def _rank_ablink(u: str) -> tuple:
+            return (len(upn_token_invite(u)), len(u or ""))
+    except Exception:
+        def _rank_ablink(u: str) -> tuple:
+            return (len(u or ""),)
+
+        def enlace_invite_completo(u: str) -> bool:
+            return "ablink." in (u or "").lower()
+
+    if candidatos_cta:
+        buenos = [u for u in candidatos_cta if enlace_invite_completo(u)]
+        return max(buenos or candidatos_cta, key=_rank_ablink)
+    uniq = list(dict.fromkeys(candidatos_ablink))
+    buenos = [u for u in uniq if enlace_invite_completo(u)]
+    if buenos:
+        return max(buenos, key=_rank_ablink)
     return None
+
+
+def mejorar_enlace_invitacion(alias: str, actual: str) -> str:
+    """Si el worker devolvió el ablink del logo (?lid=), toma el CTA del HTML en Gmail.
+
+    Catch-all cheapmusic.best: no IMAP (el Worker ya tiene el CTA). Gmail nativo sí.
+    """
+    actual = (actual or "").strip()
+    alias = (alias or "").strip()
+    if not alias:
+        return actual
+    if _es_url_invitacion_directa(actual):
+        return actual
+    if _catch_all_sin_imap(alias):
+        return actual
+    try:
+        from otp_worker_client import usar_imap_gmail, enlace_invite_completo
+        if not usar_imap_gmail(alias) and enlace_invite_completo(actual):
+            return actual
+    except Exception:
+        pass
+    cta = _cta_invite_html_gmail(alias)
+    if not cta:
+        user_real, app_pwd = obtener_credenciales_imap_reales(alias)
+        if not user_real or not app_pwd:
+            return actual
+        try:
+            with sesion_imap(user_real, app_pwd) as mail:
+                found = _buscar_invitaciones_dirigidas_lote(
+                    mail, [alias], max_age_minutes=720,
+                )
+            cta = ((found.get(alias.lower()) or {}).get("link") or "").strip()
+        except Exception:
+            return actual
+    if not cta:
+        return actual
+    if _es_url_invitacion_directa(cta):
+        if cta != actual:
+            print(f"    {Color.CYAN}[Invitación]{Color.ENDC} {alias}: enlace directo desde el mail.")
+        return cta
+    try:
+        from otp_worker_client import enlace_invite_completo
+        cta_ok = enlace_invite_completo(cta)
+    except Exception:
+        cta_ok = "ablink." in cta.lower() and len(cta) > 180
+    if cta_ok and cta != actual:
+        print(f"    {Color.CYAN}[Invitación]{Color.ENDC} {alias}: se usa el CTA del mail "
+              f"(no el tracking corto que cae en ?lid=).")
+        return cta
+    return actual
+
+
+def _cta_invite_html_gmail(alias: str, max_n: int = 30) -> str:
+    """CTA «Únete al plan Family» del mail cuyo To: es este alias (últimos N de la etiqueta)."""
+    alias = (alias or "").strip().lower()
+    if not alias or "@" not in alias:
+        return ""
+    if _catch_all_sin_imap(alias):
+        return ""
+    user_real, app_pwd = obtener_credenciales_imap_reales(alias)
+    if not user_real or not app_pwd:
+        return ""
+    try:
+        with sesion_imap(user_real, app_pwd) as mail:
+            _imap_preparar_carpeta_otp(mail, [alias])
+            exists = _imap_untagged_int(mail, "EXISTS")
+            if exists <= 0:
+                return ""
+            n = min(max(8, int(max_n)), exists)
+            for seq in range(exists, exists - n, -1):
+                uid, msg = _imap_fetch_seq_header(mail, seq)
+                if msg is None:
+                    continue
+                from_s = _imap_decode_header_value(msg.get("From"))
+                subj = _imap_decode_header_value(msg.get("Subject"))
+                if "tidal" not in f"{from_s} {subj}".lower():
+                    continue
+                subj_l = (subj or "").lower()
+                if "cancel" in subj_l:
+                    continue
+                if any(x in subj_l for x in (
+                    "reset", "restablec", "restaurar", "password", "contrase",
+                    "forgot", "código de inicio", "codigo de inicio", "login code",
+                    "verification code", "código de verificación", "codigo de verificacion",
+                )):
+                    continue
+                rec = _headers_destinatario(msg)
+                if not _destinatario_es_para_alias(alias, rec, subj, exigir_exacto=True):
+                    continue
+                full = _imap_fetch_seq_rfc822(mail, seq)
+                if full is None:
+                    continue
+                body_text, html_raw = _extraer_cuerpo_y_html_msg(full)
+                blob = f"{subj} {body_text} {html_raw}"
+                if "cancel" in blob.lower():
+                    continue
+                if not any(kw.lower() in blob.lower() for kw in KEYWORDS_INVITACION_FAMILIAR):
+                    continue
+                link = _extraer_enlace_invitacion_de_contenido(body_text, html_raw)
+                if link and "resetpass" not in link.lower():
+                    return link
+    except Exception:
+        return ""
+    return ""
+
+
+def _url_es_home_campana_lid(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    if "ablink." in u:
+        return False
+    if "account.tidal.com" in u or "login.tidal.com" in u:
+        return False
+    return "tidal.com/?" in u or (u.rstrip("/").endswith("tidal.com") and "lid=" in u)
+
+
+def preparar_enlace_invitacion_para_abrir(alias: str, url: str) -> str:
+    """Worker/logo ablink → CTA del mail → account.tidal.com/family/accept-invite.
+
+    Chrome no debe abrir el ablink del logo: Tidal lo convierte en tidal.com/?lid=.
+    """
+    url = (url or "").strip()
+    alias = (alias or "").strip()
+    if not url:
+        return url
+    if _url_es_resetpass(url):
+        return ""
+    if _es_url_invitacion_directa(url):
+        return url
+    try:
+        from otp_worker_client import enlace_invite_completo
+        # CTA /ls/click con upn largo: Chrome lo abre. GET HTTP tarda varios
+        # segundos y Tidal a menudo responde tidal.com/?lid=.
+        if enlace_invite_completo(url):
+            return url
+        if alias and _catch_all_sin_imap(alias):
+            return ""
+    except Exception:
+        if alias and _catch_all_sin_imap(alias):
+            return url
+    if alias:
+        mejor = mejorar_enlace_invitacion(alias, url)
+        if mejor:
+            url = mejor
+            try:
+                from otp_worker_client import enlace_invite_completo as _cta_ok
+                if _cta_ok(url) or _es_url_invitacion_directa(url):
+                    return url
+            except Exception:
+                if _es_url_invitacion_directa(url):
+                    return url
+    if "ablink." not in url.lower():
+        if _url_es_home_campana_lid(url):
+            return ""
+        return url
+    if alias and _catch_all_sin_imap(alias):
+        return url
+    resuelto = _resolver_ablink_a_invitacion(url)
+    if resuelto and _es_url_invitacion_directa(resuelto):
+        return resuelto
+    if resuelto and _url_es_home_campana_lid(resuelto):
+        cta = _cta_invite_html_gmail(alias) if alias else ""
+        if cta and cta != url:
+            res2 = _resolver_ablink_a_invitacion(cta)
+            if res2 and _es_url_invitacion_directa(res2):
+                return res2
+            try:
+                from otp_worker_client import enlace_invite_completo
+                cta_ok = enlace_invite_completo(cta)
+            except Exception:
+                cta_ok = "ablink." in cta.lower() and len(cta) > 180
+            if cta_ok and not _url_es_home_campana_lid(cta) and not _url_es_resetpass(cta):
+                print(f"    {Color.CYAN}[Invitación]{Color.ENDC} {alias}: el tracking cae en ?lid=; "
+                      f"se abre el CTA del mail.")
+                return cta
+        print(f"    {Color.WARNING}[Invitación]{Color.ENDC} {alias}: ablink de logo/campaña "
+              f"(tidal.com/?lid=); no se abre.")
+        return ""
+    if resuelto and _url_es_resetpass(resuelto):
+        print(f"    {Color.WARNING}[Invitación]{Color.ENDC} {alias}: el ablink resolvió a "
+              f"resetpass; no es invitación familiar.")
+        return ""
+    if not resuelto:
+        print(f"    {Color.WARNING}[Invitación]{Color.ENDC} {alias}: no hay CTA familiar.")
+        return ""
+    try:
+        from otp_worker_client import enlace_invite_completo
+        if not enlace_invite_completo(url):
+            print(f"    {Color.WARNING}[Invitación]{Color.ENDC} {alias}: ablink demasiado corto "
+                  f"(logo/?lid=); no se abre en Chrome.")
+            return ""
+    except Exception:
+        pass
+    return url
 
 
 def _emails_en_texto_invitacion(recipients: str, cuerpo: str) -> list[str]:
@@ -7193,6 +8031,8 @@ def _emails_en_texto_invitacion(recipients: str, cuerpo: str) -> list[str]:
         .replace("&#64;", "@")
         .replace("&amp;#64;", "@")
         .replace("&#046;", ".")
+        .replace("&#46;", ".")
+        .replace("&#x2e;", ".")
         .replace("&dot;", ".")
         .replace("%2e", ".")
     )
@@ -7424,23 +8264,26 @@ def listar_invitaciones_familiares_buzon(
     aliases_l = [(a or "").strip().lower() for a in (aliases_objetivo or []) if (a or "").strip()]
     try:
         from otp_worker_client import listar_invites_worker, worker_cubre_alias, worker_config
-        hits: list[dict] = []
+        hits_raw: list[dict] = []
         cubre_todos = True
         cubre_alguno = False
         dests = aliases_l or [(gmail_user or "").strip().lower()]
         for a in dests:
             if worker_cubre_alias(a):
                 cubre_alguno = True
-                hits.extend(listar_invites_worker(a, max_age_minutes))
+                hits_raw.extend(listar_invites_worker(a, max_age_minutes))
             else:
                 cubre_todos = False
-        if hits:
-            print(f"    {Color.GREEN}[WORKER]{Color.ENDC} {len(hits)} invitación(es) para "
-                  f"{dests[0]}.")
-            if cubre_alguno and cubre_todos and not worker_config().get("imap_fallback"):
-                return hits
-        elif cubre_alguno and cubre_todos and not worker_config().get("imap_fallback"):
-            return []
+        try:
+            from otp_worker_client import enlace_invite_completo
+            hits = [h for h in hits_raw if enlace_invite_completo((h or {}).get("link") or "")]
+        except Exception:
+            hits = list(hits_raw)
+        if cubre_alguno and cubre_todos and not worker_config().get("imap_fallback"):
+            if hits:
+                print(f"    {Color.GREEN}[WORKER]{Color.ENDC} {len(hits)} invitación(es) para "
+                      f"{dests[0]}.")
+            return hits
     except Exception:
         pass
 
@@ -7500,12 +8343,7 @@ def listar_invitaciones_familiares_buzon(
                 pass
 
             subject_text = _imap_decode_header_value(msg_h.get("Subject"))
-            to_header = (msg_h.get("To") or "").lower()
-            delivered_to = (msg_h.get("Delivered-To") or "").lower()
-            envelope_to = (msg_h.get("Envelope-To") or "").lower()
-            x_original = (msg_h.get("X-Original-To") or "").lower()
-            x_forwarded = (msg_h.get("X-Forwarded-To") or "").lower()
-            recipients = f"{to_header} {delivered_to} {envelope_to} {x_original} {x_forwarded}"
+            recipients = _headers_destinatario(msg_h)
 
             parece_inv = _imap_asunto_parece_invitacion(subject_text)
             to_exacto = bool(aliases_l) and any(a in recipients for a in aliases_l)
@@ -7536,6 +8374,10 @@ def listar_invitaciones_familiares_buzon(
             if not any(kw.lower() in text_to_check for kw in KEYWORDS_INVITACION_FAMILIAR):
                 continue
             if "cancel" in text_to_check:
+                continue
+            if "removed from" in text_to_check or "has sido eliminad" in text_to_check:
+                continue
+            if _texto_es_mail_reset_no_invite(f"{subject_text} {body_text} {html_raw}"):
                 continue
             link = _extraer_enlace_invitacion_de_contenido(body_text, html_raw)
             if not link:
@@ -7600,6 +8442,8 @@ def _buscar_invitaciones_dirigidas_lote(
         for crit in (
             f'(FROM "tidal" SINCE {since_str} TO "{alias}")',
             f'(FROM "tidal" SINCE {since_str} TEXT "{alias}")',
+            f'(FROM "tidal" SINCE {since_str} SUBJECT "invit")',
+            f'(FROM "tidal" SINCE {since_str} SUBJECT "Family")',
             f'(FROM "tidal" TEXT "{alias}")',
         ):
             try:
@@ -7613,7 +8457,8 @@ def _buscar_invitaciones_dirigidas_lote(
         if not msg_ids:
             continue
         uids_alias: list[int] = []
-        for msg_id in reversed(msg_ids[-6:]):
+        tope = 25 if msg_ids and len(msg_ids) > 6 else 6
+        for msg_id in reversed(msg_ids[-max(tope, 6):]):
             try:
                 uid = int(msg_id)
             except ValueError:
@@ -7654,11 +8499,20 @@ def _buscar_invitaciones_dirigidas_lote(
         subject_text = _imap_decode_header_value(msg_h.get("Subject"))
         if subject_text and "cancel" in subject_text.lower():
             continue
+        sl = (subject_text or "").lower()
+        if any(x in sl for x in (
+            "restablecer tu contrase", "reset your password", "resetting your tidal",
+            "restaurar su contrase", "forgot your password",
+        )):
+            continue
         recipients = " ".join([
             (msg_h.get("To") or ""),
             (msg_h.get("Delivered-To") or ""),
             (msg_h.get("X-Original-To") or ""),
             (msg_h.get("X-Forwarded-To") or ""),
+            (msg_h.get("Envelope-To") or ""),
+            (msg_h.get("X-Envelope-To") or ""),
+            (msg_h.get("X-Google-Original-To") or ""),
         ]).lower()
         parece = _imap_asunto_parece_invitacion(subject_text) or any(
             a in recipients for a in aliases_norm
@@ -7675,47 +8529,57 @@ def _buscar_invitaciones_dirigidas_lote(
     # 3) Bodies en lote
     bodies_map = _imap_fetch_bodies_lote(mail, candidatos_body)
 
-    # 4) Emparejar cada alias con el mejor match exacto
-    for alias in aliases_norm:
-        if alias in hallados:
+    # 4) Emparejar. Gmail busca TO sin distinguir puntos, así que el UID que
+    # devolvió el SEARCH de un alias puede ser la invitación de su hermano.
+    # Se puntúa cada UID contra todos los alias y se queda el match exacto.
+    candidatos_match: list[tuple[int, int, str, dict]] = []
+    for uid in candidatos_body:
+        if uid in uids_excluir:
             continue
-        for uid in uids_por_alias.get(alias, []):
-            if uid in uids_excluir:
-                continue
-            msg = bodies_map.get(uid)
-            if not msg:
-                continue
-            meta = meta_por_uid.get(uid) or {}
-            subject_text = meta.get("subject") or _imap_decode_header_value(msg.get("Subject"))
-            body_text, html_raw = _extraer_cuerpo_y_html_msg(msg)
-            text_to_check = f"{subject_text} {body_text}".lower()
-            if not any(kw.lower() in text_to_check for kw in KEYWORDS_INVITACION_FAMILIAR):
-                continue
-            if "cancel" in text_to_check:
-                continue
-            link = _extraer_enlace_invitacion_de_contenido(body_text, html_raw)
-            if not link or link in links_excluir or "resetpass" in link.lower():
-                continue
-            recipients = meta.get("recipients") or " ".join([
-                (msg.get("To") or ""),
-                (msg.get("Delivered-To") or ""),
-                (msg.get("X-Original-To") or ""),
-                (msg.get("X-Forwarded-To") or ""),
-            ]).lower()
-            cuerpo = f"{subject_text}\n{body_text}\n{html_raw}"
+        msg = bodies_map.get(uid)
+        if not msg:
+            continue
+        meta = meta_por_uid.get(uid) or {}
+        subject_text = meta.get("subject") or _imap_decode_header_value(msg.get("Subject"))
+        body_text, html_raw = _extraer_cuerpo_y_html_msg(msg)
+        text_to_check = f"{subject_text} {body_text}".lower()
+        if not any(kw.lower() in text_to_check for kw in KEYWORDS_INVITACION_FAMILIAR):
+            continue
+        if "cancel" in text_to_check:
+            continue
+        if "removed from" in text_to_check or "has sido eliminad" in text_to_check:
+            continue
+        if _texto_es_mail_reset_no_invite(f"{subject_text} {body_text} {html_raw}"):
+            continue
+        link = _extraer_enlace_invitacion_de_contenido(body_text, html_raw)
+        if not link or link in links_excluir or "resetpass" in link.lower():
+            continue
+        recipients = meta.get("recipients") or ""
+        if not recipients:
+            recipients = _headers_destinatario(msg)
+        cuerpo = f"{subject_text}\n{body_text}\n{html_raw}"
+        for alias in aliases_norm:
             score = _puntuar_invitacion_para_alias(alias, recipients, cuerpo)
-            if score < 85:
-                continue
-            hallados[alias] = {
-                "uid": uid,
-                "recipients": recipients,
-                "body": cuerpo,
-                "link": link,
-                "score": score,
-            }
-            uids_excluir.add(uid)
-            links_excluir.add(link)
-            break
+            if score >= 85:
+                candidatos_match.append((score, uid, alias, {
+                    "uid": uid,
+                    "recipients": recipients,
+                    "body": cuerpo,
+                    "link": link,
+                    "score": score,
+                }))
+    candidatos_match.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    uids_tomados: set[int] = set()
+    for score, uid, alias, payload in candidatos_match:
+        if alias in hallados or uid in uids_tomados:
+            continue
+        link = payload.get("link") or ""
+        if link in links_excluir:
+            continue
+        hallados[alias] = payload
+        uids_tomados.add(uid)
+        uids_excluir.add(uid)
+        links_excluir.add(link)
     return hallados
 
 
@@ -7733,17 +8597,24 @@ def _buscar_invitacion_por_alias_exacto(
             enlace = reclamar_desde_worker(
                 alias, "invite", max_age_minutes=max_age_minutes, silencioso=False,
             )
-            if enlace and "resetpass" not in enlace.lower():
-                if not (links_excluir and enlace in links_excluir):
-                    return {
-                        "uid": 0,
-                        "recipients": alias,
-                        "body": "",
-                        "link": enlace,
-                        "score": 100,
-                    }
-            if not worker_config().get("imap_fallback"):
+            try:
+                from otp_worker_client import enlace_invite_completo
+                ok_cta = bool(enlace and enlace_invite_completo(enlace))
+            except Exception:
+                ok_cta = bool(enlace and "resetpass" not in (enlace or "").lower())
+            if ok_cta and not (links_excluir and enlace in links_excluir):
+                return {
+                    "uid": 0,
+                    "recipients": alias,
+                    "body": "",
+                    "link": enlace,
+                    "score": 100,
+                }
+            if not enlace and not worker_config().get("imap_fallback"):
                 return None
+            if enlace and not ok_cta:
+                print(f"    {Color.WARNING}[WORKER]{Color.ENDC} {alias}: "
+                      f"ablink de logo/tracking; se busca el CTA en el mail.")
     except Exception:
         pass
     user_real, app_pwd = obtener_credenciales_imap_reales(gmail_user)
@@ -7764,7 +8635,11 @@ def _buscar_invitacion_por_alias_exacto(
 MAX_AGE_INVITACION_FAMILIAR_MIN = 2880
 
 
-def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
+def asignar_enlaces_invitacion_a_correos(
+    correos: list[str],
+    *,
+    esperar_si_falta: bool = True,
+) -> dict[str, str]:
     """Asigna 1 enlace de invitación único por correo, coordinado por buzón Gmail.
 
     Evita el fallo de la opción 4: N alias con puntos del mismo Gmail → To: canónico →
@@ -7818,7 +8693,11 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
                 continue
         except Exception as e_w:
             print(f"    {Color.WARNING}[WORKER]{Color.ENDC} Asignación de invitaciones: {e_w}")
-            # Seguir con IMAP para todos (FORWARD_TO); no descartar catch-all.
+
+        # Catch-all: el Worker es la fuente; no caer a Gmail aunque falte el CTA.
+        aliases_unicos = [a for a in aliases_unicos if not _catch_all_sin_imap(a)]
+        if not aliases_unicos:
+            continue
 
         if len(aliases_unicos) == 1:
             solo = aliases_unicos[0]
@@ -7867,19 +8746,28 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
                 links_usados.add(ident_prev)
         invitaciones: list[dict] = []
 
-        def _asignar(alias: str, uid: int, link: str, score: int, tipo: str) -> None:
+        def _asignar(alias: str, uid: int, link: str, score: int, tipo: str) -> bool:
             if alias not in pendientes:
-                return
+                return False
             if uid and uid in uids_usados:
-                return
+                return False
             ident = _invite_url_identidad(link)
             if (link in links_usados) or (ident and ident in links_usados):
-                return
+                if score >= 85:
+                    print(f"    {Color.WARNING}[IMAP]{Color.ENDC} UID {uid} → {alias}: "
+                          f"enlace repetido, no se asigna.")
+                return False
             em_link = _invite_email_en_url(link)
             if em_link and not correos_iguales_exacto(em_link, alias):
-                return
+                if score >= 85:
+                    print(f"    {Color.WARNING}[IMAP]{Color.ENDC} UID {uid} → {alias}: "
+                          f"el enlace es de {em_link}.")
+                return False
             if uid and not _reclamar_uid_correo(buzon_clave, uid):
-                return
+                if score >= 85:
+                    print(f"    {Color.WARNING}[IMAP]{Color.ENDC} UID {uid} → {alias}: "
+                          f"ya reclamado por otro paso, no se asigna.")
+                return False
             asignados[alias] = link
             pendientes.remove(alias)
             if uid:
@@ -7890,6 +8778,7 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
             color = Color.GREEN if score >= 85 else Color.WARNING
             print(f"    {color}[IMAP]{Color.ENDC} Invitación UID {uid} → {alias} "
                   f"({tipo}, score={score})")
+            return True
 
         # Pasada 1 (rápida): SEARCH dirigido por alias — evita escanear 100+ invites.
         print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Buzón {_norm_dots_gmail(buzon_clave)}: "
@@ -7917,8 +8806,20 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
             except Exception as e_dir:
                 print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Búsqueda dirigida: {e_dir}")
 
-        # Pasada 2: listado masivo solo para los que faltan (headers lote + bodies lote).
-        if pendientes:
+        # Pasada 2: listado masivo SOLO para Gmail nativo (o imap_fallback).
+        # Catch-all: Worker + búsqueda dirigida ya corrieron; barrer 5k UIDs
+        # del forward no aporta y retrasa varios segundos.
+        imap_masivo = True
+        try:
+            from otp_worker_client import usar_imap_gmail
+            imap_masivo = any(usar_imap_gmail(a) for a in pendientes)
+        except Exception:
+            imap_masivo = True
+        if pendientes and not imap_masivo:
+            print(f"    {Color.CYAN}[IMAP]{Color.ENDC} {len(pendientes)} sin CTA usable; "
+                  f"no se barre el buzón completo (imap_fallback off).")
+            invitaciones = []
+        elif pendientes:
             tope_msgs = max(250, len(pendientes) * 6, 120)
             print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Listado masivo para "
                   f"{len(pendientes)} pendiente(s) (hasta {tope_msgs} UIDs)...")
@@ -7981,6 +8882,98 @@ def asignar_enlaces_invitacion_a_correos(correos: list[str]) -> dict[str, str]:
                 print(f"    {Color.WARNING}[IMAP]{Color.ENDC} {len(libres)} invitaciones canónicas "
                       f"para {alias_unico}; no se asigna a ciegas (riesgo de link incorrecto).")
 
+        # El mail de Tidal a veces entra en IMAP con el enlace ya visible y el
+        # alias con puntos un instante después. Si se vio un candidato y no se
+        # pudo atribuir, se relee. Si aún no hay correo, una sola espera.
+        def _aplicar_lista(lista: list[dict]) -> None:
+            candidatos_r: list[tuple[int, int, str, str]] = []
+            for inv in lista:
+                uid = int(inv.get("uid") or 0)
+                link = (inv.get("link") or "").strip()
+                if not link or "resetpass" in link.lower():
+                    continue
+                if uid and uid in uids_usados:
+                    continue
+                ident = _invite_url_identidad(link)
+                if link in links_usados or (ident and ident in links_usados):
+                    continue
+                for alias in list(pendientes):
+                    sc = _puntuar_invitacion_para_alias(
+                        alias, inv.get("recipients") or "", inv.get("body") or ""
+                    )
+                    if sc <= 0:
+                        continue
+                    candidatos_r.append((sc, uid, alias, link))
+            candidatos_r.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            for sc, uid, alias, link in candidatos_r:
+                if not pendientes or sc < 85:
+                    continue
+                _asignar(alias, uid, link, sc, "relectura")
+
+        esperas = 0
+        while esperar_si_falta and pendientes and esperas < 2:
+            mejor, quien, uid_m = 0, "", 0
+            for inv in invitaciones:
+                for alias in list(pendientes):
+                    sc = _puntuar_invitacion_para_alias(
+                        alias, inv.get("recipients") or "", inv.get("body") or ""
+                    )
+                    if sc > mejor:
+                        mejor = sc
+                        quien = alias
+                        uid_m = int(inv.get("uid") or 0)
+            # 85+ y sigue pendiente: el rechazo fue duplicado o UID reclamado.
+            # Releer no lo cambia. Score 0 tras una espera: ese alias no tiene correo.
+            if mejor >= 85 or (mejor == 0 and esperas >= 1):
+                break
+            esperas += 1
+            if mejor > 0:
+                print(
+                    f"    {Color.WARNING}[IMAP]{Color.ENDC} UID {uid_m} score {mejor} "
+                    f"para {quien}; se relee el buzón en 8s "
+                    f"(el alias con puntos a veces aparece un instante después)."
+                )
+            else:
+                print(
+                    f"    {Color.CYAN}[IMAP]{Color.ENDC} Aún sin correo de invitación "
+                    f"para {len(pendientes)} alias; espera 8s..."
+                )
+            time.sleep(8)
+            if not (user_real and app_pwd):
+                break
+            try:
+                with sesion_imap(user_real, app_pwd) as mail:
+                    dirigidos = _buscar_invitaciones_dirigidas_lote(
+                        mail,
+                        list(pendientes),
+                        max_age_minutes=max_age,
+                        uids_excluir=uids_usados,
+                        links_excluir=links_usados,
+                    )
+                for alias, dirigido in dirigidos.items():
+                    _asignar(
+                        alias,
+                        int(dirigido.get("uid") or 0),
+                        dirigido.get("link") or "",
+                        int(dirigido.get("score") or 95),
+                        "relectura",
+                    )
+            except Exception as e_re:
+                print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Relectura dirigida: {e_re}")
+            if not pendientes:
+                break
+            try:
+                invitaciones = listar_invitaciones_familiares_buzon(
+                    aliases_unicos[0],
+                    max_age_minutes=max_age,
+                    max_mensajes=max(250, len(pendientes) * 6, 120),
+                    aliases_objetivo=list(pendientes),
+                )
+            except Exception as e_re:
+                print(f"    {Color.WARNING}[IMAP]{Color.ENDC} Relectura masiva: {e_re}")
+                invitaciones = []
+            _aplicar_lista(invitaciones)
+
         print(f"    {Color.CYAN}[IMAP]{Color.ENDC} Asignadas {n_alias - len(pendientes)}/{n_alias}; "
               f"pendientes {len(pendientes)}.")
         for a in pendientes:
@@ -8005,6 +8998,8 @@ def reclamar_otp_registro_para_alias(
     alias = (alias or "").strip().lower()
     if not alias or "@" not in alias:
         return None
+    if omitir_worker and _catch_all_sin_imap(alias):
+        return None
     if not omitir_worker:
         try:
             from otp_worker_client import worker_cubre_alias, intentar_via_worker
@@ -8017,6 +9012,17 @@ def reclamar_otp_registro_para_alias(
                     after_email_id=eid,
                     silencioso=silencioso,
                     aliases=[alias],
+                )
+                if val:
+                    return val
+                from otp_worker_client import esperar_desde_worker
+                val = esperar_desde_worker(
+                    alias, "register",
+                    max_wait_s=1.6,
+                    interval_s=0.08,
+                    after_email_id=eid,
+                    max_age_minutes=max_age_minutes,
+                    silencioso=silencioso,
                 )
                 if val:
                     return val
@@ -8109,6 +9115,8 @@ def reclamar_otp_login_para_alias(
     alias = (alias or "").strip().lower()
     if not alias or "@" not in alias:
         return None
+    if omitir_worker and _catch_all_sin_imap(alias):
+        return None
     if not omitir_worker:
         try:
             from otp_worker_client import worker_cubre_alias, intentar_via_worker
@@ -8120,6 +9128,17 @@ def reclamar_otp_login_para_alias(
                     after_email_id=eid,
                     silencioso=silencioso,
                     aliases=[alias],
+                )
+                if val:
+                    return val
+                from otp_worker_client import esperar_desde_worker
+                val = esperar_desde_worker(
+                    alias, "login",
+                    max_wait_s=1.6,
+                    interval_s=0.08,
+                    after_email_id=eid,
+                    max_age_minutes=max_age_minutes,
+                    silencioso=silencioso,
                 )
                 if val:
                     return val
@@ -8142,18 +9161,85 @@ def reclamar_otp_login_para_alias(
         )
 
 
+def _imap_otp_eliminacion_dirigido(
+    alias: str,
+    preferir_otp_len: int | None = 5,
+    max_age_minutes: int = 10,
+    omitir: set | None = None,
+) -> str | None:
+    """OTP de borrado buscando el To: exacto (no los 8 mails más nuevos de la etiqueta).
+
+    El worker de Cloudflare a menudo no guarda estos mails (solo el forward a Gmail).
+    CLIENTES TIDAL tiene 20k+ mensajes: mirar solo los últimos 8 se come el OTP de
+    este alias cuando hay 5 bajas en paralelo + mails de confirmación.
+    """
+    import email as email_lib
+
+    alias = (alias or "").strip().lower()
+    if not alias or "@" not in alias:
+        return None
+    omitir = {re.sub(r"\D", "", str(x or "")) for x in (omitir or set()) if x}
+    omitir.discard("")
+    user_real, app_pwd = obtener_credenciales_imap_reales(alias)
+    if not user_real or not app_pwd:
+        return None
+    try:
+        with sesion_imap(user_real, app_pwd) as mail:
+            carpeta = _imap_preparar_carpeta_otp(mail, [alias])
+            exists = _imap_untagged_int(mail, "EXISTS")
+            if exists <= 0:
+                return None
+            n = min(25, exists)
+            for seq in range(exists, exists - n, -1):
+                uid, msg = _imap_fetch_seq_header(mail, seq)
+                if msg is None:
+                    continue
+                from_s = _imap_decode_header_value(msg.get("From"))
+                subj = _imap_decode_header_value(msg.get("Subject"))
+                if not _imap_parece_otp_tidal(from_s, subj, "tidal"):
+                    continue
+                if _imap_asunto_es_aviso_login(subj):
+                    continue
+                sl = (subj or "").lower()
+                if "confirmation" in sl and "verify" not in sl and "verific" not in sl:
+                    continue
+                rec = _headers_destinatario(msg)
+                if not _destinatario_es_para_alias(alias, rec, subj, exigir_exacto=True):
+                    continue
+                full = _imap_fetch_seq_rfc822(mail, seq)
+                texto = _imap_cuerpo_texto(full) if full else ""
+                blob = f"{subj} {texto}"
+                if _texto_excluido_por_frases(blob, EXCLUDE_ELIMINACION_CUENTA):
+                    continue
+                if not any(kw.lower() in blob.lower() for kw in KEYWORDS_ELIMINACION_CUENTA):
+                    if not re.search(r"delet|elimin", blob, re.I):
+                        continue
+                codes = _extraer_codigos_otp(blob, preferir_len=preferir_otp_len)
+                for c in codes:
+                    digs = re.sub(r"\D", "", str(c))
+                    if digs and digs not in omitir:
+                        return str(c).strip()
+    except Exception as exc:
+        print(f"    {Color.WARNING}[IMAP]{Color.ENDC} OTP eliminación dirigido {alias}: {exc}")
+    return None
+
+
 def reclamar_otp_eliminacion_para_alias(
     alias: str,
     after_email_id: int = 0,
     preferir_otp_len: int | None = 5,
-    max_age_minutes: int = 45,
+    max_age_minutes: int = 5,
     permitir_canonico: bool = False,
+    despues_de: float | None = None,
+    max_wait_s: float = 40.0,
+    omitir_codigos: set | None = None,
 ) -> str | None:
     """Obtiene el OTP de borrado para UN alias (con puntos), sin saturar IMAP.
 
     - Un solo hilo a la vez por buzón Gmail (evita el colapso de N ventanas en paralelo).
     - Primero match EXACTO con puntos.
     - Si permitir_canonico: To: sin puntos se reparte 1 UID libre por hilo (bajo el mismo lock).
+    - Worker: peek corto. El OTP de delete suele estar solo en Gmail (forward).
     """
     import email as email_lib
     from email.header import decode_header
@@ -8164,22 +9250,85 @@ def reclamar_otp_eliminacion_para_alias(
     if not alias or "@" not in alias:
         return None
 
+    omitir = {re.sub(r"\D", "", str(x or "")) for x in (omitir_codigos or set()) if x}
+    omitir.discard("")
+
+    def _usable(val: str | None) -> str | None:
+        if not val:
+            return None
+        digs = re.sub(r"\D", "", str(val))
+        if not digs:
+            return None
+        if digs in omitir:
+            print(f"    {Color.WARNING}[OTP]{Color.ENDC} Código {digs} ya rechazado; se ignora.")
+            return None
+        return str(val).strip()
+
+    try:
+        from otp_worker_client import (
+            worker_cubre_alias, esperar_desde_worker, usar_imap_gmail,
+        )
+        if worker_cubre_alias(alias):
+            espera_w = max(1.2, float(max_wait_s or 8.0))
+            val = esperar_desde_worker(
+                alias, "delete",
+                max_wait_s=espera_w,
+                interval_s=0.08,
+                after_email_id=after_email_id,
+                max_age_minutes=max(8, int(max_age_minutes or 5)),
+                silencioso=True,
+                consume=True,
+                despues_de=despues_de,
+                margen_s=12.0,
+            )
+            got = _usable(val)
+            if got:
+                print(f"    {Color.GREEN}[WORKER]{Color.ENDC} OTP eliminación → {alias}: {got}")
+                return got
+            if not usar_imap_gmail(alias):
+                return None
+    except Exception as e_w:
+        print(f"    {Color.WARNING}[WORKER]{Color.ENDC} OTP eliminación: {e_w}")
+
     with _lock_registro_mismo_buzon(alias):
-        # 1) Match estricto por puntos
+        dirigido = _imap_otp_eliminacion_dirigido(
+            alias,
+            preferir_otp_len=preferir_otp_len,
+            max_age_minutes=max(10, int(max_age_minutes or 5)),
+            omitir=omitir,
+        )
+        got = _usable(dirigido)
+        if got:
+            print(f"    {Color.GREEN}[IMAP]{Color.ENDC} OTP eliminación (To: {alias}): {got}")
+            return got
+
+        # after_email_id dummy=1 del catch-all no filtra; un UID real inflado por
+        # hermanos en paralelo sí esconde el mail propio. En catch-all no usarlo.
+        after_imap = int(after_email_id or 0)
+        if after_imap <= 1:
+            after_imap = 0
+        try:
+            from otp_worker_client import worker_cubre_alias as _cubre
+            if _cubre(alias):
+                after_imap = 0
+        except Exception:
+            pass
         codigo = obtener_codigo_via_imap(
             gmail_user=alias,
             required_keywords=KEYWORDS_ELIMINACION_CUENTA,
             query_exclude=EXCLUDE_ELIMINACION_CUENTA,
-            after_email_id=after_email_id,
-            max_age_minutes=max_age_minutes,
+            after_email_id=after_imap,
+            max_age_minutes=max(8, int(max_age_minutes or 5)),
             aliases_solo=[alias],
             preferir_otp_len=preferir_otp_len,
             exigir_destinatario_exacto=True,
             silencioso=True,
+            omitir_worker=True,
         )
-        if codigo:
-            print(f"    {Color.GREEN}[IMAP]{Color.ENDC} OTP eliminación (exacto) → {alias}: {codigo}")
-            return codigo
+        got = _usable(codigo)
+        if got:
+            print(f"    {Color.GREEN}[IMAP]{Color.ENDC} OTP eliminación (exacto) → {alias}: {got}")
+            return got
 
         if not permitir_canonico:
             return None
@@ -8459,11 +9608,13 @@ def _imap_untagged_int(mail, key: str) -> int:
 
 
 def _imap_max_recientes(max_age_minutes: int) -> int:
+    # CLIENTES TIDAL tiene decenas de miles de mails. 8 era poco: 5 bajas en
+    # paralelo + confirmaciones empujan el OTP de "Verify account deletion" fuera.
     if max_age_minutes and int(max_age_minutes) >= 1440:
-        return 12
+        return 40
     if max_age_minutes and int(max_age_minutes) >= 120:
-        return 10
-    return 8
+        return 35
+    return 30
 
 
 def _imap_parece_otp_tidal(from_s: str, subj: str, query_from: str) -> bool:
@@ -8742,7 +9893,10 @@ def obtener_codigo_via_imap(gmail_user="cakeseller1234@gmail.com", gmail_app_pas
                 return None
     except Exception:
         pass
-    
+
+    if (not solo_link) and _catch_all_sin_imap(aliases_ok[0] if aliases_ok else gmail_user):
+        return None
+
     user_real, app_pwd = obtener_credenciales_imap_reales(gmail_user)
     if not user_real or not app_pwd:
         if not silencioso:
@@ -9377,7 +10531,9 @@ def headless_forzado_por_entorno() -> bool:
 
 def kwargs_launch_persistent(profile_dir, *, headless: bool = False) -> dict:
     """Kwargs comunes para launch_persistent_context (PC Windows o VPS Linux headless)."""
-    usar_headless = bool(headless) or headless_forzado_por_entorno()
+    usar_headless = bool(headless)
+    if not usar_headless and sys.platform != "win32":
+        usar_headless = headless_forzado_por_entorno()
     es_linux = sys.platform.startswith("linux")
     args = list(CHROME_SILENT_ARGS)
     # Contabo/VPS como root: Chromium EXIGE --no-sandbox. No meterlo en ignore_default_args.
@@ -9547,13 +10703,156 @@ SURFSHARK_PAISES_REGISTRO = {
     },
 }
 
+# Países de rotación del pipeline (pasos 1-2 y 4+). Argentina NO entra: solo paso 3.
+SURFSHARK_ROTACION_PIPELINE: dict[str, dict] = {
+    "ecuador": {
+        "clave": "ecuador", "nombre": "Ecuador", "codigo": "EC",
+        "nombres_geo": ("ecuador",), "ubicacion": "ecuador", "ciudad": "Quito",
+    },
+    "peru": {
+        "clave": "peru", "nombre": "Perú", "codigo": "PE",
+        "nombres_geo": ("peru", "perú"), "ubicacion": "peru", "ciudad": "Lima",
+    },
+    "chile": {
+        "clave": "chile", "nombre": "Chile", "codigo": "CL",
+        "nombres_geo": ("chile",), "ubicacion": "chile", "ciudad": "Santiago",
+    },
+    "colombia": {
+        "clave": "colombia", "nombre": "Colombia", "codigo": "CO",
+        "nombres_geo": ("colombia",), "ubicacion": "colombia", "ciudad": "Bogotá",
+    },
+    "brasil": {
+        "clave": "brasil", "nombre": "Brasil", "codigo": "BR",
+        "nombres_geo": ("brasil", "brazil"), "ubicacion": "brasil", "ciudad": "São Paulo",
+    },
+    "costa_rica": {
+        "clave": "costa_rica", "nombre": "Costa Rica", "codigo": "CR",
+        "nombres_geo": ("costa rica",), "ubicacion": "costa rica", "ciudad": "San José",
+    },
+    "bolivia": {
+        "clave": "bolivia", "nombre": "Bolivia", "codigo": "BO",
+        "nombres_geo": ("bolivia",), "ubicacion": "bolivia", "ciudad": "La Paz",
+    },
+    "espana": {
+        "clave": "espana", "nombre": "España", "codigo": "ES",
+        "nombres_geo": ("españa", "spain", "espana"), "ubicacion": "españa", "ciudad": "Madrid",
+    },
+    "panama": {
+        "clave": "panama", "nombre": "Panamá", "codigo": "PA",
+        "nombres_geo": ("panama", "panamá"), "ubicacion": "panama", "ciudad": "Panamá",
+    },
+    "paraguay": {
+        "clave": "paraguay", "nombre": "Paraguay", "codigo": "PY",
+        "nombres_geo": ("paraguay",), "ubicacion": "paraguay", "ciudad": "Asunción",
+    },
+    "puerto_rico": {
+        "clave": "puerto_rico", "nombre": "Puerto Rico", "codigo": "PR",
+        "nombres_geo": ("puerto rico",), "ubicacion": "puerto rico", "ciudad": "San Juan",
+    },
+    "uruguay": {
+        "clave": "uruguay", "nombre": "Uruguay", "codigo": "UY",
+        "nombres_geo": ("uruguay",), "ubicacion": "uruguay", "ciudad": "Montevideo",
+    },
+    "venezuela": {
+        "clave": "venezuela", "nombre": "Venezuela", "codigo": "VE",
+        "nombres_geo": ("venezuela",), "ubicacion": "venezuela", "ciudad": "Caracas",
+    },
+    "mexico": {
+        "clave": "mexico", "nombre": "México", "codigo": "MX",
+        "nombres_geo": ("mexico", "méxico"), "ubicacion": "mexico", "ciudad": "Ciudad de México",
+    },
+    "bahamas": {
+        "clave": "bahamas", "nombre": "Bahamas", "codigo": "BS",
+        "nombres_geo": ("bahamas",), "ubicacion": "bahamas", "ciudad": "Nassau",
+    },
+}
+
+_VPN_ROTACION_RECIENTES: list[str] = []
+_VPN_ROTACION_MAX_RECIENTES = 5
+
+
+def set_vpn_rotacion_recientes(claves) -> None:
+    global _VPN_ROTACION_RECIENTES
+    out: list[str] = []
+    vistos: set[str] = set()
+    for c in claves or []:
+        k = str(c or "").strip().lower().replace(" ", "_")
+        if k in ("españa", "spain"):
+            k = "espana"
+        if k not in SURFSHARK_ROTACION_PIPELINE or k in vistos:
+            continue
+        vistos.add(k)
+        out.append(k)
+    _VPN_ROTACION_RECIENTES = out[-_VPN_ROTACION_MAX_RECIENTES:]
+
+
+def vpn_rotacion_recientes() -> list[str]:
+    return list(_VPN_ROTACION_RECIENTES)
+
+
+def _anotar_vpn_rotacion(clave: str) -> None:
+    global _VPN_ROTACION_RECIENTES
+    k = str(clave or "").strip().lower()
+    if k not in SURFSHARK_ROTACION_PIPELINE:
+        return
+    _VPN_ROTACION_RECIENTES = [c for c in _VPN_ROTACION_RECIENTES if c != k]
+    _VPN_ROTACION_RECIENTES.append(k)
+    _VPN_ROTACION_RECIENTES = _VPN_ROTACION_RECIENTES[-_VPN_ROTACION_MAX_RECIENTES:]
+
+
+def elegir_pais_rotacion(*, extra_excluir: list[str] | None = None) -> dict:
+    """País aleatorio de la lista, evitando los usados hace poco y extra_excluir."""
+    excluir = set(_VPN_ROTACION_RECIENTES)
+    for c in extra_excluir or []:
+        k = str(c or "").strip().lower().replace(" ", "_")
+        if k:
+            excluir.add(k)
+    pool = [p for k, p in SURFSHARK_ROTACION_PIPELINE.items() if k not in excluir]
+    if not pool:
+        ultimos = set(_VPN_ROTACION_RECIENTES[-2:])
+        pool = [p for k, p in SURFSHARK_ROTACION_PIPELINE.items() if k not in ultimos]
+    if not pool:
+        pool = list(SURFSHARK_ROTACION_PIPELINE.values())
+    return random.choice(pool)
+
+
+def rotar_vpn_pipeline(*, motivo: str, extra_excluir: list[str] | None = None) -> dict | None:
+    """Desconecta Surfshark y conecta un país de rotación (nunca Argentina)."""
+    pais = elegir_pais_rotacion(extra_excluir=extra_excluir)
+    recientes = ", ".join(_VPN_ROTACION_RECIENTES) or "ninguno"
+    print(f"  {Color.CYAN}[VPN] Rotación → {pais['nombre']} "
+          f"(recientes: {recientes}).{Color.ENDC}")
+    ok = asegurar_vpn_pais_para_registro(
+        pais=pais, reciclar=True, motivo=motivo, intentos_auto=2, interactivo=False,
+    )
+    if ok:
+        _anotar_vpn_rotacion(pais["clave"])
+        return pais
+    otro = elegir_pais_rotacion(extra_excluir=[pais["clave"], *(extra_excluir or [])])
+    if otro["clave"] != pais["clave"]:
+        print(f"  {Color.WARNING}[VPN] {pais['nombre']} no confirmó; se prueba {otro['nombre']}.{Color.ENDC}")
+        ok2 = asegurar_vpn_pais_para_registro(
+            pais=otro, reciclar=True, motivo=f"{motivo} (reintento)",
+            intentos_auto=2, interactivo=False,
+        )
+        if ok2:
+            _anotar_vpn_rotacion(otro["clave"])
+            return otro
+    print(f"  {Color.WARNING}[VPN] No se pudo rotar Surfshark. Se sigue con la IP actual.{Color.ENDC}")
+    return None
+
 
 def _geoip_es_pais_registro(info: dict, pais: dict) -> bool:
     code = (info.get("country_code") or "").upper()
     name = (info.get("country") or "").casefold()
     if code == str(pais.get("codigo") or "").upper():
         return True
-    return any(n in name for n in (pais.get("nombres_geo") or ()))
+    if any(n in name for n in (pais.get("nombres_geo") or ())):
+        return True
+    # Puerto Rico a veces sale como US en geoip.
+    if str(pais.get("codigo") or "").upper() == "PR" and "puerto rico" in name:
+        return True
+    return False
 
 
 def ip_publica_es_pais_registro(pais: dict, info: dict | None = None) -> tuple[bool, str]:
@@ -9711,11 +11010,13 @@ def asegurar_vpn_pais_para_registro(
     reciclar: bool,
     motivo: str,
     intentos_auto: int = 2,
+    interactivo: bool = True,
 ) -> bool:
     """Asegura Surfshark en el país elegido antes de registrar. No exige IP distinta.
 
     reciclar=False: si ya está en ese país, no toca la VPN; si no, conecta.
     reciclar=True: desconecta y vuelve a conectar el mismo país (cada 2 oleadas).
+    interactivo=False: si el auto falla, no pide Enter (pipeline largo).
     """
     nombre = pais.get("nombre") or "Nigeria"
     ubicacion = pais.get("ubicacion") or "nigeria"
@@ -9737,14 +11038,14 @@ def asegurar_vpn_pais_para_registro(
         if reciclar:
             print("  [VPN] Desconectando Surfshark...")
             _surfshark_subprocess(["--solo-desconectar"], timeout_s=40.0)
-            time.sleep(3.0)
+            time.sleep(1.5)
         ok_ui = _surfshark_subprocess(
             ["--ubicacion", ubicacion, "--espera", "3", "--timeout-busqueda", "8"],
             timeout_s=75.0,
         )
         print("  [VPN] Flush DNS...")
         _flush_dns_windows()
-        time.sleep(3.0)
+        time.sleep(1.5)
         ok, detalle = _esperar_geo_pais_registro(pais, 16.0, ip_anterior=ip_antes)
         if ok:
             print(f"  {Color.GREEN}[VPN] [OK] IP en {nombre}: {detalle}{Color.ENDC}")
@@ -9757,6 +11058,9 @@ def asegurar_vpn_pais_para_registro(
         print(f"  {Color.WARNING}[VPN] Tras el ciclo, ni UI ni geo confirman {nombre} ({detalle}).{Color.ENDC}")
 
     print(f"  {Color.FAIL}[VPN] No se confirmó {nombre} en automático.{Color.ENDC}")
+    if not interactivo:
+        print(f"  {Color.WARNING}[VPN] Modo no interactivo: no se espera confirmación manual.{Color.ENDC}")
+        return False
     print(f"  {Color.FAIL}[VPN] Conecta Surfshark a {nombre.upper()} a mano. "
           f"No se registra con otra IP.{Color.ENDC}")
     while True:
@@ -9790,22 +11094,18 @@ def asegurar_vpn_nigeria_para_registro(*, reciclar: bool, motivo: str, intentos_
     )
 
 
-# LATAM para opciones 4 y 9: cualquier IP vale; se rota entre estos países para no quemar una sola.
-SURFSHARK_LATAM_UBICS = (
-    "peru",
-    "bolivia",
-    "chile",
-    "brasil",
-    "ecuador",
-    "colombia",
-    "costa rica",
-    "argentina",
+# Países “cualquier IP vale” (opción 9 / pasos sin Argentina). Sin AR.
+SURFSHARK_LATAM_UBICS = tuple(
+    p["ubicacion"] for p in SURFSHARK_ROTACION_PIPELINE.values()
 )
-SURFSHARK_LATAM_CODIGOS = frozenset({"PE", "BO", "CL", "BR", "EC", "CO", "CR", "AR"})
-_SURFSHARK_LATAM_NOMBRES = (
-    "peru", "perú", "bolivia", "chile", "brazil", "brasil",
-    "ecuador", "colombia", "costa rica", "argentina",
+SURFSHARK_LATAM_CODIGOS = frozenset(
+    {p["codigo"] for p in SURFSHARK_ROTACION_PIPELINE.values()} | {"AR"}
 )
+_SURFSHARK_LATAM_NOMBRES = tuple(
+    n
+    for p in SURFSHARK_ROTACION_PIPELINE.values()
+    for n in (p.get("nombres_geo") or ())
+) + ("argentina",)
 _surfshark_latam_rr = 0
 
 
@@ -9839,8 +11139,9 @@ def asegurar_vpn_latam_para_oleadas(*, reciclar: bool, motivo: str, intentos_aut
     reciclar=False: si ya estamos en PE/BO/CL/BR/EC/CO/CR/AR, no toca la VPN.
     reciclar=True: desconecta y conecta el siguiente país de la lista (IP nueva).
     """
-    print(f"\n  {Color.CYAN}[VPN] {motivo} — LATAM preferida "
-          f"(Perú, Bolivia, Chile, Brasil, Ecuador, Colombia, Costa Rica, Argentina). "
+    print(f"\n  {Color.CYAN}[VPN] {motivo} — rotación Surfshark "
+          f"(Ecuador, Perú, Chile, Colombia, Brasil, Costa Rica, Bolivia, España, "
+          f"Panamá, Paraguay, Puerto Rico, Uruguay, Venezuela, México, Bahamas). "
           f"Cualquier IP vale.{Color.ENDC}")
     if not reciclar:
         info = consultar_geoip_publica(preferir=_geoip_es_latam_preferida)
@@ -10133,9 +11434,18 @@ def url_es_pagina_marketing(url: str) -> bool:
     u = (url or "").lower()
     if "account.tidal.com" in u or "login.tidal.com" in u or "listen.tidal.com" in u:
         return False
-    return any(p in u for p in (
+    if "ablink." in u:
+        return False
+    if any(p in u for p in (
         "/pricing", "/try-now", "/plans", "/premium", "/campaigns",
-    )) or u.rstrip("/").endswith("tidal.com") or u.rstrip("/").endswith("www.tidal.com")
+    )):
+        return True
+    # Home de campaña: https://tidal.com/?lid=xxxx (no es accept familiar)
+    path = url_path_tidal(u)
+    host_ok = "tidal.com" in u and "login." not in u and "account." not in u
+    if host_ok and path in ("", "/"):
+        return True
+    return u.rstrip("/").endswith("tidal.com") or u.rstrip("/").endswith("www.tidal.com")
 
 
 def url_path_tidal(url: str) -> str:
@@ -10207,9 +11517,14 @@ def url_llegada_coincide_destino(url_actual: str, url_destino: str) -> bool:
 
 
 def url_es_flujo_invitacion_familiar(url: str) -> bool:
-    """True si la pestaña ya salió de marketing y está en login/aceptar/familia."""
+    """True si la pestaña ya salió de marketing y está en login/aceptar/familia.
+
+    resetpass no cuenta: Tidal a veces redirige el ablink ahí si se sigue sin sesión.
+    """
     u = (url or "").lower()
     if not u or url_es_pagina_marketing(u):
+        return False
+    if "resetpass" in u or "reset-password" in u:
         return False
     return (
         url_es_login_o_cuenta(u)
@@ -10618,6 +11933,10 @@ def manejar_bloqueos_e_intervencion(page, subtitulo: str = "") -> None:
                 if not detectar_pantalla_antirobot(page):
                     print("  [Anti-bot] ¡Slider captcha resuelto automáticamente!")
                     return
+            if MODO_SIN_PROXY:
+                print("  [Anti-bot] IP bloqueada. Se cierra esta ventana para reciclar la IP "
+                      "y reabrirla, sin seguir en el mismo captcha.")
+                raise RuntimeError("Bloqueo/Captcha persistente no superado de forma automática.")
             continue
 
         # 3. En el intento 2 o superior, intentar recargar / recuperar
@@ -13334,14 +14653,21 @@ class TidalRegisterManager:
                           f"({codigo}) — reintento {ronda}/4...")
 
                 if not codigo:
+                    ultimo_error_codigo = (
+                        "No se pudo extraer el código de verificación del correo de manera automática."
+                    )
+                    # Resend ya se pulsó en ronda < 4; hay que seguir sondeando.
+                    if ronda < 4 and _pantalla_otp_registro():
+                        print(
+                            f"  [Registro] [{self.client_email}] Sin OTP en ronda {ronda}/4; "
+                            f"se espera el reenvío (ronda {ronda + 1}/4)..."
+                        )
+                        continue
                     if self._confirmar_registro_completado(timeout_s=8.0):
                         print(f"  [Registro] {Color.GREEN}[{self.client_email}] Cuenta ya registrada "
                               f"pese a no re-leer OTP. Continuando...{Color.ENDC}")
                         codigo_aceptado = True
                         break
-                    ultimo_error_codigo = (
-                        "No se pudo extraer el código de verificación del correo de manera automática."
-                    )
                     break
 
                 if codigo.startswith("http"):
@@ -13551,6 +14877,9 @@ class TidalRegisterManager:
                       f"(timeout). Se cierra y se sigue con el resto.{Color.ENDC}")
                 return False
             print(f"  {Color.FAIL}[ERROR] Falló el registro para {self.client_email}: {e}{Color.ENDC}")
+            if _registro_error_es_bloqueo(e):
+                self.fallo_por_captcha = True
+                return False
             try:
                 if self.page and not self.page.is_closed() and self._confirmar_registro_completado(timeout_s=12.0):
                     print(f"  [Registro] {Color.GREEN}[{self.client_email}] La cuenta SÍ quedó registrada. "
@@ -13573,6 +14902,9 @@ class TidalRegisterManager:
                       f"(timeout). Se cierra y se sigue con el resto.{Color.ENDC}")
                 return False
             print(f"  {Color.FAIL}[ERROR] Falló el registro para {self.client_email}: {e}{Color.ENDC}")
+            if _registro_error_es_bloqueo(e):
+                self.fallo_por_captcha = True
+                return False
             try:
                 if self.page and not self.page.is_closed() and self._confirmar_registro_completado(timeout_s=12.0):
                     print(f"  [Registro] {Color.GREEN}[{self.client_email}] La cuenta SÍ quedó registrada. "
@@ -13679,6 +15011,11 @@ class TidalRegisterManager:
                 self.page = pagina_vigente(self.page)
                 if not self.page or self.page.is_closed():
                     return False
+                try:
+                    if detectar_pantalla_antirobot(self.page):
+                        return False
+                except Exception:
+                    pass
                 curr_url = (self.page.url or "").lower()
                 if curr_url != last_url_printed:
                     print(f"  [Registro] URL actual: {curr_url}")
@@ -13751,6 +15088,11 @@ class TidalRegisterManager:
                         time.sleep(1.5)
                         aceptar_cookies_con_espera(self.page, intentos=1, pausa_s=0.15)
                         u2 = (self.page.url or "").lower()
+                        try:
+                            if detectar_pantalla_antirobot(self.page):
+                                return False
+                        except Exception:
+                            pass
                         if self._url_indica_cuenta_activa(u2) and "login.tidal.com" not in u2:
                             # Si hay formulario de login visible, la sesión no quedó
                             hay_login = False
@@ -15378,7 +16720,7 @@ class TidalResetPasswordManager:
             reset_baseline_id = 0
             
             # 2. Navegar a la página de restablecimiento con bypass y validación de carga
-            _max_intentos_nav = 5
+            _max_intentos_nav = 2 if MODO_SIN_PROXY else 5
             nav_reset_ok = False
             email_input = None
             for _intento_nav in range(1, _max_intentos_nav + 1):
@@ -15537,6 +16879,17 @@ class TidalResetPasswordManager:
                     if self._reset_solicitud_confirmada_ui(url_antes_submit, email_antes_visible):
                         click_exitoso = True
                         break
+                if not click_exitoso:
+                    try:
+                        if email_input:
+                            email_input.press("Enter")
+                        for _ in range(8):
+                            time.sleep(0.3)
+                            if self._reset_solicitud_confirmada_ui(url_antes_submit, email_antes_visible):
+                                click_exitoso = True
+                                break
+                    except Exception:
+                        pass
                 if click_exitoso:
                     break
 
@@ -15548,32 +16901,37 @@ class TidalResetPasswordManager:
                 except Exception:
                     pass
 
+            # La UI a veces no cambia aunque Tidal ya mandó el mail. Si se aborta aquí,
+            # la ronda siguiente toma un baseline posterior y ese correo queda invisible.
             if not click_exitoso:
-                raise RuntimeError(
-                    "No se confirmó el envío del formulario de restablecimiento "
-                    "(el formulario sigue activo o hay overlay/DataDome)."
+                print(
+                    f"  [Reset Pass] [{self.client_email}] La UI no confirmó Continuar. "
+                    f"Se busca el correo de reset por si el envío sí salió..."
                 )
+            else:
+                manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (Envío)")
+                print(f"  [Reset Pass] [{self.client_email}] Solicitud enviada. Reclamando enlace...")
 
-            manejar_bloqueos_e_intervencion(self.page, "Restablecer Contraseña (Envío)")
-
-            # Reclamar el enlace YA. Los reset de Tidal suelen tardar 15–40 s (no como el OTP).
-            # Si el worker no lo trae, caer a IMAP: FORWARD_TO reenvía copia a Gmail.
-            print(f"  [Reset Pass] [{self.client_email}] Solicitud enviada. Reclamando enlace...")
             enlace_box: dict = {"val": None, "usa_worker": False}
+            intentos_imap = 5 if not click_exitoso else 21
 
             def _claim_enlace_reset():
                 try:
                     from otp_worker_client import cubre_y_esperar_reset, worker_cubre_alias
                     if worker_cubre_alias(self.client_email):
                         enlace_box["usa_worker"] = True
-                        _, val = cubre_y_esperar_reset(self.client_email, max_wait_s=75.0)
+                        espera_worker = 20.0 if not click_exitoso else 75.0
+                        _, val = cubre_y_esperar_reset(self.client_email, max_wait_s=espera_worker)
                         if val and str(val).startswith("http"):
                             enlace_box["val"] = val
                             return
                         print(f"  [Reset Pass] [{self.client_email}] Worker sin enlace; "
                               f"fallback IMAP (forward a Gmail)...")
-                    for intento in range(1, 21):
-                        print(f"  [Reset Pass] Intento IMAP {intento}/20: buscando correo de reset...")
+                    for intento in range(1, intentos_imap + 1):
+                        print(
+                            f"  [Reset Pass] Intento IMAP {intento}/{intentos_imap}: "
+                            f"buscando correo de reset..."
+                        )
                         val = obtener_codigo_via_imap(
                             gmail_user=self.client_email,
                             required_keywords=KEYWORDS_RESTABLECER_PWD,
@@ -15597,14 +16955,25 @@ class TidalResetPasswordManager:
 
             print(f"  [Reset Pass] [{self.client_email}] Cerrando la ventana actual...")
             self.cerrar_navegador(liberar_proxy=False)
-            t_claim.join(timeout=140.0)
+            t_claim.join(timeout=36.0 if not click_exitoso else 140.0)
             enlace_reset = enlace_box.get("val")
 
             # Sincronización tras tener (o no) el enlace; el sondeo ya no espera esta barrera.
             self.esperar_barrera("post_solicitud")
 
             if not enlace_reset or not str(enlace_reset).startswith("http"):
+                if not click_exitoso:
+                    raise RuntimeError(
+                        "No se confirmó el envío del formulario de restablecimiento "
+                        "(el formulario sigue activo o hay overlay/DataDome) "
+                        "y no llegó correo de reset."
+                    )
                 raise RuntimeError("No se pudo extraer el enlace de reinicio automáticamente.")
+            if not click_exitoso:
+                print(
+                    f"  [Reset Pass] [{self.client_email}] La UI no cambió, "
+                    f"pero el correo de reset sí llegó. Se continúa."
+                )
                 
             # --- PARTE 2: Abrir el enlace de restablecimiento con el mismo proxy de Perú ---
             print(f"  [Reset Pass] [{self.client_email}] Abriendo nuevo navegador con el proxy de PERÚ...")
@@ -17585,10 +18954,19 @@ class TidalFamilyInviter:
             print("  [Inviter] Hilo de invitación finalizado y ventana de Chrome cerrada.")
 
 
-def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None, interactive: bool = True):
+def restablecer_contrasenas_tidal(
+    correos=None,
+    *,
+    headless: bool | None = None,
+    interactive: bool = True,
+    invitar: bool = True,
+    skip_vpn: bool = False,
+    max_ventanas: int = 5,
+):
     """Restablece contraseñas (opción 9).
 
     interactive=False: sin prompts (bot Telegram / VPS). headless=True por defecto en ese modo.
+    invitar=False: no lanza TidalFamilyInviter en paralelo (el pipeline usa invitar_miembros.py).
     Devuelve dict con ok_list / fail_list / success_count / fail_count.
     """
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
@@ -17650,6 +19028,15 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
         
     correos_lista = list(cuentas_map.keys())
     print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
+    n_w = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "worker")
+    n_i = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "imap")
+    n_s = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "ninguno")
+    if n_w:
+        print(f"  {Color.CYAN}[Worker] {n_w} @cheapmusic.best → enlace de reset por Email Worker.{Color.ENDC}")
+    if n_i:
+        print(f"  {Color.CYAN}[IMAP] {n_i} Gmail/otro dominio → enlace de reset por IMAP (passwords.txt).{Color.ENDC}")
+    if n_s:
+        print(f"  {Color.FAIL}[IMAP] {n_s} sin Email Worker ni App Password IMAP.{Color.ENDC}")
 
     if headless is None:
         if interactive:
@@ -17658,8 +19045,9 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
             ).strip().lower()
             headless = headless_opt in ("s", "si", "yes", "y")
         else:
-            headless = True
-    headless = bool(headless) or headless_forzado_por_entorno()
+            headless = headless_forzado_por_entorno()
+    else:
+        headless = bool(headless)
     if headless:
         print(f"  {Color.CYAN}[Opción 9] Modo headless activado.{Color.ENDC}")
 
@@ -17672,7 +19060,10 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
     if MODO_SIN_PROXY:
         print(f"\n{Color.CYAN}[Sin Proxy] Opción 9 con IP real (sin proxies residenciales).{Color.ENDC}")
         valid_pe_list = []
-        asegurar_vpn_latam_para_oleadas(reciclar=False, motivo="inicio opción 9")
+        if skip_vpn:
+            print(f"  {Color.CYAN}[VPN] Ya rotada por el pipeline; no se toca Surfshark aquí.{Color.ENDC}")
+        else:
+            asegurar_vpn_latam_para_oleadas(reciclar=False, motivo="inicio opción 9")
     else:
         print(f"\n{Color.CYAN}[Proxies PE] Habilitando proxies de Perú obligatorios para restablecimiento (Opción 9)...{Color.ENDC}")
         valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas + 5)
@@ -17688,15 +19079,19 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
     if not path_titular.exists():
         path_titular = SCRIPT_DIR / "perfiles" / "familiar_titular.txt"
 
-    trabajos_inv, sin_mapa_inv, path_titular = agrupar_miembros_por_titular_familiar(
-        correos_lista, path_titular
-    )
-    if sin_mapa_inv:
+    trabajos_inv, sin_mapa_inv, path_titular = ([], [], path_titular)
+    if invitar:
+        trabajos_inv, sin_mapa_inv, path_titular = agrupar_miembros_por_titular_familiar(
+            correos_lista, path_titular
+        )
+    else:
+        print(f"\n{Color.CYAN}[Opción 9] Invitación familiar omitida (la hará el pipeline).{Color.ENDC}")
+    if invitar and sin_mapa_inv:
         print(f"\n{Color.WARNING}[Paso 9] Sin titular en {path_titular.name} para "
               f"{len(sin_mapa_inv)} correo(s) (no pasarán a invitación):{Color.ENDC}")
         for m in sin_mapa_inv:
             print(f"    ✗ {m}")
-    if trabajos_inv:
+    if invitar and trabajos_inv:
         print(f"\n  [Paso 9] Invitaciones según bloques de {path_titular.name}:")
         total_m = 0
         for tj in trabajos_inv:
@@ -17762,11 +19157,11 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
             inviter_threads.append(th)
             th.start()
         print(f"  [Paso 9] Invitador(es) familiar(es) iniciado(s) en paralelo con los restablecimientos.")
-    else:
+    elif invitar:
         print(f"\n{Color.WARNING}[Paso 9] Ningún correo procesado figura como MIEMBROS en "
               f"{path_titular.name}. Se omite la invitación al plan familiar.{Color.ENDC}")
 
-    batch_size = 5
+    batch_size = max(1, min(5, int(max_ventanas or 5)))
     total_cuentas = len(correos_lista)
     n_oleadas = max(1, (total_cuentas + batch_size - 1) // batch_size)
     if total_cuentas > batch_size:
@@ -17778,9 +19173,13 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
               f"(hasta {batch_size} ventanas en simultáneo"
               f"{', IP real / Surfshark LATAM' if MODO_SIN_PROXY else ', solo proxy PE'})...{Color.ENDC}")
     if MODO_SIN_PROXY:
-        print(f"{Color.CYAN}VPN: cualquier IP vale. Se prefiere LATAM (Perú, Bolivia, Chile, Brasil, "
-              f"Ecuador, Colombia, Costa Rica, Argentina). Si el proceso es largo, cada 2 oleadas "
-              f"se recicla Surfshark a otro de esos países.{Color.ENDC}")
+        if skip_vpn:
+            print(f"{Color.CYAN}VPN: el pipeline ya rotó Surfshark; opción 9 no la cambia.{Color.ENDC}")
+        else:
+            print(f"{Color.CYAN}VPN: cualquier IP vale. Se rota entre Ecuador, Perú, Chile, Colombia, "
+                  f"Brasil, Costa Rica, Bolivia, España, Panamá, Paraguay, Puerto Rico, Uruguay, "
+                  f"Venezuela, México, Bahamas. Si el proceso es largo, cada 2 oleadas "
+                  f"se recicla Surfshark a otro de esos países.{Color.ENDC}")
     print()
 
     oleadas_completadas = 0
@@ -17803,14 +19202,15 @@ def restablecer_contrasenas_tidal(correos=None, *, headless: bool | None = None,
                   f"({b_start + 1}-{b_start + num_cuentas_lote} de {total_cuentas}) ==={Color.ENDC}")
             for c_o in lote_correos:
                 print(f"    • {c_o}")
-        vpn_latam_antes_de_oleada(
-            oleadas_completadas=oleadas_completadas, n_oleada=n_oleada, n_total=n_oleadas
-        )
+        if not skip_vpn:
+            vpn_latam_antes_de_oleada(
+                oleadas_completadas=oleadas_completadas, n_oleada=n_oleada, n_total=n_oleadas
+            )
 
         def restablecer_un_correo(idx_rel, correo):
             if idx_rel > 1:
-                # Escalonar arranque sin alargar tanto el lote (antes 0.35s → ~6.6s el último)
-                time.sleep((idx_rel - 1) * 0.15)
+                # Con IP real, 5 Chromes a la vez disparan DataDome. 1s entre ventanas.
+                time.sleep((idx_rel - 1) * (1.0 if MODO_SIN_PROXY else 0.15))
             idx_abs = b_start + idx_rel
             contrasena = cuentas_map[correo]
 
@@ -17905,7 +19305,7 @@ PATRON_MODO_CONTRASENA = r"(?:inicia|iniciar|usar|use|sign\s*in|log\s*in|entrar)
 
 class TidalAutoLoginManager:
     def __init__(self, client_email, target_pwd, proxy_pe_server=None, proxy_pe_user=None, proxy_pe_pass=None, headless=False, barreras=None, thread_index=1,
-                 mantener_ventana_si_falla=False):
+                 mantener_ventana_si_falla=False, elim_otp_coord=None):
         self.client_email = client_email
         self.target_pwd = target_pwd
         self.proxy_pe_server = None if MODO_SIN_PROXY else proxy_pe_server
@@ -17914,6 +19314,8 @@ class TidalAutoLoginManager:
         self.use_proxy = False if MODO_SIN_PROXY else (proxy_pe_server is not None)
         self.headless = headless
         self.barreras = barreras or {}
+        self.elim_otp_coord = elim_otp_coord
+        self._otp_eliminacion_pedido = False
         self.thread_index = thread_index
         self.mantener_ventana_si_falla = mantener_ventana_si_falla
         self.playwright = None
@@ -17926,6 +19328,7 @@ class TidalAutoLoginManager:
         self.login_ok = False
         self.export_ok = False
         self.eliminacion_ok = False
+        self.pwd_incorrecta = False
         self.correo_registrado_perfil = None
         self._rotaciones_antibot = 0
         self._recuperaciones_error_tidal = 0
@@ -18087,6 +19490,12 @@ class TidalAutoLoginManager:
             self.download_completed = False
 
     def abortar_barreras(self):
+        coord = getattr(self, "elim_otp_coord", None)
+        if coord:
+            try:
+                coord.fallo(self.client_email)
+            except Exception:
+                pass
         for name, b in self.barreras.items():
             try:
                 b.abort()
@@ -18857,13 +20266,30 @@ class TidalAutoLoginManager:
         return False
 
     def _error_codigo_eliminacion_visible(self) -> bool:
+        frases = (
+            "incorrecto", "inválido", "invalido", "invalid", "incorrect",
+            "verifica que el código", "verifica que el codigo",
+            "introducido sea correcto", "code you entered",
+            "that code isn't valid", "that code isnt valid",
+            "wrong code", "código no es válido", "codigo no es valido",
+        )
         for frame in self.page.frames:
             try:
+                txt = ""
+                try:
+                    txt = (frame.evaluate(
+                        "() => (document.body && document.body.innerText || '').toLowerCase()"
+                    ) or "")
+                except Exception:
+                    txt = ""
+                if any(f in txt for f in frases):
+                    return True
                 error_loc = (
                     frame.locator("text=incorrecto")
                     .or_(frame.locator("text=inválido"))
                     .or_(frame.locator("text=invalid"))
                     .or_(frame.locator("text=incorrect"))
+                    .or_(frame.locator("text=Verifica que el código"))
                     .first
                 )
                 if error_loc and error_loc.is_visible():
@@ -18945,16 +20371,20 @@ class TidalAutoLoginManager:
         return self.confirmar_cuenta_eliminada(confirm_timeout_s)
 
     def _reintentar_eliminacion_con_otp(self, codigo: str, max_intentos: int = 3) -> bool:
-        """Si acabamos en /profile con sesión (falso abandono), reabre el asistente y reintenta."""
-        codigo = (codigo or "").strip()
-        if not codigo:
-            return False
+        """Si acabamos en /profile con sesión (falso abandono), reabre el asistente y reintenta.
+
+        Nunca reutiliza un OTP que Tidal ya rechazó: espera uno nuevo del worker.
+        """
+        alias = (self.correo_registrado_perfil or self.client_email or "").strip()
+        omitir = set()
+        viejo = re.sub(r"\D", "", str(codigo or ""))
+        if viejo:
+            omitir.add(viejo)
         for intento in range(1, max_intentos + 1):
             print(f"  [Eliminación] [{self.client_email}] Recuperación post-/profile "
-                  f"({intento}/{max_intentos}): reabriendo asistente de eliminación...")
+                  f"({intento}/{max_intentos}): reabriendo asistente y pidiendo OTP NUEVO...")
             try:
                 self.page = pagina_vigente(self.page)
-                # Si ya estamos en login, el borrado sí ocurrió
                 url0 = (self.page.url or "").lower()
                 if "login.tidal.com" in url0 or "/authorize" in url0:
                     if self.confirmar_cuenta_eliminada(6.0):
@@ -18984,32 +20414,47 @@ class TidalAutoLoginManager:
                               f"pantalla OTP en recuperación {intento}.")
                         continue
                 if not self.hay_campo_codigo():
-                    # ¿Cuenta ya borrada?
                     if self.confirmar_cuenta_eliminada(6.0):
                         return True
                     continue
+                t_envio = time.time()
+                try:
+                    from otp_worker_client import marcar_baseline_worker
+                    marcar_baseline_worker(alias)
+                except Exception:
+                    pass
+                print(f"  [Eliminación] [{self.client_email}] Esperando 6s al OTP fresco...")
+                time.sleep(6.0)
+                nuevo = reclamar_otp_eliminacion_para_alias(
+                    alias=alias,
+                    after_email_id=0,
+                    preferir_otp_len=contar_cajas_otp_visibles(self.page) or 5,
+                    max_age_minutes=4,
+                    permitir_canonico=True,
+                    despues_de=t_envio,
+                    max_wait_s=35.0,
+                    omitir_codigos=omitir,
+                )
+                if not nuevo:
+                    print(f"  [Eliminación] [{self.client_email}] [WARN] Sin OTP fresco en "
+                          f"recuperación {intento}.")
+                    continue
+                codigo = nuevo
+                print(f"  [Eliminación] [{self.client_email}] OTP fresco para recuperación: {codigo}")
                 if not escribir_codigo_verificacion_inteligente(self.page, codigo):
                     print(f"  [Eliminación] [{self.client_email}] [WARN] No se pudo reescribir OTP.")
                     continue
+                time.sleep(0.7)
+                if self._error_codigo_eliminacion_visible():
+                    digs_bad = re.sub(r"\D", "", str(codigo))
+                    if digs_bad:
+                        omitir.add(digs_bad)
+                    print(f"  [Eliminación] [{self.client_email}] OTP {digs_bad} rechazado en "
+                          f"recuperación.")
+                    continue
                 if not esperar_boton_eliminar_cuenta_habilitado(self.page, timeout_s=8.0):
-                    print(f"  [Eliminación] [{self.client_email}] [WARN] delete-button no se habilitó "
-                          f"con este OTP (¿código incorrecto/ya usado?).")
-                    # Pedir OTP fresco
-                    nuevo = reclamar_otp_eliminacion_para_alias(
-                        alias=self.correo_registrado_perfil or self.client_email,
-                        after_email_id=0,
-                        preferir_otp_len=contar_cajas_otp_visibles(self.page) or 5,
-                        max_age_minutes=30,
-                        permitir_canonico=True,
-                    )
-                    if nuevo and nuevo != codigo:
-                        codigo = nuevo
-                        print(f"  [Eliminación] [{self.client_email}] OTP fresco para recuperación: {codigo}")
-                        escribir_codigo_verificacion_inteligente(self.page, codigo)
-                        if not esperar_boton_eliminar_cuenta_habilitado(self.page, timeout_s=6.0):
-                            continue
-                    else:
-                        continue
+                    print(f"  [Eliminación] [{self.client_email}] [WARN] delete-button no se habilitó.")
+                    continue
                 print(f"  [Eliminación] [{self.client_email}] Pulsando CTA en recuperación {intento}...")
                 if not clic_confirmar_eliminacion_asistente(self.page):
                     continue
@@ -19059,6 +20504,12 @@ class TidalAutoLoginManager:
             except Exception:
                 pass
 
+            if pagina_muestra_pwd_incorrecta(self.page) or self.pwd_incorrecta:
+                self.pwd_incorrecta = True
+                print(f"  [Login] {Color.FAIL}[STOP] [{self.client_email}] Contraseña incorrecta "
+                      f"durante la espera de sesión.{Color.ENDC}")
+                return False
+
             url = ""
             try:
                 url = self.page.url.lower()
@@ -19097,8 +20548,12 @@ class TidalAutoLoginManager:
                 break
 
             # Tras captcha/Turnstile el botón puede volver a "Inicia Sesión": reenviar una vez
-            if "login.tidal.com" in url and reintentos_login_btn < 2:
+            # (nunca si ya hay aviso de contraseña incorrecta).
+            if "login.tidal.com" in url and reintentos_login_btn < 1 and not self.pwd_incorrecta:
                 pwd_still = encontrar_locator_en_frames(self.page, ['input[type="password"]', 'input[name="password"]'])
+                if pwd_still and pagina_muestra_pwd_incorrecta(self.page):
+                    self.pwd_incorrecta = True
+                    return False
                 btn_login = encontrar_locator_en_frames(
                     self.page,
                     [
@@ -19210,6 +20665,13 @@ class TidalAutoLoginManager:
             pass
         # Si ya se tecleó, no pisar con setter nativo (Vue/React deja Continuar gris).
 
+    def _abortar_por_pwd_incorrecta(self, detalle: str = "Contraseña incorrecta.") -> bool:
+        self.pwd_incorrecta = True
+        print(f"  [Login] {Color.FAIL}[STOP] [{self.client_email}] {detalle} "
+              f"No se reintenta; se omite la cuenta.{Color.ENDC}")
+        self.abortar_barreras()
+        return self.finalizar_sin_exito(detalle)
+
     def escribir_password_login(self, pwd_input) -> None:
         """Teclea la contraseña para que Vue/React habilite 'Inicia sesión'."""
         try:
@@ -19316,8 +20778,16 @@ class TidalAutoLoginManager:
                     pwd_input.press("Enter")
                 except Exception:
                     pass
-
-            return self.esperar_establecimiento_sesion(40.0)
+            time.sleep(1.2)
+            if pagina_muestra_pwd_incorrecta(self.page):
+                self.pwd_incorrecta = True
+                print(f"  [Login] {Color.FAIL}[STOP] [{self.client_email}] Contraseña incorrecta "
+                      f"en re-login. No se reintenta.{Color.ENDC}")
+                return False
+            ok_sesion = self.esperar_establecimiento_sesion(20.0)
+            if self.pwd_incorrecta:
+                return False
+            return bool(ok_sesion)
         except Exception as e:
             print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Falló el re-login: {e}{Color.ENDC}")
             return False
@@ -19465,7 +20935,11 @@ class TidalAutoLoginManager:
         """modo='solo_login' → opción 10 (solo login, ventana abierta). modo='eliminar' → opción 15."""
         try:
             self.asegurar_navegador_abierto()
-            
+            # Opción 15: las N ventanas del lote deben estar abiertas a la vez
+            # antes de navegar, para pedir los OTP juntas.
+            if modo == "eliminar":
+                self.esperar_barrera("chrome")
+
             # 1. Abrir navegador y cargar página de login en Tidal con bypass de reputación
             print(f"  [Navegador] [{self.client_email}] Abriendo ventana de Chrome mediante proxy de Perú...")
             
@@ -19892,8 +21366,8 @@ class TidalAutoLoginManager:
                             )
                 
                 login_exitoso = login_por_codigo
-                for intento_pwd in range(1, 5):
-                    if login_exitoso:
+                for intento_pwd in range(1, 3):
+                    if login_exitoso or self.pwd_incorrecta:
                         break
                     # Solo confirmar en /profile si YA salimos del flujo de login (no navegar
                     # ahí mientras aún estamos en la pantalla de contraseña).
@@ -19907,31 +21381,30 @@ class TidalAutoLoginManager:
                             login_exitoso = True
                             break
                         # Antes: al 2º intento lanzaba RuntimeError sin recuperar (log s.im.plypretty803)
-                        if intento_pwd < 4:
-                            print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Sin campo contraseña "
-                                  f"(intento {intento_pwd}/4). Recuperando...{Color.ENDC}")
-                            pwd_input = _recuperar_campo_password(f"intento {intento_pwd}/4")
-                            if pwd_input:
-                                pass  # continuar al fill abajo
-                            elif self.hay_pantalla_codigo_login():
-                                print(f"  [Login] [{self.client_email}] Fallback a código de acceso del correo...")
-                                if not base_login_id:
-                                    base_login_id = obtener_max_email_id(self.client_email, "tidal")
-                                if self.iniciar_sesion_con_codigo_email(base_login_id):
-                                    login_exitoso = True
-                                    break
-                                continue
-                            else:
-                                # Rotar PE si hay antibot / error genérico
-                                if detectar_pantalla_antirobot(self.page) or es_pantalla_error_login_tidal(self.page):
-                                    try:
-                                        self.ejecutar_rotacion_proxy_y_recargar()
-                                    except Exception as e_rot:
-                                        print(f"  [Login] [{self.client_email}] [WARN] Rotación PE: {e_rot}")
-                                continue
-                        raise RuntimeError(
-                            "No se localizó el campo de contraseña tras varios reintentos de recuperación."
-                        )
+                        print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Sin campo contraseña "
+                              f"(intento {intento_pwd}/2). Recuperando...{Color.ENDC}")
+                        pwd_input = _recuperar_campo_password(f"intento {intento_pwd}/2")
+                        if pwd_input:
+                            pass  # continuar al fill abajo
+                        elif self.hay_pantalla_codigo_login():
+                            print(f"  [Login] [{self.client_email}] Fallback a código de acceso del correo...")
+                            if not base_login_id:
+                                base_login_id = obtener_max_email_id(self.client_email, "tidal")
+                            if self.iniciar_sesion_con_codigo_email(base_login_id):
+                                login_exitoso = True
+                                break
+                            continue
+                        else:
+                            if detectar_pantalla_antirobot(self.page) or es_pantalla_error_login_tidal(self.page):
+                                try:
+                                    self.ejecutar_rotacion_proxy_y_recargar()
+                                except Exception as e_rot:
+                                    print(f"  [Login] [{self.client_email}] [WARN] Rotación PE: {e_rot}")
+                            if intento_pwd >= 2:
+                                raise RuntimeError(
+                                    "No se localizó el campo de contraseña tras varios reintentos de recuperación."
+                                )
+                            continue
 
                     self.escribir_password_login(pwd_input)
                     time.sleep(0.35)
@@ -19973,47 +21446,31 @@ class TidalAutoLoginManager:
                             pwd_input.press("Enter")
                         except Exception:
                             pass
-                    time.sleep(2.5)
 
-                    # Detectar contraseña incorrecta YA, antes de esperar 40s a una sesión que no llegará
-                    error_pwd = False
-                    try:
-                        for frame in self.page.frames:
-                            try:
-                                body_text = (frame.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''") or "")
-                                if any(k in body_text for k in ["incorrecto", "incorrect", "invalid"]):
-                                    if any(k in body_text for k in ["contraseña", "password", "usuario", "username", "correo"]):
-                                        error_pwd = True
-                                        break
-                            except Exception:
-                                pass
-                        if not error_pwd:
-                            for err_sel in [
-                                "text='Contraseña incorrecta'", "text='Invalid password'", "text='Wrong password'",
-                                "[data-test='form-error']", ".error-message", "[role='alert']"
-                            ]:
-                                try:
-                                    loc_err = self.page.locator(err_sel).first
-                                    if loc_err.count() > 0 and loc_err.is_visible():
-                                        txt = loc_err.inner_text().lower()
-                                        if any(kw in txt for kw in ["contraseña", "password", "incorrect", "invalid"]):
-                                            error_pwd = True
-                                            break
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                    # Esperar el aviso rojo o el avance; no reenviar la misma clave 4 veces.
+                    limite_aviso = time.time() + 8.0
+                    while time.time() < limite_aviso:
+                        self.page = pagina_vigente(self.page)
+                        if pagina_muestra_pwd_incorrecta(self.page):
+                            return self._abortar_por_pwd_incorrecta()
+                        if self.es_sesion_activa():
+                            break
+                        if self.hay_pantalla_codigo_login() and not encontrar_locator_en_frames(
+                            self.page, ['input[type="password"]', 'input[name="password"]']
+                        ):
+                            break
+                        time.sleep(0.35)
 
-                    if error_pwd:
-                        print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Intento {intento_pwd}/2 de contraseña falló. Reintentando...{Color.ENDC}")
-                        time.sleep(1.0)
-                        continue
+                    if pagina_muestra_pwd_incorrecta(self.page) or self.pwd_incorrecta:
+                        return self._abortar_por_pwd_incorrecta()
 
                     # Esperar consolidación OAuth + confirmación en /profile (no marcar éxito por un flash)
-                    if self.esperar_establecimiento_sesion(35.0):
+                    if self.esperar_establecimiento_sesion(18.0):
                         login_exitoso = True
                         print(f"  [Login] {Color.GREEN}[OK] [{self.client_email}] Sesión consolidada tras contraseña.{Color.ENDC}")
                         break
+                    if self.pwd_incorrecta:
+                        return self._abortar_por_pwd_incorrecta()
 
                     if self.hay_pantalla_codigo_login() or self.hay_control_modo_contrasena():
                         print(f"  [Login] [{self.client_email}] Tras la contraseña Tidal pidió código; "
@@ -20024,6 +21481,21 @@ class TidalAutoLoginManager:
                             login_exitoso = True
                             break
 
+                    sigue_form_pwd = encontrar_locator_en_frames(
+                        self.page, ['input[type="password"]', 'input[name="password"]']
+                    )
+                    if sigue_form_pwd and intento_pwd >= 2:
+                        if detectar_pantalla_antirobot(self.page):
+                            break
+                        return self._abortar_por_pwd_incorrecta(
+                            "Contraseña rechazada (Tidal sigue en el formulario)."
+                        )
+                    if sigue_form_pwd:
+                        print(f"  [Login] {Color.WARNING}[WARN] [{self.client_email}] Sigue el formulario "
+                              f"tras enviar la clave; un solo reenvío.{Color.ENDC}")
+
+                if self.pwd_incorrecta:
+                    return self._abortar_por_pwd_incorrecta()
                 if not login_exitoso:
                     print(f"\n  {Color.FAIL}{Color.BOLD}✖ [LOGIN] NO SE PUDO INICIAR SESIÓN PARA: {self.client_email}{Color.ENDC}\n")
                     self.abortar_barreras()
@@ -20061,6 +21533,8 @@ class TidalAutoLoginManager:
             return self._esperar_sesion_manual_indefinida()
 
         except Exception as e:
+            if self.pwd_incorrecta:
+                return self._abortar_por_pwd_incorrecta()
             print(f"  {Color.FAIL}[ERROR] Excepción general en el proceso para {self.client_email}: {e}{Color.ENDC}")
             self.abortar_barreras()
             return self.finalizar_sin_exito("El proceso terminó con una excepción.")
@@ -20171,6 +21645,247 @@ class TidalAutoLoginManager:
               f"'Correo electrónico' en Información general.{Color.ENDC}")
         return None
 
+
+    def _completar_eliminacion_con_otp(
+        self,
+        *,
+        aliases_imap,
+        buzones_extra,
+        t_envio_otp: float,
+        prefer_len: int,
+        lote: bool = False,
+        codigo_prefetch: str | None = None,
+    ) -> bool:
+        """Worker (o IMAP) + escribir OTP + confirmar borrado. True si la cuenta quedó eliminada.
+
+        Debe ejecutarse con el lock de escritura del lote (una ventana a la vez).
+        El código ya debería estar en codigo_prefetch (recogido ANTES del lock).
+        """
+        codigo_eliminacion = None
+        codigos_rechazados: set[str] = set()
+        pre = (codigo_prefetch or "").strip()
+        if pre:
+            print(f"  [Eliminación] [{self.client_email}] OTP ya recogido ({pre}); "
+                  f"se escribe sin esperar IMAP.")
+            codigo_eliminacion = pre
+        else:
+            print(f"  [Eliminación] [{self.client_email}] Buscando código NUEVO "
+                  f"(destinatario EXACTO: {self.correo_registrado_perfil})...")
+        max_intentos_otp = 6 if lote else 12
+        reenvios = (5,) if lote else (6, 10)
+        for intento in range(1, max_intentos_otp + 1):
+            if codigo_eliminacion:
+                break
+            if intento in reenvios:
+                try:
+                    if self.forzar_reenvio_codigo():
+                        t_envio_otp = time.time()
+                        try:
+                            from otp_worker_client import marcar_baseline_worker
+                            marcar_baseline_worker(self.correo_registrado_perfil)
+                        except Exception:
+                            pass
+                        print(f"  [Eliminación] [{self.client_email}] Reenvío disparado. "
+                              f"Esperando 4s al código fresco...")
+                        time.sleep(4.0)
+                except Exception as e_reenv:
+                    print(f"  [Eliminación] [{self.client_email}] [WARN] Reenvío: {e_reenv}")
+            after_pref = 0
+            espera = 8.0 if intento == 1 else 5.0
+            print(f"  [Eliminación] [{self.client_email}] Intento {intento}/{max_intentos_otp}: "
+                  f"esperando OTP de eliminación (hasta {espera:.0f}s)...")
+            try:
+                codigo_eliminacion = reclamar_otp_eliminacion_para_alias(
+                    alias=self.correo_registrado_perfil,
+                    after_email_id=after_pref,
+                    preferir_otp_len=prefer_len,
+                    max_age_minutes=10,
+                    permitir_canonico=(intento >= 3),
+                    despues_de=t_envio_otp,
+                    max_wait_s=espera,
+                    omitir_codigos=codigos_rechazados,
+                )
+                extra_intentos = reenvios + (max_intentos_otp,)
+                imap_extra = True
+                try:
+                    from otp_worker_client import usar_imap_gmail
+                    imap_extra = usar_imap_gmail(self.correo_registrado_perfil)
+                except Exception:
+                    imap_extra = True
+                if (
+                    not codigo_eliminacion
+                    and imap_extra
+                    and intento in extra_intentos
+                    and buzones_extra
+                ):
+                    for buzon in buzones_extra[:4]:
+                        codigo_eliminacion = obtener_codigo_via_imap(
+                            gmail_user=buzon,
+                            required_keywords=KEYWORDS_ELIMINACION_CUENTA,
+                            query_exclude=EXCLUDE_ELIMINACION_CUENTA,
+                            after_email_id=0,
+                            max_age_minutes=8,
+                            aliases_solo=aliases_imap,
+                            preferir_otp_len=prefer_len,
+                            exigir_destinatario_exacto=True,
+                            silencioso=True,
+                            omitir_worker=True,
+                        )
+                        if codigo_eliminacion:
+                            digs_x = re.sub(r"\D", "", str(codigo_eliminacion))
+                            if digs_x in codigos_rechazados:
+                                codigo_eliminacion = None
+                                continue
+                            print(f"  [Eliminación] [{self.client_email}] Código hallado en buzón "
+                                  f"'{buzon}' (otro Gmail; match por puntos).")
+                            break
+            except Exception as e_imap:
+                print(f"  [Eliminación] [{self.client_email}] [WARN] IMAP intento {intento}: {e_imap}")
+                codigo_eliminacion = None
+
+            if codigo_eliminacion:
+                digs = re.sub(r"\D", "", str(codigo_eliminacion))
+                n_ahora = contar_cajas_otp_visibles(self.page) or prefer_len
+                if n_ahora >= 5 and len(digs) != n_ahora:
+                    print(f"  [Eliminación] [{self.client_email}] OTP '{digs}' "
+                          f"({len(digs)} dígitos) vs {n_ahora} cajas visibles; "
+                          f"se intentará escribir/adaptar de todos modos.")
+                break
+            if intento < max_intentos_otp:
+                time.sleep(0.2)
+
+        if not codigo_eliminacion:
+            print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se obtuvo el código "
+                  f"vía IMAP en {self.correo_registrado_perfil}.{Color.ENDC}")
+            return False
+
+        print(f"  [Eliminación] [{self.client_email}] {Color.GREEN}Código obtenido: "
+              f"{codigo_eliminacion}{Color.ENDC}")
+        try:
+            self.page = pagina_vigente(self.page)
+            self.page.bring_to_front()
+        except Exception:
+            pass
+        if not self.hay_campo_codigo():
+            print(f"  [Eliminación] [{self.client_email}] [WARN] Sin cajas OTP visibles "
+                  f"tras IMAP; reabriendo asistente...")
+            try:
+                self.page.goto(
+                    "https://account.tidal.com/account-deletion",
+                    wait_until="domcontentloaded",
+                    timeout=35000,
+                )
+                time.sleep(1.5)
+                aceptar_cookies_con_espera(self.page)
+                self.recorrer_asistente_eliminacion()
+            except Exception as e_re:
+                print(f"  [Eliminación] [{self.client_email}] [WARN] Reapertura: {e_re}")
+
+        codigo_escrito = False
+        for intento_write in range(1, 5):
+            if not self.hay_campo_codigo():
+                print(f"  [Eliminación] [{self.client_email}] [WARN] Intento escritura "
+                      f"{intento_write}/4: aún no hay campo de código.")
+                time.sleep(1.0)
+                continue
+            if escribir_codigo_verificacion_inteligente(self.page, codigo_eliminacion):
+                time.sleep(0.8)
+                if self._error_codigo_eliminacion_visible():
+                    digs_bad = re.sub(r"\D", "", str(codigo_eliminacion))
+                    if digs_bad:
+                        codigos_rechazados.add(digs_bad)
+                    print(f"  [Eliminación] [{self.client_email}] {Color.FAIL}Tidal rechazó "
+                          f"el código {digs_bad or codigo_eliminacion}. Se espera uno NUEVO "
+                          f"(no se reutiliza).{Color.ENDC}")
+                    try:
+                        from otp_worker_client import marcar_baseline_worker
+                        marcar_baseline_worker(self.correo_registrado_perfil)
+                    except Exception:
+                        pass
+                    t_envio_otp = time.time()
+                    fresco = reclamar_otp_eliminacion_para_alias(
+                        alias=self.correo_registrado_perfil,
+                        after_email_id=0,
+                        preferir_otp_len=prefer_len,
+                        max_age_minutes=4,
+                        permitir_canonico=True,
+                        despues_de=t_envio_otp,
+                        max_wait_s=35.0,
+                        omitir_codigos=codigos_rechazados,
+                    )
+                    if fresco:
+                        codigo_eliminacion = fresco
+                        print(f"  [Eliminación] [{self.client_email}] OTP fresco: {fresco}")
+                        continue
+                    break
+                btn_ready = esperar_boton_eliminar_cuenta_habilitado(self.page, timeout_s=8.0)
+                if btn_ready:
+                    codigo_escrito = True
+                    break
+                print(f"  [Eliminación] [{self.client_email}] [WARN] OTP escrito pero "
+                      f"button.delete-button sigue deshabilitado (intento {intento_write}/4). "
+                      f"Reescribiendo...")
+                time.sleep(0.8)
+                continue
+            print(f"  [Eliminación] [{self.client_email}] [WARN] Escritura OTP falló "
+                  f"({intento_write}/4). Reintentando...")
+            time.sleep(1.2)
+
+        if not codigo_escrito:
+            print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo ingresar "
+                  f"el código de forma que habilite button.delete-button del asistente."
+                  f"{Color.ENDC}")
+            return False
+
+        print(f"  [Eliminación] [{self.client_email}] Código ingresado correctamente "
+              f"(CTA delete-button habilitado).")
+        time.sleep(0.6)
+        print(f"  [Eliminación] [{self.client_email}] Confirmando eliminación "
+              f"(asistente, no menú)...")
+        clicked = clic_confirmar_eliminacion_asistente(self.page)
+        if not clicked:
+            print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo pulsar "
+                  f"button.delete-button del asistente.{Color.ENDC}")
+            return False
+
+        time.sleep(1.0)
+        try:
+            url_mid = (pagina_vigente(self.page).url or "").lower()
+        except Exception:
+            url_mid = ""
+        if "view=verify" in url_mid and self.hay_campo_codigo():
+            print(f"  [Eliminación] [{self.client_email}] [WARN] Seguimos en "
+                  f"view=verify tras el clic; reintentando CTA...")
+            time.sleep(0.8)
+            clic_confirmar_eliminacion_asistente(self.page)
+            time.sleep(1.2)
+
+        if self.esperar_y_confirmar_eliminacion(8.0, confirm_timeout_s=10.0):
+            print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
+                  f"eliminada correctamente.{Color.ENDC}")
+            return True
+
+        url_post = ""
+        try:
+            url_post = (pagina_vigente(self.page).url or "").lower()
+        except Exception:
+            pass
+        if url_parece_exito_o_fin_eliminacion(url_post):
+            print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
+                  f"eliminada (URL login/authorize).{Color.ENDC}")
+            return True
+
+        print(f"  [Eliminación] [{self.client_email}] {Color.WARNING}Borrado "
+              f"no confirmado (URL={url_post[:70] or '?'}). "
+              f"Reintentando asistente...{Color.ENDC}")
+        if self._reintentar_eliminacion_con_otp(codigo_eliminacion, max_intentos=3):
+            print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
+                  f"eliminada tras recuperación.{Color.ENDC}")
+            return True
+        print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] "
+              f"No se pudo confirmar el borrado tras reintentos.{Color.ENDC}")
+        return False
+
     def _flujo_eliminar_cuenta_opcion15(self) -> bool:
         """Tras login: verifica correo del perfil en passwords.txt (IMAP) y elimina la cuenta."""
         print(f"  [Eliminación] [{self.client_email}] Modo opción 15: verificar correo registrado → "
@@ -20210,23 +21925,27 @@ class TidalAutoLoginManager:
                       f"registrado son hermanos Gmail (puntos distintos = cuentas Tidal distintas). "
                       f"El OTP se leerá del correo registrado EXACTO.{Color.ENDC}")
 
-        if not tiene_contrasena_imap_registrada(self.correo_registrado_perfil):
+        canal_otp, detalle_otp = canal_otp_para_correo(self.correo_registrado_perfil)
+        if canal_otp == "worker":
+            print(f"  [OTP] {Color.GREEN}[OK] [{self.client_email}] '{self.correo_registrado_perfil}' "
+                  f"→ {detalle_otp}.{Color.ENDC}")
+        elif canal_otp == "imap":
+            user_imap, _pwd_imap = obtener_credenciales_imap_reales(self.correo_registrado_perfil)
+            print(f"  [IMAP] {Color.GREEN}[OK] [{self.client_email}] '{self.correo_registrado_perfil}' "
+                  f"está en passwords.txt (buzón IMAP: {user_imap or self.correo_registrado_perfil})."
+                  f"{Color.ENDC}")
+        else:
             print(f"  [IMAP] {Color.FAIL}[ABORTADO] [{self.client_email}] El correo registrado "
-                  f"'{self.correo_registrado_perfil}' NO tiene App Password / IMAP en "
-                  f"passwords.txt.{Color.ENDC}")
-            print(f"  [IMAP] Sin eso no llegaría el código de eliminación. Añádelo y reintenta.")
+                  f"'{self.correo_registrado_perfil}' no es @cheapmusic.best y NO tiene App Password "
+                  f"IMAP en passwords.txt.{Color.ENDC}")
+            print(f"  [IMAP] Añade gmail_app_password_{self.correo_registrado_perfil}=<app password> "
+                  f"y reintenta.")
             self.abortar_barreras()
             return self.finalizar_sin_exito(
                 f"Correo del perfil '{self.correo_registrado_perfil}' ausente en passwords.txt."
             )
 
-        user_imap, _pwd_imap = obtener_credenciales_imap_reales(self.correo_registrado_perfil)
-        print(f"  [IMAP] {Color.GREEN}[OK] [{self.client_email}] '{self.correo_registrado_perfil}' "
-              f"está en passwords.txt (buzón IMAP: {user_imap or self.correo_registrado_perfil})."
-              f"{Color.ENDC}")
-
         # --- Eliminación ---
-        exito_eliminacion = False
         print(f"\n  [Eliminación] [{self.client_email}] Iniciando eliminación de cuenta Tidal...")
         try:
             try:
@@ -20294,6 +22013,10 @@ class TidalAutoLoginManager:
                 if "account-deletion" not in (self.page.url or ""):
                     raise RuntimeError("Tidal no permitió abrir el asistente de eliminación de cuenta.")
 
+            coord = getattr(self, "elim_otp_coord", None)
+            if coord:
+                coord.esperar_para_pedir_otp(self.client_email)
+
             if not self.recorrer_asistente_eliminacion():
                 raise RuntimeError("No se alcanzó la pantalla del código del asistente de eliminación.")
 
@@ -20302,186 +22025,83 @@ class TidalAutoLoginManager:
                     f"Tidal enviaría el código a un correo distinto de '{self.correo_registrado_perfil}'."
                 )
 
-            codigo_eliminacion = None
-            # Cuántas cajas OTP hay (Tidal eliminación suele ser 5 dígitos). Guía la extracción IMAP.
+            t_envio_otp = time.time()
+            try:
+                from otp_worker_client import marcar_baseline_worker
+                marcar_baseline_worker(self.correo_registrado_perfil)
+            except Exception:
+                pass
+            self._otp_eliminacion_pedido = True
+            print(f"  [Eliminación] [{self.client_email}] Código pedido (pantalla OTP).")
+
             n_cajas_otp = contar_cajas_otp_visibles(self.page)
             prefer_len = n_cajas_otp if n_cajas_otp in (5, 6) else 5
             print(f"  [Eliminación] [{self.client_email}] Cajas OTP visibles: {n_cajas_otp or '?'}; "
                   f"se prioriza código de {prefer_len} dígitos.")
 
-            print(f"  [Eliminación] [{self.client_email}] Buscando código en IMAP "
-                  f"(destinatario EXACTO con puntos: {self.correo_registrado_perfil})...")
-            for intento in range(1, 19):
-                if intento in (2, 8, 14):
-                    try:
-                        self.forzar_reenvio_codigo()
-                    except Exception as e_reenv:
-                        print(f"  [Eliminación] [{self.client_email}] [WARN] Reenvío: {e_reenv}")
-                # Baseline solo al inicio; luego mirar recientes (códigos ya en bandeja).
-                usar_baseline = intento <= 2
-                after_pref = (
-                    baselines_por_buzon.get(buzones_preferidos[0], 0) if usar_baseline else 0
+            codigo_prefetch = None
+
+            def _recoger_otp_eliminacion() -> None:
+                nonlocal codigo_prefetch
+                codigo_prefetch = reclamar_otp_eliminacion_para_alias(
+                    alias=self.correo_registrado_perfil,
+                    after_email_id=0,
+                    preferir_otp_len=prefer_len,
+                    max_age_minutes=10,
+                    permitir_canonico=False,
+                    despues_de=t_envio_otp,
+                    max_wait_s=10.0,
                 )
-                print(f"  [Eliminación] [{self.client_email}] Intento {intento}/18: "
-                      f"buscando correo de eliminación"
-                      f"{'' if usar_baseline else ' (ventana reciente sin baseline)'}...")
-                try:
-                    # Un hilo por buzón: evita colapsar Gmail cuando hay muchos alias a la vez.
-                    # Desde intento 3 permite To: canónico repartido 1 UID/hilo si no hay exacto.
-                    codigo_eliminacion = reclamar_otp_eliminacion_para_alias(
-                        alias=self.correo_registrado_perfil,
-                        after_email_id=after_pref,
-                        preferir_otp_len=prefer_len,
-                        max_age_minutes=45,
-                        permitir_canonico=(intento >= 3),
-                    )
-                    # Otros Gmail solo si el preferido no tiene nada (casos raros)
-                    if not codigo_eliminacion and intento in (6, 12, 18) and buzones_extra:
-                        for buzon in buzones_extra[:4]:
-                            codigo_eliminacion = obtener_codigo_via_imap(
-                                gmail_user=buzon,
-                                required_keywords=KEYWORDS_ELIMINACION_CUENTA,
-                                query_exclude=EXCLUDE_ELIMINACION_CUENTA,
-                                after_email_id=0,
-                                max_age_minutes=45,
-                                aliases_solo=aliases_imap,
-                                preferir_otp_len=prefer_len,
-                                exigir_destinatario_exacto=True,
-                                silencioso=True,
-                            )
-                            if codigo_eliminacion:
-                                print(f"  [Eliminación] [{self.client_email}] Código hallado en buzón "
-                                      f"'{buzon}' (otro Gmail; match por puntos).")
-                                break
-                except Exception as e_imap:
-                    print(f"  [Eliminación] [{self.client_email}] [WARN] IMAP intento {intento}: {e_imap}")
-                    codigo_eliminacion = None
 
-                if codigo_eliminacion:
-                    digs = re.sub(r"\D", "", str(codigo_eliminacion))
-                    n_ahora = contar_cajas_otp_visibles(self.page) or prefer_len
-                    if n_ahora >= 5 and len(digs) != n_ahora:
-                        print(f"  [Eliminación] [{self.client_email}] OTP '{digs}' "
-                              f"({len(digs)} dígitos) vs {n_ahora} cajas visibles; "
-                              f"se intentará escribir/adaptar de todos modos.")
-                    break
-                if intento < 18:
-                    time.sleep(2.5)
-
-            if not codigo_eliminacion:
-                print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se obtuvo el código "
-                      f"vía IMAP en {self.correo_registrado_perfil}.{Color.ENDC}")
+            if coord:
+                coord.esperar_despues_de_pedir_otp(
+                    self.client_email, recolectar=_recoger_otp_eliminacion
+                )
             else:
-                print(f"  [Eliminación] [{self.client_email}] {Color.GREEN}Código obtenido: "
-                      f"{codigo_eliminacion}{Color.ENDC}")
-                # Tras la espera IMAP la pestaña puede haber perdido foco o el DOM OTP.
                 try:
-                    self.page = pagina_vigente(self.page)
-                    self.page.bring_to_front()
+                    from otp_worker_client import worker_cubre_alias
+                    cubre = worker_cubre_alias(self.correo_registrado_perfil)
                 except Exception:
-                    pass
-                if not self.hay_campo_codigo():
-                    print(f"  [Eliminación] [{self.client_email}] [WARN] Sin cajas OTP visibles "
-                          f"tras IMAP; reabriendo asistente...")
-                    try:
-                        self.page.goto(
-                            "https://account.tidal.com/account-deletion",
-                            wait_until="domcontentloaded",
-                            timeout=35000,
-                        )
-                        time.sleep(1.5)
-                        aceptar_cookies_con_espera(self.page)
-                        self.recorrer_asistente_eliminacion()
-                    except Exception as e_re:
-                        print(f"  [Eliminación] [{self.client_email}] [WARN] Reapertura: {e_re}")
-
-                codigo_escrito = False
-                for intento_write in range(1, 5):
-                    if not self.hay_campo_codigo():
-                        print(f"  [Eliminación] [{self.client_email}] [WARN] Intento escritura "
-                              f"{intento_write}/4: aún no hay campo de código.")
-                        time.sleep(1.0)
-                        continue
-                    if escribir_codigo_verificacion_inteligente(self.page, codigo_eliminacion):
-                        # Éxito real = delete-button del asistente habilitado (NO el menú lateral)
-                        btn_ready = esperar_boton_eliminar_cuenta_habilitado(self.page, timeout_s=8.0)
-                        if btn_ready:
-                            codigo_escrito = True
-                            break
-                        print(f"  [Eliminación] [{self.client_email}] [WARN] OTP escrito pero "
-                              f"button.delete-button sigue deshabilitado (intento {intento_write}/4). "
-                              f"Reescribiendo...")
-                        time.sleep(0.8)
-                        continue
-                    print(f"  [Eliminación] [{self.client_email}] [WARN] Escritura OTP falló "
-                          f"({intento_write}/4). Reintentando...")
-                    time.sleep(1.2)
-
-                if codigo_escrito:
-                    print(f"  [Eliminación] [{self.client_email}] Código ingresado correctamente "
-                          f"(CTA delete-button habilitado).")
-                    time.sleep(0.6)
-                    print(f"  [Eliminación] [{self.client_email}] Confirmando eliminación "
-                          f"(asistente, no menú)...")
-                    clicked = clic_confirmar_eliminacion_asistente(self.page)
-                    if not clicked:
-                        print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo pulsar "
-                              f"button.delete-button del asistente.{Color.ENDC}")
-                    else:
-                        time.sleep(1.0)
-                        # Si tras el clic seguimos en verify con OTP, el clic no aplicó
-                        try:
-                            url_mid = (pagina_vigente(self.page).url or "").lower()
-                        except Exception:
-                            url_mid = ""
-                        if "view=verify" in url_mid and self.hay_campo_codigo():
-                            print(f"  [Eliminación] [{self.client_email}] [WARN] Seguimos en "
-                                  f"view=verify tras el clic; reintentando CTA...")
-                            time.sleep(0.8)
-                            clic_confirmar_eliminacion_asistente(self.page)
-                            time.sleep(1.2)
-
-                        if self.esperar_y_confirmar_eliminacion(8.0, confirm_timeout_s=10.0):
-                            print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
-                                  f"eliminada correctamente.{Color.ENDC}")
-                            exito_eliminacion = True
-                        else:
-                            url_post = ""
-                            try:
-                                url_post = (pagina_vigente(self.page).url or "").lower()
-                            except Exception:
-                                pass
-                            if url_parece_exito_o_fin_eliminacion(url_post):
-                                print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
-                                      f"eliminada (URL login/authorize).{Color.ENDC}")
-                                exito_eliminacion = True
-                            else:
-                                # /profile con sesión NO es abandono definitivo: a menudo el script
-                                # navega ahí para verificar antes de que el CTA termine, o el OTP
-                                # era incorrecto. Reabrir asistente y reintentar.
-                                print(f"  [Eliminación] [{self.client_email}] {Color.WARNING}Borrado "
-                                      f"no confirmado (URL={url_post[:70] or '?'}). "
-                                      f"Reintentando asistente...{Color.ENDC}")
-                                if self._reintentar_eliminacion_con_otp(codigo_eliminacion, max_intentos=3):
-                                    print(f"  [Eliminación] {Color.GREEN}[OK] Cuenta {self.client_email} "
-                                          f"eliminada tras recuperación.{Color.ENDC}")
-                                    exito_eliminacion = True
-                                else:
-                                    print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] "
-                                          f"No se pudo confirmar el borrado tras reintentos."
-                                          f"{Color.ENDC}")
+                    cubre = False
+                if cubre:
+                    print(f"  [Eliminación] [{self.client_email}] Código en camino. "
+                          f"Consultando worker...")
+                    _recoger_otp_eliminacion()
                 else:
-                    print(f"  {Color.FAIL}[Eliminación] [{self.client_email}] No se pudo ingresar "
-                          f"el código de forma que habilite button.delete-button del asistente."
-                          f"{Color.ENDC}")
+                    print(f"  [Eliminación] [{self.client_email}] Código en camino. Esperando 4s "
+                          f"(Gmail; el OTP caduca a los 3 min)...")
+                    time.sleep(4.0)
+
+            _turno = coord.escritura_lock if coord else contextlib.nullcontext()
+            with _turno:
+                if coord:
+                    print(f"  [Eliminación] [{self.client_email}] Turno: escribir OTP y terminar "
+                          f"esta ventana antes de pasar a la siguiente...")
+                try:
+                    if self._completar_eliminacion_con_otp(
+                        aliases_imap=aliases_imap,
+                        buzones_extra=buzones_extra,
+                        t_envio_otp=t_envio_otp,
+                        prefer_len=prefer_len,
+                        lote=bool(coord),
+                        codigo_prefetch=codigo_prefetch,
+                    ):
+                        self.eliminacion_ok = True
+                        print(f"  [Navegador] [{self.client_email}] Cerrando ventana de Chrome...")
+                        self.cerrar_recursos()
+                        return True
+                    if coord:
+                        print(f"  [Eliminación] [{self.client_email}] Turno fallido; "
+                              f"cerrando esta ventana antes de la siguiente...")
+                    return self.finalizar_sin_exito("No se completó la eliminación de la cuenta.")
+                except Exception as ex_write:
+                    print(f"  {Color.FAIL}[Eliminación] [ERROR] [{self.client_email}] {ex_write}{Color.ENDC}")
+                    self.abortar_barreras()
+                    return self.finalizar_sin_exito("No se completó la eliminación de la cuenta.")
         except Exception as ex_el:
             print(f"  {Color.FAIL}[Eliminación] [ERROR] [{self.client_email}] {ex_el}{Color.ENDC}")
+            self.abortar_barreras()
 
-        self.eliminacion_ok = exito_eliminacion
-        if exito_eliminacion:
-            print(f"  [Navegador] [{self.client_email}] Cerrando ventana de Chrome...")
-            self.cerrar_recursos()
-            return True
         return self.finalizar_sin_exito("No se completó la eliminación de la cuenta.")
 
     def cerrar_recursos(self):
@@ -20718,49 +22338,89 @@ def iniciar_sesion_automatico_tidal(correos):
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
 
 
-def eliminar_cuentas_tidal_automatico_opcion15(correos):
-    """Opción 15: eliminar cuenta (proxy PE) y luego registrar de nuevo (proxy NG + PE pago)."""
+def eliminar_cuentas_tidal_automatico_opcion15(
+    correos,
+    *,
+    interactive: bool = True,
+    headless: bool | None = None,
+    solo_eliminar: bool = False,
+    mantener_ventanas: bool | None = None,
+    max_ventanas: int = 5,
+):
+    """Opción 15: eliminar cuenta (proxy PE) y luego registrar de nuevo (proxy NG + PE pago).
+
+    solo_eliminar=True: corta tras la fase 1 (el pipeline registra después con opción 8 / AR).
+    interactive=False: sin prompts. Devuelve dict con ok_list / fail_list / pwd_incorrecta_list.
+    """
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.BLUE}{Color.BOLD}   ELIMINAR + REGISTRAR CUENTA TIDAL AUTOMÁTICO{Color.ENDC}")
+    titulo = "ELIMINAR CUENTA TIDAL" if solo_eliminar else "ELIMINAR + REGISTRAR CUENTA TIDAL AUTOMÁTICO"
+    print(f"{Color.BLUE}{Color.BOLD}   {titulo}{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
-    print(f"{Color.CYAN}Fase 1 (Perú): login → leer correo del perfil → IMAP → eliminar.{Color.ENDC}")
-    print(f"{Color.CYAN}Fase 2 (Nigeria): registrar de nuevo las cuentas eliminadas "
-          f"(pago con proxy PE).{Color.ENDC}")
+    print(f"{Color.CYAN}Fase 1 (Perú): login → leer correo del perfil → IMAP / Email Worker → eliminar.{Color.ENDC}")
+    if solo_eliminar:
+        print(f"{Color.CYAN}Fase 2 omitida: el registro lo hace el pipeline (opción 8 / Argentina).{Color.ENDC}")
+    else:
+        print(f"{Color.CYAN}Fase 2 (Nigeria): registrar de nuevo las cuentas eliminadas "
+              f"(pago con proxy PE).{Color.ENDC}")
+
+    def _resultado(ok=None, fail=None, pwd=None, error=None, eliminados=None):
+        return {
+            "ok_list": list(ok or []),
+            "fail_list": list(fail or []),
+            "pwd_incorrecta_list": list(pwd or []),
+            "correos_eliminados": list(eliminados or []),
+            "success_count": len(ok or []),
+            "fail_count": len(fail or []),
+            "error": error,
+        }
+
+    def _pause(msg=None):
+        if msg:
+            print(msg)
+        if interactive:
+            input(">>> Presiona Enter para volver al menú principal <<<")
 
     try:
         from playwright.sync_api import sync_playwright  # noqa: F401
     except ImportError:
-        print(f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. Ejecute 'pip install playwright' "
-              f"e instale los navegadores con 'playwright install'.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        _pause(f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. Ejecute 'pip install playwright' "
+               f"e instale los navegadores con 'playwright install'.")
+        return _resultado(fail=list(correos or []), error="Playwright no instalado")
 
     path_cuentas = SCRIPT_DIR / "sesiones_imap_cuentas.txt"
     if not path_cuentas.exists():
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe en la carpeta actual.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        _pause(f"\n{Color.FAIL}[Error]{Color.ENDC} El archivo 'sesiones_imap_cuentas.txt' no existe en la carpeta actual.")
+        return _resultado(fail=list(correos or []), error="Falta sesiones_imap_cuentas.txt")
 
     cuentas_map = cargar_mapa_cuentas_sesiones()
     if not cuentas_map:
-        print(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en "
-              f"'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        _pause(f"\n{Color.FAIL}[Error]{Color.ENDC} No se encontraron cuentas válidas en "
+               f"'sesiones_imap_cuentas.txt' (formato: correo contraseña).")
+        return _resultado(fail=list(correos or []), error="sesiones_imap_cuentas.txt vacío")
 
     cuentas_map = filtrar_cuentas_por_correos_activos(cuentas_map, correos)
     if cuentas_map is None:
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        _pause()
+        return _resultado(fail=list(correos or []), error="Ningún correo activo en sesiones_imap_cuentas.txt")
 
     correos_lista = list(cuentas_map.keys())
     print(f"\nSe procesarán {len(correos_lista)} cuenta(s) (filtradas por correos activos del menú).")
 
-    headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
-    headless = headless_opt in ("s", "si", "yes", "y")
+    if headless is None:
+        if interactive:
+            headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
+            headless = headless_opt in ("s", "si", "yes", "y")
+        else:
+            headless = False
+    headless = bool(headless)
 
-    revision_opt = input("¿Mantener abiertas las ventanas con error para revisión manual? (s/n, por defecto 'n'): ").strip().lower()
-    mantener_ventanas = revision_opt in ("s", "si", "sí", "yes", "y")
+    if mantener_ventanas is None:
+        if interactive:
+            revision_opt = input("¿Mantener abiertas las ventanas con error para revisión manual? (s/n, por defecto 'n'): ").strip().lower()
+            mantener_ventanas = revision_opt in ("s", "si", "sí", "yes", "y")
+        else:
+            mantener_ventanas = False
+    mantener_ventanas = bool(mantener_ventanas)
 
     success_count = 0
     fail_count = 0
@@ -20777,15 +22437,17 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
         valid_pe_list = asegurar_proxies_peru(cantidad_necesaria=num_cuentas)
         if not valid_pe_list:
             print(f"\n{Color.FAIL}[Error]{Color.ENDC} No hay proxies de Perú válidos y esta opción los exige.")
-            input(">>> Presiona Enter para volver al menú principal <<<")
-            return
+            _pause()
+            return _resultado(fail=list(correos_lista), error="Sin proxies PE")
         GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
 
-    batch_size = 10
+    batch_size = max(1, min(5, int(max_ventanas or 5)))
     total_cuentas = len(correos_lista)
 
-    print(f"\n{Color.CYAN}{Color.BOLD}=== FASE 1: Eliminar {total_cuentas} cuentas (proxy PE) "
-          f"(máx. {batch_size} ventanas en paralelo; OTP por alias exacto con puntos) ==={Color.ENDC}\n")
+    print(f"\n{Color.CYAN}{Color.BOLD}=== FASE 1: Eliminar {total_cuentas} cuentas "
+          f"(máx. {batch_size} ventanas a la vez) ==={Color.ENDC}")
+    print(f"{Color.CYAN}Se abren juntas, piden el OTP a la vez → 6s → escriben y cierran "
+          f"de una en una (alias exacto con puntos).{Color.ENDC}\n")
 
     hermanos = {}
     for c in correos_lista:
@@ -20803,27 +22465,37 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
             GLOBAL_PE_PROXY_POOL.reiniciar_bloqueos()
         lote_correos = correos_lista[b_start: b_start + batch_size]
         num_cuentas_lote = len(lote_correos)
-        barreras_lote = {"inicio": threading.Barrier(num_cuentas_lote)}
+        barreras_lote = {
+            "chrome": threading.Barrier(num_cuentas_lote),
+            "inicio": threading.Barrier(num_cuentas_lote),
+        }
+        coord_otp = CoordinadorOtpEliminacionLote(num_cuentas_lote)
         workers = num_cuentas_lote
+        print(f"{Color.CYAN}Oleada de eliminación: {num_cuentas_lote} ventana(s) simultáneas "
+              f"(piden códigos juntas, escriben 1 a 1).{Color.ENDC}")
         if total_cuentas > batch_size:
             print(f"\n{Color.CYAN}{Color.BOLD}--- Lote "
                   f"({b_start + 1} a {b_start + num_cuentas_lote} de {total_cuentas}) "
                   f"---{Color.ENDC}")
 
-        def eliminar_un_correo(idx_rel, correo):
+        def eliminar_un_correo(idx_rel, correo, _barreras=barreras_lote, _coord=coord_otp):
             if idx_rel > 1:
-                time.sleep((idx_rel - 1) * 1.5)
+                time.sleep((idx_rel - 1) * 0.25)
             nonlocal_idx = idx_global + idx_rel
             contrasena = cuentas_map[correo]
 
             p_pe = None if MODO_SIN_PROXY else GLOBAL_PE_PROXY_POOL.obtener_proxy_unico()
             if not MODO_SIN_PROXY and not p_pe:
                 print(f"  {Color.FAIL}[Proxy PE] [{correo}] Sin proxy disponible; se omite.{Color.ENDC}")
-                for b in barreras_lote.values():
+                for b in _barreras.values():
                     try:
                         b.abort()
                     except Exception:
                         pass
+                try:
+                    _coord.fallo(correo)
+                except Exception:
+                    pass
                 return correo, False
             p_pe_server = (p_pe or {}).get("server")
             p_pe_user = (p_pe or {}).get("username")
@@ -20836,14 +22508,21 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
                 proxy_pe_user=p_pe_user,
                 proxy_pe_pass=p_pe_pass,
                 headless=headless,
-                barreras=barreras_lote,
+                barreras=_barreras,
                 thread_index=nonlocal_idx,
                 mantener_ventana_si_falla=mantener_ventanas,
+                elim_otp_coord=_coord,
             )
             managers.append(manager)
             print(f"\n{Color.CYAN}{Color.BOLD}[Eliminar Automático] Iniciando proceso para: {correo}{Color.ENDC}")
             try:
                 exito = manager.run_auto_login(modo="eliminar")
+            except Exception:
+                try:
+                    manager.abortar_barreras()
+                except Exception:
+                    pass
+                raise
             finally:
                 cerrar_sesion_imap_hilo()
             if exito:
@@ -20894,11 +22573,26 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
         print(f"{Color.WARNING}Las ventanas de las cuentas incompletas ya se cerraron tras el plazo "
               f"de revisión manual.{Color.ENDC}")
 
-    if not correos_eliminados:
-        print(f"\n{Color.WARNING}[Opción 15] Ninguna cuenta se eliminó con éxito. "
-              f"Se omite la fase de registro.{Color.ENDC}")
-        print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
-        return
+    pwd_incorrecta_list = [
+        m.client_email for m in managers if getattr(m, "pwd_incorrecta", False)
+    ]
+    fail_list_fase1 = [c for c in correos_lista if c not in correos_eliminados]
+
+    if solo_eliminar or not correos_eliminados:
+        if not correos_eliminados:
+            print(f"\n{Color.WARNING}[Opción 15] Ninguna cuenta se eliminó con éxito. "
+                  f"Se omite la fase de registro.{Color.ENDC}")
+        elif solo_eliminar:
+            print(f"\n{Color.GREEN}{Color.BOLD}>>> Fase 1 (eliminar) finalizada. "
+                  f"Registro lo hace el pipeline.{Color.ENDC}\n")
+        else:
+            print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso finalizado. Regresando al menú principal...{Color.ENDC}\n")
+        return _resultado(
+            ok=correos_eliminados,
+            fail=fail_list_fase1,
+            pwd=pwd_incorrecta_list,
+            eliminados=correos_eliminados,
+        )
 
     print(f"\n{Color.CYAN}{Color.BOLD}=== FASE 2: Registrar {len(correos_eliminados)} cuenta(s) "
           f"eliminada(s) (proxy NG + PE pago) ==={Color.ENDC}")
@@ -21072,17 +22766,38 @@ def eliminar_cuentas_tidal_automatico_opcion15(correos):
 
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso eliminar+registrar finalizado. "
           f"Regresando al menú principal...{Color.ENDC}\n")
+    pwd_incorrecta_list = [
+        m.client_email for m in managers if getattr(m, "pwd_incorrecta", False)
+    ]
+    fail_all = [c for c in correos_lista if c not in correos_eliminados]
+    return _resultado(
+        ok=correos_eliminados,
+        fail=fail_all,
+        pwd=pwd_incorrecta_list,
+        eliminados=correos_eliminados,
+    )
 
 
-def registrar_cuentas_tidal(correos):
+def registrar_cuentas_tidal(
+    correos,
+    *,
+    pais_vpn: dict | None = None,
+    interactive: bool = True,
+    headless: bool | None = None,
+    max_ventanas: int = 5,
+):
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   REGISTRO AUTOMÁTICO DE CUENTAS TIDAL{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
 
-    pais_vpn = pedir_pais_vpn_opcion8()
+    if pais_vpn is None:
+        if interactive:
+            pais_vpn = pedir_pais_vpn_opcion8()
+        else:
+            pais_vpn = SURFSHARK_PAISES_REGISTRO["argentina"]
     if not pais_vpn:
         print(f"\n{Color.WARNING}[Opción 8] Cancelado: no se eligió país de IP.{Color.ENDC}")
-        return
+        return {"ok_list": [], "fail_list": list(correos or []), "success_count": 0, "fail_count": len(correos or [])}
     nombre_vpn = pais_vpn.get("nombre") or "Nigeria"
     print(f"\n  {Color.GREEN}[Opción 8] IP de registro: {nombre_vpn.upper()}.{Color.ENDC}")
     
@@ -21090,8 +22805,9 @@ def registrar_cuentas_tidal(correos):
         from playwright.sync_api import sync_playwright
     except ImportError:
         print(f"{Color.FAIL}[Error]{Color.ENDC} Playwright no está instalado. Ejecute 'pip install playwright' e instale los navegadores con 'playwright install'.")
-        input(">>> Presiona Enter para volver al menú principal <<<")
-        return
+        if interactive:
+            input(">>> Presiona Enter para volver al menú principal <<<")
+        return {"ok_list": [], "fail_list": list(correos or []), "error": "Playwright no instalado"}
 
     global valid_ng_list, CACHE_PROXIES_NG
     valid_ng_list = []
@@ -21131,10 +22847,13 @@ def registrar_cuentas_tidal(correos):
             use_proxy = True
         else:
             print(f"\n{Color.WARNING}[WARN]{Color.ENDC} No hay proxies de Nigeria válidos disponibles.")
-            confirm = input("¿Deseas continuar con tu IP local/VPN actual? (s/n, por defecto 'n'): ").strip().lower()
-            if confirm not in ("s", "si", "yes", "y"):
-                print("Operación cancelada.")
-                return
+            if interactive:
+                confirm = input("¿Deseas continuar con tu IP local/VPN actual? (s/n, por defecto 'n'): ").strip().lower()
+                if confirm not in ("s", "si", "yes", "y"):
+                    print("Operación cancelada.")
+                    return {"ok_list": [], "fail_list": list(correos or []), "error": "Cancelado: sin proxies NG"}
+            else:
+                print("  [Opción 8] Modo no interactivo: se continúa con IP local/VPN (Surfshark).")
 
     print(f"\n{Color.CYAN}[Opción 8] Solo registro Tidal (sin pago/TuneMyMusic): no se reservan proxies PE.{Color.ENDC}")
 
@@ -21149,12 +22868,11 @@ def registrar_cuentas_tidal(correos):
         print(f"\n{Color.WARNING}[Opción 8] No hay correos para registrar.{Color.ENDC}")
         return
 
-    n_catch = sum(
-        1 for c in correos_lista
-        if not c.endswith(("@gmail.com", "@googlemail.com"))
-    )
-    if n_catch:
-        print(f"  {Color.CYAN}[Worker] {n_catch} correo(s) catch-all (@cheapmusic.best): "
+    n_worker = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "worker")
+    n_imap = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "imap")
+    n_sin = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "ninguno")
+    if n_worker:
+        print(f"  {Color.CYAN}[Worker] {n_worker} correo(s) catch-all (@cheapmusic.best): "
               f"OTP por Email Worker, un alias = un código (sin mezclar ventanas).{Color.ENDC}")
         try:
             from otp_worker_client import worker_salud, worker_config
@@ -21169,17 +22887,27 @@ def registrar_cuentas_tidal(correos):
                 print(f"  imap_fallback=1 (si el worker no tiene el mail, se intenta IMAP del Gmail de forward).")
         except Exception as e_w:
             print(f"  {Color.WARNING}Email Worker: no se pudo comprobar ({e_w}){Color.ENDC}")
+    if n_imap:
+        print(f"  {Color.CYAN}[IMAP] {n_imap} correo(s) Gmail/otro dominio: "
+              f"OTP por IMAP con App Password de passwords.txt.{Color.ENDC}")
+    if n_sin:
+        print(f"  {Color.FAIL}[IMAP] {n_sin} correo(s) sin Email Worker ni App Password IMAP.{Color.ENDC}")
 
-    headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
-    headless = headless_opt in ("s", "si", "yes", "y")
+    if headless is None:
+        if interactive:
+            headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
+            headless = headless_opt in ("s", "si", "yes", "y")
+        else:
+            headless = False
+    headless = bool(headless)
 
-    # Tope 4: más ventanas saturan el Email Worker y se pisan OTP del catch-all.
-    batch_size = 4
+    # Tope 5: una oleada familiar completa cabe en una sola tanda (OTP por alias exacto).
+    batch_size = max(1, min(5, int(max_ventanas or 5)))
     timeout_oleada_s = 420.0
     total_cuentas = len(correos_lista)
     n_oleadas = max(1, (total_cuentas + batch_size - 1) // batch_size)
     print(f"\n{Color.CYAN}{Color.BOLD}Opción 8: {total_cuentas} cuenta(s) → {n_oleadas} oleada(s) "
-          f"de hasta {batch_size} ventanas en simultáneo (IP {nombre_vpn} vía Surfshark, OTP worker por alias).{Color.ENDC}")
+          f"de hasta {batch_size} ventanas en simultáneo (IP {nombre_vpn} vía Surfshark, OTP worker/IMAP).{Color.ENDC}")
     print(f"{Color.CYAN}Un fallo no detiene el lote. Tras todas las oleadas se reintenta una vez "
           f"lo que haya fallado.{Color.ENDC}")
     if not use_proxy:
@@ -21194,20 +22922,30 @@ def registrar_cuentas_tidal(correos):
     estado_lock = threading.Lock()
     oleadas_completadas = 0
     vpn_ng_abortar = False
+    saltar_reciclado_vpn = False
+    captcha_intentos: dict[str, int] = {}
+    max_reabrir_captcha = 3
 
     def _vpn_nigeria_antes_de_oleada(n_oleada: int, n_ol: int) -> bool:
         """País elegido antes de registrar. Cada 2 oleadas: Desconectar y conectar otra vez."""
-        nonlocal vpn_ng_abortar
+        nonlocal vpn_ng_abortar, saltar_reciclado_vpn
         if use_proxy:
             return True
-        reciclar = oleadas_completadas > 0 and oleadas_completadas % 2 == 0
-        if reciclar:
-            motivo = (f"tras {oleadas_completadas} oleada(s) — desconectar y conectar {nombre_vpn} "
-                      f"(antes de oleada {n_oleada}/{n_ol})")
+        if saltar_reciclado_vpn:
+            saltar_reciclado_vpn = False
+            reciclar = False
+            motivo = (f"antes de oleada {n_oleada}/{n_ol} "
+                      f"(IP de {nombre_vpn} recién reciclada tras captcha)")
         else:
-            motivo = f"antes de oleada {n_oleada}/{n_ol}"
+            reciclar = oleadas_completadas > 0 and oleadas_completadas % 2 == 0
+            if reciclar:
+                motivo = (f"tras {oleadas_completadas} oleada(s) — desconectar y conectar {nombre_vpn} "
+                          f"(antes de oleada {n_oleada}/{n_ol})")
+            else:
+                motivo = f"antes de oleada {n_oleada}/{n_ol}"
         ok = asegurar_vpn_pais_para_registro(
             pais=pais_vpn, reciclar=reciclar, motivo=motivo,
+            interactivo=interactive,
         )
         if not ok:
             vpn_ng_abortar = True
@@ -21238,20 +22976,23 @@ def registrar_cuentas_tidal(correos):
             time.sleep(pausa)
 
     def _correr_oleadas(pendientes: list[str], etiqueta: str) -> tuple[list[str], list[str]]:
-        nonlocal success_count, fail_count, oleadas_completadas
+        nonlocal success_count, fail_count, oleadas_completadas, saltar_reciclado_vpn, vpn_ng_abortar
         ok_esta: list[str] = []
         fail_esta: list[str] = []
+        cola = list(pendientes)
         n_tot = len(pendientes)
         n_ol = max(1, (n_tot + batch_size - 1) // batch_size)
-        for b_start in range(0, n_tot, batch_size):
+        n_oleada = 0
+        while cola:
             if vpn_ng_abortar:
                 print(f"  {Color.FAIL}[VPN] Oleadas restantes canceladas: IP no es {nombre_vpn}.{Color.ENDC}")
                 break
-            lote = pendientes[b_start:b_start + batch_size]
-            n_oleada = (b_start // batch_size) + 1
+            lote = cola[:batch_size]
+            cola = cola[batch_size:]
+            n_oleada += 1
             print(f"\n{Color.BLUE}{Color.BOLD}=== {etiqueta} oleada {n_oleada}/{n_ol}: "
                   f"{len(lote)} cuenta(s) "
-                  f"({b_start + 1}-{b_start + len(lote)} de {n_tot}) ==={Color.ENDC}")
+                  f"({n_tot - len(cola) - len(lote) + 1}-{n_tot - len(cola)} de {n_tot}) ==={Color.ENDC}")
             for c_o in lote:
                 print(f"    • {c_o}")
             if not _vpn_nigeria_antes_de_oleada(n_oleada, n_ol):
@@ -21307,7 +23048,10 @@ def registrar_cuentas_tidal(correos):
                     if exito:
                         print(f"  {Color.GREEN}[Registro] [{correo}] Completado. "
                               f"Opción 8 finaliza aquí (sin TuneMyMusic).{Color.ENDC}")
-                    return correo, bool(exito)
+                        return correo, True
+                    if getattr(manager, "fallo_por_captcha", False):
+                        return correo, "captcha"
+                    return correo, False
                 except Exception as e_reg:
                     if manager is not None:
                         try:
@@ -21323,6 +23067,10 @@ def registrar_cuentas_tidal(correos):
                         except Exception:
                             pass
                     print(f"  {Color.FAIL}[ERROR] Excepción en registro de {correo}: {e_reg}{Color.ENDC}")
+                    if _registro_error_es_bloqueo(e_reg) or (
+                        manager is not None and getattr(manager, "fallo_por_captcha", False)
+                    ):
+                        return correo, "captcha"
                     return correo, False
                 finally:
                     with managers_lock:
@@ -21340,6 +23088,7 @@ def registrar_cuentas_tidal(correos):
                             manager.proxy_ng_server = None
                             manager.proxy_pe_server = None
 
+            captcha_esta: list[str] = []
             timed_out = False
             ya_contados: set[str] = set()
             executor = ThreadPoolExecutor(max_workers=len(lote))
@@ -21367,7 +23116,9 @@ def registrar_cuentas_tidal(correos):
                             if c_res in ya_contados:
                                 continue
                             ya_contados.add(c_res)
-                            if ok:
+                            if ok == "captcha":
+                                captcha_esta.append(c_res)
+                            elif ok:
                                 success_count += 1
                                 ok_esta.append(c_res)
                                 ok_list.append(c_res)
@@ -21412,6 +23163,51 @@ def registrar_cuentas_tidal(correos):
 
             _limpiar_tras_oleada(n_oleada, n_ol)
             oleadas_completadas += 1
+            if captcha_esta and not use_proxy:
+                reabrir: list[str] = []
+                for c in captcha_esta:
+                    n_cap = captcha_intentos.get(c, 0) + 1
+                    captcha_intentos[c] = n_cap
+                    if n_cap <= max_reabrir_captcha:
+                        reabrir.append(c)
+                    else:
+                        print(f"  {Color.FAIL}[Captcha] {c}: sin alta tras reciclar "
+                              f"{nombre_vpn} {max_reabrir_captcha} veces.{Color.ENDC}")
+                        if c not in fail_list and c not in ok_list:
+                            fail_count += 1
+                            fail_esta.append(c)
+                            fail_list.append(c)
+                if reabrir and not vpn_ng_abortar:
+                    print(
+                        f"\n  {Color.WARNING}[Captcha] {len(reabrir)} ventana(s) con captcha. "
+                        f"Se desconecta y vuelve a conectar {nombre_vpn}, se espera 20s "
+                        f"y se reabren solo esas.{Color.ENDC}"
+                    )
+                    ok_vpn = asegurar_vpn_pais_para_registro(
+                        pais=pais_vpn,
+                        reciclar=True,
+                        motivo=f"captcha en registro: reciclar {nombre_vpn}",
+                        intentos_auto=2,
+                        interactivo=interactive,
+                    )
+                    if not ok_vpn:
+                        vpn_ng_abortar = True
+                        for c in reabrir:
+                            if c not in fail_list and c not in ok_list:
+                                fail_count += 1
+                                fail_esta.append(c)
+                                fail_list.append(c)
+                    else:
+                        print(f"  {Color.CYAN}[Captcha] Esperando 20s antes de reabrir "
+                              f"en {nombre_vpn}.{Color.ENDC}")
+                        time.sleep(20)
+                        saltar_reciclado_vpn = True
+                        ya = set(reabrir)
+                        cola = reabrir + [c for c in cola if c not in ya]
+                        n_ol = max(
+                            n_ol,
+                            n_oleada + max(1, (len(cola) + batch_size - 1) // batch_size),
+                        )
         return ok_esta, fail_esta
 
     _correr_oleadas(correos_lista, "Opción 8")
@@ -21430,11 +23226,29 @@ def registrar_cuentas_tidal(correos):
         else:
             print(f"\n{Color.CYAN}{Color.BOLD}[Opción 8] Reintento de {len(retry_lista)} cuenta(s) "
                   f"fallida(s), otra vez en oleadas de {batch_size}...{Color.ENDC}\n")
-            time.sleep(2.0)
-            fail_count -= len(retry_lista)
-            fail_list[:] = [c for c in fail_list if c not in retry_lista]
-            _ok_r, _fail_r = _correr_oleadas(retry_lista, "Opción 8 reintento")
-            # fail_count / lists already updated inside _correr_oleadas
+            if not use_proxy:
+                print(f"  {Color.WARNING}[Captcha] Antes del reintento se desconecta y "
+                      f"vuelve a conectar {nombre_vpn}, y se espera 20s.{Color.ENDC}")
+                if not asegurar_vpn_pais_para_registro(
+                    pais=pais_vpn,
+                    reciclar=True,
+                    motivo=f"reintento de registro: reciclar {nombre_vpn}",
+                    intentos_auto=2,
+                    interactivo=interactive,
+                ):
+                    vpn_ng_abortar = True
+                    print(f"  {Color.FAIL}[Opción 8] Reintento omitido: no hay IP de {nombre_vpn}.{Color.ENDC}")
+                else:
+                    time.sleep(20)
+                    saltar_reciclado_vpn = True
+                    fail_count -= len(retry_lista)
+                    fail_list[:] = [c for c in fail_list if c not in retry_lista]
+                    _correr_oleadas(retry_lista, "Opción 8 reintento")
+            else:
+                time.sleep(2.0)
+                fail_count -= len(retry_lista)
+                fail_list[:] = [c for c in fail_list if c not in retry_lista]
+                _correr_oleadas(retry_lista, "Opción 8 reintento")
 
     print(f"\n{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}   RESUMEN DEL REGISTRO (opción 8){Color.ENDC}")
@@ -21451,7 +23265,12 @@ def registrar_cuentas_tidal(correos):
             print(f"  {Color.FAIL}{i:2d}. {c}{Color.ENDC}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*60 + f"{Color.ENDC}\n")
     print(f"\n{Color.GREEN}{Color.BOLD}>>> Proceso de registro finalizado. Regresando al menú principal...{Color.ENDC}\n")
-
+    return {
+        "ok_list": list(ok_list),
+        "fail_list": list(fail_list),
+        "success_count": len(ok_list),
+        "fail_count": len(fail_list),
+    }
 
 
 def parsear_titular_familiar_txt_opcion11(path: Path) -> tuple[list[dict], list[str]]:
@@ -21870,58 +23689,26 @@ def ingresar_correos():
 
 
 def tiene_contrasena_imap_registrada(gmail_user_solicitado: str) -> bool:
-    """Verifica si la cuenta especificada tiene su propia contraseña IMAP/App Password en passwords.txt."""
-    pwd_file = SCRIPT_DIR / "passwords.txt"
-    if not pwd_file.exists():
-        return False
-        
+    """True si hay App Password IMAP usable para este correo en passwords.txt."""
+    user, pwd = obtener_credenciales_imap_reales(gmail_user_solicitado)
+    return bool(user and pwd)
+
+
+def canal_otp_para_correo(correo: str) -> tuple[str, str]:
+    """Cómo se leerán códigos/enlaces de Tidal: worker | imap | ninguno."""
+    c = (correo or "").strip().lower()
+    if not c or "@" not in c:
+        return "ninguno", "correo inválido"
     try:
-        lines = pwd_file.read_text(encoding="utf-8").splitlines()
+        from otp_worker_client import worker_cubre_alias
+        if worker_cubre_alias(c):
+            return "worker", "Email Worker (@cheapmusic.best)"
     except Exception:
-        return False
-    
-    gmail_user_solicitado = destino_imap_de_alias((gmail_user_solicitado or "").lower().strip())
-    if "@gmail.com" in gmail_user_solicitado:
-        username, domain = gmail_user_solicitado.split("@", 1)
-        solicitado_no_dots = username.replace(".", "") + "@" + domain
-    else:
-        solicitado_no_dots = gmail_user_solicitado
-
-    user_clean_key = solicitado_no_dots.replace("@", "_at_").replace(".", "_")
-    
-    for line in lines:
-        if "=" in line:
-            key, val = line.split("=", 1)
-            val_clean = val.strip().strip('"').strip("'")
-            if not val_clean:
-                continue
-            key_name = key.strip().lower()
-            if key_name.startswith("gmail_app_password_") or key_name.startswith("imap_password_"):
-                email_part = key_name[19:].strip() if key_name.startswith("gmail_app_password_") else key_name[14:].strip()
-                if "@" in email_part:
-                    usr, dom = email_part.split("@", 1)
-                    email_part_no_dots = usr.replace(".", "") + "@" + dom
-                    if email_part_no_dots == solicitado_no_dots:
-                        return True
-            
-            key_clean = key.strip().lower().replace("@", "_at_").replace(".", "_")
-            if (key_clean == f"gmail_app_password_{user_clean_key}" or 
-                key_clean == f"gmail_app_password_{solicitado_no_dots}" or
-                key_clean == f"imap_password_{user_clean_key}" or
-                key_clean == f"imap_password_{solicitado_no_dots}"):
-                return True
-
-    # Fallback solo para la cuenta por defecto cakeseller1234 si existe gmail_app_password=
-    if "cakeseller1234" in solicitado_no_dots:
-        for line in lines:
-            if "=" in line:
-                key, val = line.split("=", 1)
-                key_stripped = key.strip().lower()
-                val_clean = val.strip().strip('"').strip("'")
-                if key_stripped in ("gmail_app_password", "imap_password") and val_clean:
-                    return True
-
-    return False
+        pass
+    if tiene_contrasena_imap_registrada(c):
+        user, _ = obtener_credenciales_imap_reales(c)
+        return "imap", f"IMAP {user or destino_imap_de_alias(c)} (passwords.txt)"
+    return "ninguno", "sin App Password IMAP en passwords.txt"
 
 
 def remover_puntos_correo(correo: str) -> str:
@@ -21942,6 +23729,8 @@ def verificar_contrasenas_imap_opcion12(correos: list[str]):
         return
 
     faltantes = []
+    worker_ok = []
+    imap_ok = []
     forwards: dict[str, str] = {}
     
     for correo in correos:
@@ -21949,7 +23738,12 @@ def verificar_contrasenas_imap_opcion12(correos: list[str]):
         dest = destino_imap_de_alias(correo_l)
         if dest != correo_l and "@" in correo_l:
             forwards[correo_l.split("@", 1)[1]] = dest
-        if not tiene_contrasena_imap_registrada(correo):
+        canal, detalle = canal_otp_para_correo(correo)
+        if canal == "worker":
+            worker_ok.append(correo_l)
+        elif canal == "imap":
+            imap_ok.append(f"{correo_l} → {detalle}")
+        else:
             correo_limpio = remover_puntos_correo(correo)
             if correo_limpio not in faltantes:
                 faltantes.append(correo_limpio)
@@ -21957,7 +23751,7 @@ def verificar_contrasenas_imap_opcion12(correos: list[str]):
     if forwards:
         print(f"\n{Color.CYAN}Catch-all (Cloudflare Email Routing):{Color.ENDC}")
         for dom, dest in sorted(forwards.items()):
-            print(f"  @{dom} → IMAP {dest}")
+            print(f"  @{dom} → IMAP {dest} (solo fallback; OTP va por Email Worker)")
 
     try:
         from otp_worker_client import worker_salud, worker_config
@@ -21971,13 +23765,21 @@ def verificar_contrasenas_imap_opcion12(correos: list[str]):
             print(f"  Catch-all (@cheapmusic.best): OTP/links por worker, sin IMAP.")
     except Exception as e:
         print(f"\n{Color.WARNING}Email Worker:{Color.ENDC} no se pudo comprobar ({e})")
+
+    if worker_ok:
+        print(f"\n{Color.CYAN}Worker ({len(worker_ok)}):{Color.ENDC} @cheapmusic.best")
+    if imap_ok:
+        print(f"\n{Color.CYAN}IMAP ({len(imap_ok)}) via passwords.txt:{Color.ENDC}")
+        for linea in imap_ok:
+            print(f"  ✓ {linea}")
             
     if not faltantes:
-        print(f"\n{Color.GREEN}{Color.BOLD}>>> TODO ESTÁ CORRECTO: Todos los correos tienen su contraseña IMAP registrada. <<<{Color.ENDC}\n")
+        print(f"\n{Color.GREEN}{Color.BOLD}>>> TODO ESTÁ CORRECTO: worker y/o IMAP listos para todos los correos. <<<{Color.ENDC}\n")
     else:
-        print(f"\n{Color.FAIL}{Color.BOLD}>>> FALTAN REGISTRAR CONTRASEÑAS IMAP EN PASSWORDS.TXT PARA LOS SIGUIENTES CORREOS ({len(faltantes)}): <<<{Color.ENDC}")
+        print(f"\n{Color.FAIL}{Color.BOLD}>>> FALTAN APP PASSWORD IMAP EN PASSWORDS.TXT ({len(faltantes)} Gmail/otro dominio): <<<{Color.ENDC}")
         for c in faltantes:
             print(f"  {Color.FAIL}✖ {c}{Color.ENDC}")
+        print(f"  Formato: gmail_app_password_cuenta@gmail.com=xxxx xxxx xxxx xxxx")
 
 
 def crear_cuentas_familiares_automatico_opcion14():
@@ -22025,9 +23827,10 @@ def crear_cuentas_familiares_automatico_opcion14():
 
     correos_lista = list(cuentas_map.keys())
     print(f"\nSe cargaron {len(correos_lista)} cuentas para crear como Titulares Familiares desde 'crear_cuentastitulares_imap.txt'.")
-    n_catch = sum(1 for c in correos_lista if "@" in c and not c.lower().endswith(("@gmail.com", "@googlemail.com")))
-    if n_catch:
-        print(f"  {Color.CYAN}[Worker] {n_catch} correo(s) catch-all (p. ej. @cheapmusic.best): "
+    n_worker = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "worker")
+    n_imap = sum(1 for c in correos_lista if canal_otp_para_correo(c)[0] == "imap")
+    if n_worker:
+        print(f"  {Color.CYAN}[Worker] {n_worker} correo(s) catch-all (p. ej. @cheapmusic.best): "
               f"OTP de registro por Email Worker, igual que las opciones 1–4.{Color.ENDC}")
         try:
             from otp_worker_client import worker_salud, worker_config
@@ -22042,6 +23845,8 @@ def crear_cuentas_familiares_automatico_opcion14():
                 print(f"  imap_fallback=1 (si el worker no tiene el mail, se intenta IMAP del Gmail de forward).")
         except Exception as e_w:
             print(f"  {Color.WARNING}Email Worker: no se pudo comprobar ({e_w}){Color.ENDC}")
+    if n_imap:
+        print(f"  {Color.CYAN}[IMAP] {n_imap} correo(s) Gmail/otro dominio: OTP por IMAP (passwords.txt).{Color.ENDC}")
 
     headless_opt = input("\n¿Deseas ejecutar el navegador en segundo plano (headless)? (s/n, por defecto 'n'): ").strip().lower()
     headless = headless_opt in ("s", "si", "yes", "y")
@@ -22235,7 +24040,7 @@ def menu_principal():
         print(" 1. Obtener CÓDIGO DE REGISTRO (Welcome / Verification)")
         print(" 2. Obtener CÓDIGO DE ELIMINACIÓN (Delete Account)")
         print(" 3. Obtener CÓDIGO DE INICIO DE SESIÓN (Login Verification)")
-        print(" 4. Aceptar ENLACE DE INVITACIÓN (IMAP / pegar links / linksextraidos.txt + auto + cerrar)")
+        print(" 4. Aceptar ENLACE DE INVITACIÓN (Email Worker / IMAP / pegar / linksextraidos.txt)")
         print(" 5. Buscar y completar ENLACE DE RESTABLECIMIENTO (auto-pwd + cerrar Chrome)")
         print(" 6. Cambiar de correo electrónico (define qué cuentas se procesan en el menú)")
         print(" 7. Salir")
@@ -22409,10 +24214,10 @@ def menu_principal():
             
         elif opcion == "4":
             print(f"\n{Color.CYAN}{Color.BOLD}=== PROCESANDO INVITACIONES FAMILIARES SIMULTÁNEAMENTE ==={Color.ENDC}")
-            print("  Cuentas ya registradas: login con proxy PE (sesiones_imap_cuentas.txt o código IMAP).")
-            print("  Cuentas aún sin registrar: alta automática con proxy NG (DOB + Suscríbete + OTP IMAP).")
+            print("  Enlaces: Email Worker Cloudflare por defecto (sin IMAP, segundos).")
+            print("  Cuentas ya registradas: login con sesiones_imap_cuentas.txt.")
+            print("  Cuentas aún sin registrar: alta automática (DOB + Suscríbete + OTP worker).")
             print(f"  Links desde {LINKS_EXTRAIDOS_PATH.name}: siempre proxy NG (una ventana por correo).")
-            print("  Hasta 5 alias del mismo Gmail en paralelo sin mezclar códigos.")
 
             enlaces_manual, origen_enlaces = pedir_fuente_enlaces_opcion4(correos)
             forzar_ng_archivo = origen_enlaces == "archivo"
@@ -22423,6 +24228,9 @@ def menu_principal():
                 enlaces_map = asignar_enlaces_invitacion_a_correos(correos)
             else:
                 enlaces_map = dict(enlaces_manual or {})
+                if origen_enlaces == "worker":
+                    print(f"  {Color.CYAN}[Opción 4] Enlaces del Email Worker "
+                          f"(Cloudflare, sin IMAP).{Color.ENDC}")
                 if forzar_ng_archivo:
                     print(f"  {Color.CYAN}[Opción 4] Fuente archivo → todas las invitaciones con "
                           f"proxy NIGERIA (sin ventana PE intermedia).{Color.ENDC}")
@@ -22440,9 +24248,12 @@ def menu_principal():
                         enlaces_map[c] = e
                 if e:
                     preview = e if len(e) <= 90 else e[:90] + "..."
-                    etiqueta = "IMAP" if origen_enlaces == "imap" else (
-                        "Archivo" if origen_enlaces == "archivo" else "Manual"
-                    )
+                    etiqueta = {
+                        "imap": "IMAP",
+                        "archivo": "Archivo",
+                        "pegar": "Manual",
+                        "worker": "WORKER",
+                    }.get(origen_enlaces, origen_enlaces.upper())
                     print(f"    {Color.GREEN}[{etiqueta}] Enlace para {c}: {preview}{Color.ENDC}")
                     if forzar_ng_archivo:
                         print(f"    {Color.CYAN}[Proxy] {c} → NG (linksextraidos.txt){Color.ENDC}")
@@ -22453,7 +24264,12 @@ def menu_principal():
                               f"para {c} — si es cuenta nueva se hará el alta automática; "
                               f"si ya existe se usará código IMAP.{Color.ENDC}")
                 else:
-                    origen_msg = "IMAP" if origen_enlaces == "imap" else "fuente elegida"
+                    origen_msg = {
+                        "imap": "IMAP",
+                        "worker": "WORKER",
+                        "archivo": "archivo",
+                        "pegar": "fuente elegida",
+                    }.get(origen_enlaces, "fuente elegida")
                     print(f"    {Color.FAIL}[{origen_msg}] No se encontró invitación para {c}{Color.ENDC}")
 
             enlaces_map = _invite_filtrar_enlaces_unicos(

@@ -10,14 +10,15 @@ const MAX_ITEMS = 40;
 const KINDS = ["login", "register", "delete", "reset", "invite"];
 
 export default {
-  async email(message, env) {
+  async email(message, env, ctx) {
+    let item = null;
     try {
       const rawBuf = await streamToArrayBuffer(message.raw);
       const raw = new TextDecoder("utf-8", { fatal: false }).decode(rawBuf);
       const decoded = decodeRawMime(raw);
       let alias = pickAlias(message.to, decoded, env.CATCHALL_DOMAIN || "cheapmusic.best");
       if (!alias) alias = String(message.to || "").trim().toLowerCase();
-      const item = classifyTidal(decoded, alias);
+      item = classifyTidal(decoded, alias);
       console.log(
         "email in",
         JSON.stringify({
@@ -34,14 +35,7 @@ export default {
     } catch (err) {
       console.log("email parse error", String(err));
     }
-    const fwd = (env.FORWARD_TO || "").trim();
-    if (fwd && fwd.includes("@")) {
-      try {
-        await message.forward(fwd);
-      } catch (err) {
-        console.log("forward error", String(err));
-      }
-    }
+    maybeForward(message, env, ctx, item);
   },
 
   async fetch(request, env) {
@@ -51,6 +45,44 @@ export default {
     }
     if (!checkSecret(request, url, env)) {
       return json({ ok: false, error: "unauthorized" }, 401);
+    }
+    if (url.pathname === "/pipeline-stop") {
+      const key = "pipeline:stop";
+      if (request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const raw = body && body.stop;
+        const stop = raw === true || raw === 1 || raw === "1" || String(raw).toLowerCase() === "true";
+        try {
+          if (stop) {
+            await env.OTP.put(
+              key,
+              JSON.stringify({ stop: true, ts: Date.now() / 1000 }),
+              { expirationTtl: 60 * 60 * 24 }
+            );
+          } else if (env.OTP) {
+            await env.OTP.delete(key);
+          }
+        } catch (err) {
+          console.log("pipeline-stop write error", String(err));
+          return json({ ok: false, error: "kv_failed" }, 200);
+        }
+        return json({ ok: true, stop });
+      }
+      let stop = false;
+      try {
+        const raw = env.OTP ? await env.OTP.get(key) : null;
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            stop = !!(parsed && parsed.stop);
+          } catch {
+            stop = raw === "1" || raw === "true";
+          }
+        }
+      } catch (err) {
+        console.log("pipeline-stop read error", String(err));
+      }
+      return json({ ok: true, stop });
     }
     if (url.pathname === "/claim") {
       const alias = (url.searchParams.get("alias") || "").trim().toLowerCase();
@@ -86,6 +118,36 @@ export default {
       const items = await listItems(env, alias, kind, maxAge);
       return json({ ok: true, items });
     }
+    if (url.pathname === "/list-many") {
+      let aliases = [];
+      let kind = "invite";
+      let maxAge = 172800;
+      if (request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        aliases = Array.isArray(body.aliases) ? body.aliases : [];
+        kind = String(body.kind || "invite").trim().toLowerCase();
+        maxAge = Number(body.max_age || maxAge) || maxAge;
+      } else {
+        aliases = String(url.searchParams.get("aliases") || "").split(",");
+        kind = (url.searchParams.get("kind") || "invite").trim().toLowerCase();
+        maxAge = Number(url.searchParams.get("max_age") || String(maxAge)) || maxAge;
+      }
+      aliases = [...new Set(
+        aliases.map((a) => String(a || "").trim().toLowerCase()).filter(Boolean)
+      )].slice(0, 250);
+      if (!KINDS.includes(kind)) kind = "invite";
+      const by_alias = {};
+      const CHUNK = 25;
+      for (let i = 0; i < aliases.length; i += CHUNK) {
+        const slice = aliases.slice(i, i + CHUNK);
+        const parts = await Promise.all(slice.map(async (alias) => {
+          const items = await listItemsFast(env, alias, kind, maxAge);
+          return [alias, items];
+        }));
+        for (const [alias, items] of parts) by_alias[alias] = items;
+      }
+      return json({ ok: true, by_alias, count: aliases.length });
+    }
     if (url.pathname === "/peek") {
       const alias = (url.searchParams.get("alias") || "").trim().toLowerCase();
       if (!alias) return json({ ok: false, error: "alias required" }, 400);
@@ -105,6 +167,32 @@ function json(obj, status = 200) {
       "cdn-cache-control": "no-store",
     },
   });
+}
+
+function forwardKinds(env) {
+  const raw = String((env && env.FORWARD_KINDS) || "invite,reset").toLowerCase();
+  if (!raw.trim() || raw === "none" || raw === "off" || raw === "0") return new Set();
+  if (raw === "all" || raw === "*") return new Set(KINDS);
+  return new Set(
+    raw
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => KINDS.includes(s))
+  );
+}
+
+function maybeForward(message, env, ctx, item) {
+  const fwd = (env.FORWARD_TO || "").trim();
+  if (!fwd || !fwd.includes("@")) return;
+  const kinds = forwardKinds(env);
+  const kind = item && item.kind;
+  if (!kind || !kinds.has(kind)) return;
+  const copia = message.forward(fwd).catch((err) => {
+    console.log("forward error", String(err));
+  });
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(copia);
+  }
 }
 
 function checkSecret(request, url, env) {
@@ -325,7 +413,7 @@ function extractOtp(text) {
   const lead = stripped.match(/(?:^|\n)\s*(\d{6})\s*[-–—]/);
   if (lead && !isJunkOtp(lead[1])) return lead[1];
   const nearRe =
-    /(?:^|[^a-záéíóúñ])(?:c[oó]digo|code|sign[-\s]?in|sign[-\s]?up|verification|one[-\s]?time|introduce|ingresa|enter)[^\d]{0,240}(\d{5,6})/gi;
+    /(?:^|[^a-záéíóúñ])(?:c[oó]digo|code|sign[-\s]?in|sign[-\s]?up|verification|one[-\s]?time|introduce|ingresa|enter)[^\d]{0,400}(\d{5,6})/gi;
   for (const m of stripped.matchAll(nearRe)) {
     if (!isJunkOtp(m[1])) return m[1];
   }
@@ -338,42 +426,166 @@ function extractOtp(text) {
   for (const n of nums) {
     if (!isJunkOtp(n)) return n;
   }
+  const nums5 = [...stripped.matchAll(/(?<!\d)(\d{5})(?!\d)/g)].map((m) => m[1]);
+  for (const n of nums5) {
+    if (!isJunkOtp(n)) return n;
+  }
   return null;
 }
 
-function extractReset(text) {
-  // QP soft wraps / HTML entities often split "resetpass" across lines.
-  const t = unescapeHtml(String(text || ""))
+function normalizeExtractText(t) {
+  return unescapeHtml(String(t || ""))
     .replace(/=\r?\n/g, "")
-    .replace(/&#x2[fF];/g, "/")
-    .replace(/&#47;/g, "/");
-  const direct = t.match(/https?:\/\/login\.tidal\.com\/resetpass\/[^\s"'<>]+/i);
-  if (direct) return direct[0].replace(/[>"']+$/, "");
-  const wrapped = t.match(/https?:\/\/[^\s"'<>]*tidal\.com\/[^\s"'<>]*resetpass\/[^\s"'<>]+/i);
-  if (wrapped) return wrapped[0].replace(/[>"']+$/, "");
-  const ab = t.match(/https?:\/\/ablink\.(?:info\.)?tidal\.com\/[^\s"'<>]+/i);
-  if (ab) return ab[0].replace(/[>"']+$/, "");
-  const click = t.match(/https?:\/\/[^\s"'<>]*(?:click|email|info)\.tidal\.com\/[^\s"'<>]+/i);
-  return click ? click[0].replace(/[>"']+$/, "") : null;
+    .replace(/href\s*=\s*3D/gi, "href=")
+    .replace(/&#x2[fF];/gi, "/")
+    .replace(/&#47;/g, "/")
+    .replace(/&#x3[dD];/gi, "=")
+    .replace(/&#61;/g, "=");
+}
+
+function stitchUrl(u) {
+  return String(u || "")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, "")
+    .replace(/[>"']+$/g, "");
+}
+
+function uniqueUpnToken(url) {
+  const m = String(url || "").match(/[?&]upn=([^&"'<>]+)/i);
+  if (!m) return "";
+  try {
+    return decodeURIComponent(m[1].replace(/\+/g, "%2B")).split("_")[0];
+  } catch {
+    return m[1].split("_")[0];
+  }
+}
+
+function collectAnchors(html) {
+  const t = normalizeExtractText(html);
+  const out = [];
+  const re = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(t))) {
+    const attrs = m[1] || "";
+    const hm =
+      attrs.match(/href\s*=\s*["']([^"']+)["']/i) ||
+      attrs.match(/href\s*=\s*([^\s>]+)/i);
+    if (!hm) continue;
+    const inner = String(m[2] || "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const alt = ((attrs.match(/alt\s*=\s*["']([^"']+)["']/i) || [])[1] || "");
+    out.push({ url: stitchUrl(hm[1]), text: `${inner} ${alt}`.trim() });
+  }
+  return out;
+}
+
+function collectRawUrls(text) {
+  const t = normalizeExtractText(text);
+  const re =
+    /https?:\/\/(?:ablink\.(?:info\.)?tidal\.com|(?:login|account|click|email|info)\.tidal\.com|(?:www\.)?tidal\.com)[^\s"'<>]*/gi;
+  const urls = [];
+  let m;
+  while ((m = re.exec(t))) urls.push(stitchUrl(m[0]));
+  return urls;
+}
+
+function inviteScore(url, text) {
+  const u = String(url || "").toLowerCase();
+  const txt = String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  if (/resetpass|reset-password|\/privacy|\/terms|\/legal|unsubscribe|\/wf\/open/i.test(u)) {
+    return -1000;
+  }
+  if (/login\.tidal\.com\/family|account\.tidal\.com\/family|accept-invite/.test(u)) {
+    return 2000;
+  }
+  if (/\/family\/|\/accept\/|\/join\//.test(u)) return 1500;
+  let s = 0;
+  if (/join|unir|nete|accept|aceptar|family|familiar|miembro|member|unirse/.test(txt)) {
+    s += 400;
+  }
+  if (u.includes("ablink.") && u.includes("/ls/click") && u.includes("upn=")) {
+    const n = uniqueUpnToken(url).length;
+    s += Math.min(n, 500);
+    if (n >= 140) s += 250;
+    else s -= 120;
+  } else if (u.includes("ablink.")) {
+    s -= 50;
+  }
+  return s;
+}
+
+function resetScore(url, text) {
+  const u = String(url || "").toLowerCase();
+  const txt = String(text || "").toLowerCase();
+  if (/\/privacy|\/terms|\/legal|unsubscribe|\/wf\/open/i.test(u)) return -1000;
+  if (/login\.tidal\.com\/resetpass/.test(u)) return 2000;
+  if (/resetpass|reset-password/.test(u)) return 1500;
+  let s = 0;
+  if (/reset|restablec|password|contrase|forgot/.test(txt)) s += 300;
+  if (u.includes("ablink.") && u.includes("/ls/click") && u.includes("upn=")) {
+    const n = uniqueUpnToken(url).length;
+    s += Math.min(n, 500);
+    if (n >= 140) s += 200;
+    else s -= 100;
+  }
+  return s;
+}
+
+function pickBestUrl(text, scoreFn, minScore) {
+  let best = { score: -1, url: "" };
+  for (const a of collectAnchors(text)) {
+    if (!a.url) continue;
+    const sc = scoreFn(a.url, a.text);
+    if (sc > best.score) best = { score: sc, url: a.url };
+  }
+  for (const u of collectRawUrls(text)) {
+    const sc = scoreFn(u, "");
+    if (sc > best.score) best = { score: sc, url: u };
+  }
+  return best.score >= minScore ? best.url : "";
+}
+
+function extractReset(text) {
+  const t = normalizeExtractText(text);
+  const direct = t.match(/https?:\/\/login\.tidal\.com\/resetpass[^\s"'<>]*/i);
+  if (direct) return stitchUrl(direct[0]);
+  const wrapped = t.match(/https?:\/\/[^\s"'<>]*tidal\.com\/[^\s"'<>]*resetpass[^\s"'<>]*/i);
+  if (wrapped) return stitchUrl(wrapped[0]);
+  return pickBestUrl(t, resetScore, 200) || null;
 }
 
 function extractInvite(text) {
-  const t = unescapeHtml(String(text || ""));
-  const pats = [
+  const t = normalizeExtractText(text);
+  const bad = /resetpass|reset-password|\/privacy|\/terms|\/legal/i;
+  const directPats = [
     /https?:\/\/login\.tidal\.com\/family\/[A-Za-z0-9._~\-\/?=&%]+/i,
     /https?:\/\/account\.tidal\.com\/family\/[A-Za-z0-9._~\-\/?=&%]+/i,
     /https?:\/\/(?:www\.)?tidal\.com\/(?:[a-z]{2}\/)?family\/[A-Za-z0-9._~\-\/?=&%]+/i,
     /https?:\/\/login\.tidal\.com\/[^\s"'<>]*accept[^\s"'<>]*/i,
-    /https?:\/\/ablink\.(?:info\.)?tidal\.com\/[^\s"'<>]+/i,
-    /https?:\/\/ablink\.[^\s"'<>]*tidal[^\s"'<>]*/i,
+    /https?:\/\/account\.tidal\.com\/[^\s"'<>]*accept[^\s"'<>]*/i,
   ];
-  for (const p of pats) {
+  for (const p of directPats) {
     const m = t.match(p);
-    if (m && !/resetpass|reset-password|\/privacy|\/terms|\/legal/i.test(m[0])) {
-      return m[0].replace(/[>"']+$/, "");
-    }
+    if (m && !bad.test(m[0])) return stitchUrl(m[0]);
   }
-  return null;
+  return pickBestUrl(t, inviteScore, 200) || null;
+}
+
+function esDeleteMail(blob) {
+  return /verificaci[oó]n de la eliminaci[oó]n|eliminaci[oó]n de tu cuenta|delete your account|account deletion|c[oó]digo para eliminar|to delete your account|verify tidal account deletion|confirm you want to delete|confirm the deletion of your account/.test(
+    blob
+  );
+}
+
+function esInviteMail(blob) {
+  return /invites you to join|welcome to the family|plan familiar|te ha invitado|join their tidal family|has invited you|invited to a tidal family|unir(?:te|se) a (?:un )?plan|has recibido una invitaci|invitaci[oó]n para unirte/.test(
+    blob
+  );
 }
 
 function classifyTidal(decoded, alias) {
@@ -393,9 +605,12 @@ function classifyTidal(decoded, alias) {
   if (/invitation cancelled|invitación cancelada|family invitation cancel/.test(blob)) {
     return null;
   }
+  if (/removed from a (?:tidal )?family|has sido (?:eliminad|removid)|ya no formas parte del plan/.test(blob)) {
+    return null;
+  }
 
   const esResetMail =
-    /resetpass|restablecer tu contrase|resetting your tidal password|reset your password|restaurar su contrase|forgot your password|link to reset/.test(
+    /resetpass|restablecer tu contrase|resetting your tidal password|reset your password|restaurar su contrase|forgot your password|link to reset|resetpass\?/.test(
       blob
     );
   if (esResetMail) {
@@ -407,12 +622,21 @@ function classifyTidal(decoded, alias) {
     return null;
   }
 
-  const invite = extractInvite(full);
-  if (
-    invite ||
-    /invites you to join|welcome to the family|plan familiar|te ha invitado|join their tidal family|has invited you|invited to a tidal family/.test(blob)
-  ) {
+  // OTP de borrado/login ANTES de extractInvite: el pie "TIDAL Family" + logo ablink
+  // puntuaba ≥200 y el código (p.ej. 12680) nunca se guardaba en KV.
+  if (esDeleteMail(blob)) {
+    const otpDel = extractOtp(full);
+    if (otpDel) return { ...base, kind: "delete", value: otpDel };
+    return null;
+  }
+
+  // Invitación ANTES de OTP: el mail Family dice "bienvenida" y extractOtp
+  // pescaba 10003/031813 → se guardaba como register y /list?kind=invite no lo veía.
+  if (esInviteMail(blob)) {
+    const invite = extractInvite(full);
     if (invite && !/resetpass/i.test(invite)) return { ...base, kind: "invite", value: invite };
+    console.log("invite mail without extractable CTA", (subject || "").slice(0, 80));
+    return null;
   }
 
   if (/new login to your account/.test(blob) && !extractOtp(full)) {
@@ -420,29 +644,30 @@ function classifyTidal(decoded, alias) {
   }
 
   const otp = extractOtp(full);
-  if (!otp) return null;
+  if (otp) {
+    if (
+      /completar la creaci[oó]n|creaci[oó]n de tu cuenta|creating your account|finish creating|terminar de crear|sign[-\s]?up|verifica tu correo|verify your email/.test(
+        blob
+      ) ||
+      (/registr/.test(blob) && !/c[oó]digo de inicio|login code|sign-?in code/.test(blob))
+    ) {
+      return { ...base, kind: "register", value: otp };
+    }
+    if (
+      /c[oó]digo de inicio|login code|sign-?in code|c[oó]digo de acceso|your tidal login code|sign-in code/.test(
+        blob
+      )
+    ) {
+      return { ...base, kind: "login", value: otp };
+    }
+  }
 
-  if (
-    /verificaci[oó]n de la eliminaci[oó]n|eliminaci[oó]n de tu cuenta|delete your account|account deletion|c[oó]digo para eliminar|to delete your account/.test(
-      blob
-    )
-  ) {
-    return { ...base, kind: "delete", value: otp };
+  const invite = extractInvite(full);
+  if (invite && /family\/|accept-invite|\/accept\//i.test(invite) && !/resetpass/i.test(invite)) {
+    return { ...base, kind: "invite", value: invite };
   }
-  // Registro / alta (opción 4: "Verifica tu correo… completar la creación de tu cuenta")
-  if (
-    /completar la creaci[oó]n|creaci[oó]n de tu cuenta|creating your account|finish creating|terminar de crear|sign[-\s]?up|bienven|verifica tu correo|verify your email/.test(
-      blob
-    ) ||
-    (/registr/.test(blob) && !/c[oó]digo de inicio|login code|sign-?in code/.test(blob))
-  ) {
-    return { ...base, kind: "register", value: otp };
-  }
-  if (
-    /c[oó]digo de inicio|login code|sign-?in code|c[oó]digo de acceso|your tidal login code/.test(blob)
-  ) {
-    return { ...base, kind: "login", value: otp };
-  }
+
+  if (!otp) return null;
   return { ...base, kind: "login", value: otp };
 }
 
@@ -660,6 +885,19 @@ async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
     const other = kind === "login" ? "register" : "login";
     idx = findUnclaimed(items, [other], afterTs, maxAge, now, alias);
   }
+  if (idx < 0 && (kind === "delete" || kind === "login" || kind === "register")) {
+    idx = items.findIndex((it) => {
+      const v = String((it && it.value) || "").replace(/\D/g, "");
+      return (
+        it &&
+        !it.claimed &&
+        itemMatchesAlias(it, alias) &&
+        /^\d{5,6}$/.test(v) &&
+        now - Number(it.ts || 0) <= maxAge &&
+        Number(it.ts || 0) >= afterTs
+      );
+    });
+  }
   if (idx < 0) return null;
   const hit = items[idx];
   if (hit.alias && String(hit.alias).trim().toLowerCase() !== String(alias || "").trim().toLowerCase()) {
@@ -687,6 +925,39 @@ async function claimItem(env, alias, kind, afterTs, maxAge, consume) {
   return hit;
 }
 
+async function listItemsFast(env, alias, kind, maxAge) {
+  const now = Date.now() / 1000;
+  const out = [];
+  const seen = new Set();
+  const add = (it) => {
+    if (!it || !it.value || it.claimed) return;
+    if (it.kind !== kind) return;
+    if (!itemMatchesAlias(it, alias)) return;
+    if (now - Number(it.ts) > maxAge) return;
+    const k = String(it.id || it.value);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(it);
+  };
+  for (const it of memItems(alias)) add(it);
+  if (env && env.OTP) {
+    try {
+      const p = await env.OTP.get(pendingKey(alias, kind));
+      if (p) add(JSON.parse(p));
+    } catch {
+      /* ignore */
+    }
+    try {
+      const rec = await loadRecent(env.OTP, alias);
+      for (const it of rec) add(it);
+    } catch {
+      /* ignore */
+    }
+  }
+  out.sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+  return out;
+}
+
 async function listItems(env, alias, kind, maxAge) {
   const now = Date.now() / 1000;
   const items = await readBox(env, alias);
@@ -700,3 +971,13 @@ async function listItems(env, alias, kind, maxAge) {
       now - Number(it.ts) <= maxAge
   );
 }
+
+export {
+  extractInvite,
+  extractReset,
+  extractOtp,
+  classifyTidal,
+  uniqueUpnToken,
+  inviteScore,
+  resetScore,
+};

@@ -2567,8 +2567,14 @@ def eliminar_miembro_plan_familiar_tid(
     except PWErr:
         return False
 
-    rx_eliminar = re.compile(r"eliminar\s+del\s+plan", re.I)
-    rx_remove = re.compile(r"remove\s+from\s+plan", re.I)
+    rx_eliminar = re.compile(
+        r"eliminar\s+del\s+plan|cancelar\s+invitaci",
+        re.I,
+    )
+    rx_remove = re.compile(
+        r"remove\s+from\s+plan|cancel\s+invitation",
+        re.I,
+    )
     rx_confirmar = re.compile(r"confirmar\s+la\s+eliminaci|confirmar\s+eliminaci", re.I)
     rx_confirm_en = re.compile(r"confirm\s+(the\s+)?(removal|deletion)", re.I)
     rx_confirmar_texto = re.compile(
@@ -2762,6 +2768,12 @@ def eliminar_miembro_plan_familiar_tid(
                     continue
         if _pulsar_confirmacion():
             return True
+        try:
+            cuerpo = (main.inner_text(timeout=2000) or "").casefold()
+        except Exception:
+            cuerpo = ""
+        if obj_cf and obj_cf not in cuerpo:
+            return True
         return False
 
     def _fila_correcta() -> bool:
@@ -2792,7 +2804,13 @@ def eliminar_miembro_plan_familiar_tid(
 
     # 2) Recorrer filas por «Activa» (cada miembro del plan)
     try:
-        act_loc = main.get_by_text(re.compile(r"^\s*Activa\s*$"), exact=False)
+        act_loc = main.get_by_text(
+            re.compile(
+                r"activaci[oó]n\s+pendiente|activation\s+pending|^\s*activa\s*$|^\s*active\s*$",
+                re.I,
+            ),
+            exact=False,
+        )
         n_act = min(act_loc.count(), 12)
     except Exception:
         n_act = 0

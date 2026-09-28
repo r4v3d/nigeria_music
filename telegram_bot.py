@@ -8,7 +8,8 @@ Uso:
   2. python telegram_bot.py
      (Chrome visible por defecto; TELEGRAM_FORCE_HEADLESS=1 solo si hace falta)
 
-Comandos: /start /correos /lista /limpiar /imap /op1 /op2 /op3 /op4 /op5 /op9 /op12 /status /cancel /help
+Comandos: /start /correos /lista /limpiar /imap /op1 /op2 /op3 /op4 /op5 /op9 /op12
+  /oleada /resumen /status /cancel /help
 """
 
 from __future__ import annotations
@@ -66,6 +67,9 @@ from telegram_jobs import Job, JobQueue
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 os.chdir(SCRIPT_DIR)
+RESUMEN_OLEADAS = SCRIPT_DIR.parent / "multiscript" / "resumen.txt"
+PARAR_OLEADAS_FLAG = SCRIPT_DIR.parent / "multiscript" / "parar_oleadas.flag"
+_STOP_OLEADA_MAGIC = "STOP_OLEADA"
 
 # Estado por chat: lista de correos activos
 _CORREOS: dict[int, list[str]] = {}
@@ -131,7 +135,7 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("3 Login", callback_data="run:op3"),
             ],
             [
-                InlineKeyboardButton("4 Invitaciones", callback_data="run:op4:imap"),
+                InlineKeyboardButton("4 Invitaciones", callback_data="run:op4:worker"),
                 InlineKeyboardButton("4 Archivo", callback_data="run:op4:archivo"),
             ],
             [
@@ -146,6 +150,14 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📋 Lista", callback_data="lista"),
                 InlineKeyboardButton("✏️ Cambiar correos", callback_data="ask_correos"),
                 InlineKeyboardButton("🗑 Limpiar", callback_data="limpiar"),
+            ],
+            [
+                InlineKeyboardButton("Oleadas", callback_data="run:oleada"),
+                InlineKeyboardButton("Resumen", callback_data="resumen"),
+            ],
+            [
+                InlineKeyboardButton("Parar al terminar", callback_data="parar"),
+                InlineKeyboardButton("Seguir", callback_data="seguir"),
             ],
             [
                 InlineKeyboardButton("Status", callback_data="status"),
@@ -164,6 +176,7 @@ _TITULOS = {
     "op5": "RESET",
     "op9": "RESTABLECER",
     "op12": "VERIFICAR IMAP",
+    "oleada": "OLEADA FAMILIAR",
 }
 
 
@@ -180,9 +193,61 @@ def _html_esc(s: str) -> str:
     )
 
 
+def _texto_resumen_oleadas() -> str:
+    if not RESUMEN_OLEADAS.is_file():
+        return ""
+    try:
+        raw = RESUMEN_OLEADAS.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    return _compactar_resumen_oleadas(raw)
+
+
+def _compactar_resumen_oleadas(raw: str) -> str:
+    """Tablero = resumen.txt. Solo recorta si no cabe en un mensaje de Telegram."""
+    text = (raw or "").replace("\r", "").strip()
+    if not text:
+        return ""
+    limite = 3900
+    if len(text) <= limite:
+        return text
+    keep: list[str] = []
+    seccion = ""
+    omit_aun = 0
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s in ("OK", "ERROR", "PENDIENTE") or s.startswith("TIEMPOS"):
+            seccion = "TIEMPOS" if s.startswith("TIEMPOS") else s
+            keep.append(ln.rstrip())
+            continue
+        if seccion == "PENDIENTE" and "aún no" in s.lower():
+            omit_aun += 1
+            continue
+        keep.append(ln.rstrip())
+    text2 = "\n".join(keep).strip()
+    if omit_aun:
+        text2 += f"\n  … {omit_aun} aún no"
+    if len(text2) <= limite:
+        return text2
+    return text2[: limite - 2].rstrip() + "\n…"
+
+
+def _errores_en_resumen(raw: str) -> set[str]:
+    seccion = ""
+    out: set[str] = set()
+    for ln in (raw or "").splitlines():
+        s = ln.strip()
+        if s in ("OK", "ERROR", "PENDIENTE"):
+            seccion = s
+            continue
+        if seccion == "ERROR" and s:
+            out.add(s)
+    return out
+
+
 def _es_job_imap_limpio(name: str) -> bool:
     """Jobs donde no conviene inundar Telegram con logs técnicos."""
-    return name in ("op1", "op2", "op3", "op4", "op5", "op12")
+    return name in ("op1", "op2", "op3", "op4", "op5", "op12", "oleada")
 
 
 def _format_copy_item(titulo: str, correo: str, valor: str, *, es_link: bool) -> str:
@@ -210,6 +275,11 @@ def _format_summary(name: str, result: dict | None, error: str | None) -> str:
     lines = [
         f"<b>{_html_esc(_TITULOS.get(name, name))}</b> listo",
     ]
+    if name == "oleada":
+        resumen = _texto_resumen_oleadas()
+        extra = (result.get("error") or "").strip() if result else ""
+        text = resumen or extra or "Sin resumen.txt todavía."
+        return _html_esc(text[:3900])
     if name == "op4" or pwd_bad or ya_usados:
         extra = f"Aceptadas: {len(ok)} · Contraseña incorrecta: {len(pwd_bad)} · Errores: {len(fail)}"
         if ya_usados:
@@ -249,6 +319,10 @@ _app_ref = None
 _job_queue: JobQueue | None = None
 _pending_log: dict[int, list[str]] = {}
 _log_counts: dict[int, int] = {}
+_watch_mid: dict[int, int] = {}
+_watch_mtime: float = 0.0
+_watch_errores: set[str] = set()
+_watch_baseline = True
 
 
 def _on_job_log(job: Job, line: str) -> None:
@@ -283,8 +357,8 @@ def _on_job_log(job: Job, line: str) -> None:
     chat_id = job.chat_id
     if not chat_id:
         return
-    # op1/2/3: solo mensajes copiables + resumen final (sin spam IMAP/ANSI)
-    if _es_job_imap_limpio(job.name):
+    # Oleadas: nunca reenviar la terminal. El tablero es resumen.txt.
+    if _es_job_imap_limpio(job.name) or job.name == "oleada":
         return
 
     buf = _pending_log.setdefault(chat_id, [])
@@ -347,7 +421,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Cambiar correos: botón «Cambiar correos» o /correos\n"
         "Ver lista: /lista · Borrar: /limpiar\n"
         "App Password IMAP: /imap · Verificar: /op12\n"
-        "Cancelar solo detiene un job en curso (no borra correos).",
+        "Cancelar solo detiene un job en curso (no borra correos).\n"
+        "Oleadas familiares: /oleada · /resumen · /parar (al terminar la oleada).",
         reply_markup=_menu_keyboard(),
     )
 
@@ -365,13 +440,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/op1 — código registro\n"
         "/op2 — código eliminación\n"
         "/op3 — código login\n"
-        "/op4 — invitaciones\n"
+        "/op4 — invitaciones (Email Worker, sin IMAP)\n"
         "/op4_archivo — invitaciones desde archivo\n"
         "/op5 — enlace reset\n"
         "/op9 — restablecer contraseñas\n"
         "/op12 — verificar Email Worker + IMAP\n"
+        "/oleada — pipeline familiar (cuentas procesadas.txt)\n"
+        "/resumen — tablero ok/error/pendiente de las oleadas\n"
+        "/parar — detiene al terminar la oleada en curso (no a mitad)\n"
+        "/seguir — anula /parar y continúa con las siguientes\n"
         "/status — job actual\n"
-        "/cancel — cancelar job o modo pegado\n"
+        "/cancel — cancelar job IMAP o modo pegado (corta ya)\n"
         "/whoami — tu Telegram user id"
     )
 
@@ -607,7 +686,7 @@ async def cmd_op3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_op4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _start_job(update, "op4", fuente="imap", headless=False)
+    await _start_job(update, "op4", fuente="worker", headless=False)
 
 
 async def cmd_op4_archivo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -626,6 +705,63 @@ async def cmd_op12(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _start_job(update, "op12")
 
 
+async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        await _deny(update)
+        return
+    texto = _texto_resumen_oleadas()
+    if not texto:
+        await update.effective_message.reply_text(
+            "No hay resumen en este servidor (el pipeline corre en el PC).\n\n"
+            "Cuando lances oleada_familiar.py en el PC, el tablero llega "
+            "solo a este chat (nigeria_music).",
+            reply_markup=_menu_keyboard(),
+        )
+        return
+    await update.effective_message.reply_text(
+        texto[:4000],
+        reply_markup=_menu_keyboard(),
+    )
+
+
+async def cmd_oleada(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _watch_baseline
+    if not _allowed(update):
+        await _deny(update)
+        return
+    script = SCRIPT_DIR.parent / "multiscript" / "oleada_familiar.py"
+    chat_id = update.effective_chat.id
+    texto = _texto_resumen_oleadas()
+    if not script.is_file():
+        await update.effective_message.reply_text(
+            texto[:4000] if texto else (
+                "Las oleadas se lanzan en el PC (Surfshark).\n\n"
+                "En el PC: python oleada_familiar.py\n"
+                "Aquí llega el mismo tablero que resumen.txt, sin el log."
+            ),
+            reply_markup=_menu_keyboard(),
+        )
+        return
+    uid = update.effective_user.id
+    _AWAITING_CORREOS.discard(uid)
+    _AWAITING_IMAP_PWD.discard(uid)
+    snap = _job_queue.status_snapshot()
+    if snap.get("current"):
+        await update.effective_message.reply_text(
+            texto[:4000] if texto else "Ya hay un job en curso. El tablero se ve con /resumen.",
+            reply_markup=_menu_keyboard(),
+        )
+        return
+    _job_queue.submit("oleada", [], chat_id=chat_id, headless=False)
+    msg = await update.effective_message.reply_text(
+        (texto or "en marcha\nEl tablero es resumen.txt y se actualiza solo.")[:4000],
+        reply_markup=_menu_keyboard(),
+    )
+    if msg:
+        _watch_mid[chat_id] = msg.message_id
+        _watch_baseline = False
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         await _deny(update)
@@ -634,17 +770,107 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cur = snap.get("current")
     if not cur:
         n = len(_CORREOS.get(update.effective_user.id, []))
+        resumen = _texto_resumen_oleadas()
+        extra = f"\n\n{resumen[:2200]}" if resumen else ""
         await update.effective_message.reply_text(
-            f"Sin job en curso. Pending queue: {snap.get('pending', 0)}\nCorreos activos: {n}"
+            f"Sin job en curso. Pending queue: {snap.get('pending', 0)}\n"
+            f"Correos activos: {n}{extra}"
         )
         return
     logs = cur.get("recent_logs") or []
+    if cur.get("name") == "oleada":
+        resumen = _texto_resumen_oleadas() or "(aún no hay resumen.txt)"
+        await update.effective_message.reply_text(
+            f"Oleada #{cur['job_id']} — {cur['status']}\n\n{resumen[:3500]}"
+        )
+        return
     # Filtrar ruido / señales internas
     logs = [l for l in logs if not l.startswith("__")]
     tail = "\n".join(_strip_ansi(x) for x in logs[-8:]) if logs else "(sin logs aún)"
     await update.effective_message.reply_text(
         f"Job #{cur['job_id']} {cur['name']} — {cur['status']}\n"
         f"Cuentas: {cur['correos']}\n\nÚltimos logs:\n{tail[-3500:]}"
+    )
+
+
+async def _pedir_parada_oleadas(bot, *, parar: bool) -> list[str]:
+    """Escribe la parada en archivo, Worker y perfil del bot. Devuelve vías que funcionaron."""
+    ok: list[str] = []
+    try:
+        PARAR_OLEADAS_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        if parar:
+            PARAR_OLEADAS_FLAG.write_text(
+                "parar al terminar la oleada actual\n", encoding="utf-8"
+            )
+        else:
+            PARAR_OLEADAS_FLAG.unlink(missing_ok=True)
+        ok.append("archivo")
+    except Exception as exc:
+        print(f"[Bot] Flag parar_oleadas: {exc}")
+    try:
+        from otp_worker_client import marcar_parada_pipeline
+        if marcar_parada_pipeline(parar):
+            ok.append("worker")
+    except Exception as exc:
+        print(f"[Bot] Worker pipeline-stop: {exc}")
+    try:
+        await bot.set_my_short_description(
+            short_description=_STOP_OLEADA_MAGIC if parar else ""
+        )
+        ok.append("telegram")
+    except Exception as exc:
+        print(f"[Bot] setMyShortDescription: {exc}")
+    return ok
+
+
+async def _reply_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    markup = _menu_keyboard()
+    msg = update.effective_message
+    if msg:
+        try:
+            await msg.reply_text(text, reply_markup=markup)
+            return
+        except Exception:
+            pass
+    chat = update.effective_chat
+    if chat:
+        await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=markup)
+
+
+async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        await _deny(update)
+        return
+    vias = await _pedir_parada_oleadas(context.bot, parar=True)
+    if vias:
+        detalle = "Señal enviada (" + ", ".join(vias) + ")."
+    else:
+        detalle = (
+            "No pude dejar la señal (archivo/Worker/Telegram). "
+            "Revisa el log del bot y passwords.txt."
+        )
+    await _reply_menu(
+        update,
+        context,
+        "Parada pedida.\n\n"
+        f"{detalle}\n"
+        "La oleada en curso termina completa (pasos 1 a 8).\n"
+        "Después no se lanza la siguiente.\n\n"
+        "Para continuar: /seguir\n"
+        "/cancel corta ya (a mitad de oleada).",
+    )
+
+
+async def cmd_seguir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        await _deny(update)
+        return
+    vias = await _pedir_parada_oleadas(context.bot, parar=False)
+    extra = (" (" + ", ".join(vias) + ")") if vias else " (no había señal que anular)"
+    await _reply_menu(
+        update,
+        context,
+        f"Parada anulada{extra}. Si el pipeline sigue, lanzará la siguiente oleada.",
     )
 
 
@@ -693,6 +919,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "status":
         await cmd_status(update, context)
         return
+    if data == "parar":
+        await cmd_parar(update, context)
+        return
+    if data == "seguir":
+        await cmd_seguir(update, context)
+        return
     if data == "cancel":
         await cmd_cancel(update, context)
         return
@@ -708,6 +940,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "limpiar":
         await cmd_limpiar(update, context)
         return
+    if data == "resumen":
+        await cmd_resumen(update, context)
+        return
+    if data == "run:oleada":
+        await cmd_oleada(update, context)
+        return
     if data == "run:op1":
         await _start_job(update, "op1")
         return
@@ -716,6 +954,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if data == "run:op3":
         await _start_job(update, "op3")
+        return
+    if data == "run:op4:worker":
+        await _start_job(update, "op4", fuente="worker", headless=False)
         return
     if data == "run:op4:imap":
         await _start_job(update, "op4", fuente="imap", headless=False)
@@ -732,6 +973,69 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "run:op12":
         await _start_job(update, "op12")
         return
+
+
+async def _tick_resumen_watch(application: Application) -> None:
+    global _watch_mtime, _watch_errores, _watch_baseline
+    if not RESUMEN_OLEADAS.is_file():
+        return
+    try:
+        mtime = RESUMEN_OLEADAS.stat().st_mtime
+    except Exception:
+        return
+    if mtime <= _watch_mtime:
+        return
+    try:
+        raw = RESUMEN_OLEADAS.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+    _watch_mtime = mtime
+    compact = _compactar_resumen_oleadas(raw)
+    errores = _errores_en_resumen(raw)
+    nuevos = sorted(errores - _watch_errores)
+    primera = _watch_baseline
+    _watch_baseline = False
+    _watch_errores = errores
+    if primera or not compact:
+        return
+    for chat_id in list(ALLOWED_IDS):
+        mid = _watch_mid.get(chat_id)
+        try:
+            if mid:
+                try:
+                    await application.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=mid,
+                        text=compact[:4000],
+                        reply_markup=_menu_keyboard(),
+                    )
+                except Exception:
+                    mid = None
+            if not mid:
+                msg = await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=compact[:4000],
+                    disable_notification=not bool(nuevos),
+                    reply_markup=_menu_keyboard(),
+                )
+                _watch_mid[chat_id] = msg.message_id
+            if nuevos:
+                aviso = "ERROR nuevo\n" + "\n".join(f"  {x}" for x in nuevos[:12])
+                if len(nuevos) > 12:
+                    aviso += f"\n  … y {len(nuevos) - 12} más"
+                await application.bot.send_message(chat_id=chat_id, text=aviso[:4000])
+        except Exception:
+            pass
+
+
+async def _watch_resumen_loop(application: Application) -> None:
+    await asyncio.sleep(4)
+    while True:
+        try:
+            await _tick_resumen_watch(application)
+        except Exception:
+            pass
+        await asyncio.sleep(6)
 
 
 def main() -> None:
@@ -751,6 +1055,8 @@ def main() -> None:
     async def _post_init(application: Application) -> None:
         global _main_loop
         _main_loop = asyncio.get_running_loop()
+        asyncio.create_task(_watch_resumen_loop(application))
+        print(f"  nigeria_music: tablero de oleadas → {RESUMEN_OLEADAS}")
 
     app = (
         Application.builder()
@@ -775,6 +1081,10 @@ def main() -> None:
     app.add_handler(CommandHandler("op5", cmd_op5))
     app.add_handler(CommandHandler("op9", cmd_op9))
     app.add_handler(CommandHandler("op12", cmd_op12))
+    app.add_handler(CommandHandler("oleada", cmd_oleada))
+    app.add_handler(CommandHandler("resumen", cmd_resumen))
+    app.add_handler(CommandHandler("parar", cmd_parar))
+    app.add_handler(CommandHandler("seguir", cmd_seguir))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_callback))

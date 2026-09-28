@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -19,6 +20,7 @@ _CFG_MTIME: float | None = None
 _BASELINE_TS: dict[str, float] = {}
 _SESSION: requests.Session | None = None
 _LAST_NET_ERR = 0.0
+_LIST_MANY_OK: bool | None = None
 
 
 def _http_session() -> requests.Session:
@@ -30,10 +32,10 @@ def _http_session() -> requests.Session:
             read=2,
             backoff_factor=0.2,
             status_forcelist=(502, 503, 504),
-            allowed_methods=frozenset(["GET"]),
+            allowed_methods=frozenset(["GET", "POST"]),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=64, pool_maxsize=64)
         sess = requests.Session()
         sess.mount("https://", adapter)
         sess.mount("http://", adapter)
@@ -68,7 +70,7 @@ def worker_config() -> dict:
         mtime = None
     if _CFG_CACHE is not None and mtime == _CFG_MTIME:
         return _CFG_CACHE
-    cfg = {"url": "", "secret": "", "imap_fallback": False, "timeout": 5.0}
+    cfg = {"url": "", "secret": "", "imap_fallback": False, "timeout": 2.5}
     for key, val in _pares_passwords():
         if key in ("email_worker_url", "otp_worker_url") and val:
             cfg["url"] = val.rstrip("/")
@@ -106,6 +108,51 @@ def worker_cubre_alias(alias: str) -> bool:
         return False
     dominio = a.rsplit("@", 1)[-1]
     return dominio in _WORKER_CATCHALL_DOMAINS
+
+
+def usar_imap_gmail(alias: str) -> bool:
+    """IMAP del Gmail de FORWARD_TO. Off para catch-all salvo imap_fallback=1."""
+    if not worker_cubre_alias(alias):
+        return True
+    return bool(worker_config().get("imap_fallback"))
+
+
+_MIN_UPN_CTA = 140
+
+
+def upn_token_invite(url: str) -> str:
+    u = (url or "").strip()
+    if "upn=" not in u.lower():
+        return ""
+    try:
+        from urllib.parse import unquote
+        raw = u.split("upn=", 1)[1].split("&")[0]
+        return unquote(raw).split("_")[0]
+    except Exception:
+        return u.split("upn=", 1)[1].split("&")[0].split("_")[0]
+
+
+def enlace_invite_completo(url: str) -> bool:
+    """True si es accept-invite directo o el CTA /ls/click con upn largo (no el logo → ?lid=)."""
+    u = (url or "").strip()
+    ul = u.lower()
+    if not ul.startswith("http"):
+        return False
+    if "resetpass" in ul or "reset-password" in ul or "/wf/open" in ul:
+        return False
+    if "tidal.com/?" in ul and "lid=" in ul:
+        return False
+    if (
+        "login.tidal.com/family" in ul
+        or "account.tidal.com/family" in ul
+        or "accept-invite" in ul
+        or "/accept/" in ul
+        or "/join/" in ul
+    ):
+        return True
+    if "ablink." in ul and "tidal" in ul and "/ls/click" in ul and "upn=" in ul:
+        return len(upn_token_invite(u)) >= _MIN_UPN_CTA
+    return False
 
 
 def marcar_baseline_worker(alias: str) -> None:
@@ -149,7 +196,12 @@ def _get(path: str, params: dict) -> dict | None:
         "Pragma": "no-cache",
     }
     try:
-        r = _http_session().get(url, params=params, headers=headers, timeout=cfg["timeout"])
+        # /claim y /list se sondean cada ~80 ms: sin retries (un timeout de 5s×3
+        # bloqueaba el OTP varios segundos aunque el mail ya estaba en KV).
+        fast = path in ("/claim", "/list", "/peek", "/pipeline-stop")
+        timeout = min(float(cfg["timeout"] or 2.5), 1.8) if fast else float(cfg["timeout"] or 2.5)
+        getter = requests.get if fast else _http_session().get
+        r = getter(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 401:
             print("    [WORKER] Secreto incorrecto (401). Revisa email_worker_secret en passwords.txt")
             return None
@@ -165,6 +217,46 @@ def _get(path: str, params: dict) -> dict | None:
         now = time.time()
         if now - _LAST_NET_ERR >= 5.0:
             print(f"    [WORKER] Error de red: {e}")
+            _LAST_NET_ERR = now
+        return None
+
+
+def _post(path: str, payload: dict, timeout: float | None = None) -> dict | None:
+    global _LAST_NET_ERR
+    cfg = worker_config()
+    if not cfg["url"] or not cfg["secret"]:
+        return None
+    url = cfg["url"] + path
+    headers = {
+        "X-OTP-Secret": cfg["secret"],
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Content-Type": "application/json",
+    }
+    to = float(timeout) if timeout else max(float(cfg.get("timeout") or 5.0), 15.0)
+    try:
+        r = _http_session().post(
+            url,
+            json=payload or {},
+            headers=headers,
+            params={"secret": cfg["secret"], "_": f"{time.time():.3f}"},
+            timeout=to,
+        )
+        if r.status_code == 401:
+            print("    [WORKER] Secreto incorrecto (401). Revisa email_worker_secret en passwords.txt")
+            return None
+        if r.status_code != 200:
+            now = time.time()
+            if now - _LAST_NET_ERR >= 8.0:
+                print(f"    [WORKER] HTTP {r.status_code} en {path}")
+                _LAST_NET_ERR = now
+            return None
+        data = r.json()
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        now = time.time()
+        if now - _LAST_NET_ERR >= 5.0:
+            print(f"    [WORKER] Error de red POST {path}: {e}")
             _LAST_NET_ERR = now
         return None
 
@@ -219,23 +311,23 @@ def intentar_via_worker(
     return None, False
 
 
-def _after_ts_claim(alias: str, after_email_id: int = 0) -> float:
-    """Convierte baseline IMAP → after_ts del worker.
+def _after_ts_claim(alias: str, after_email_id: int = 0, margen_s: float = 8.0) -> float:
+    """Convierte baseline IMAP / worker → after_ts.
 
-    obtener_max_email_id() para catch-all devuelve 1 (dummy). Tratarlo como filtro
-    real excluía el OTP que Tidal ya había metido en KV (reloj local vs Cloudflare,
-    o baseline tomada al ver la pantalla de código, *después* de que llegara el mail).
+    El catch-all (@cheapmusic.best) usa email_id dummy=1. Aun así hay que respetar
+    marcar_baseline_worker(): si after_ts=0 el /claim devuelve un OTP viejo de KV
+    (p. ej. eliminación previa) y Tidal lo rechaza mientras el código nuevo llega.
     """
+    ts = baseline_worker(alias)
+    if ts > 0:
+        return max(0.0, ts - max(0.0, float(margen_s)))
     try:
         eid = int(after_email_id or 0)
     except Exception:
         eid = 0
     if eid <= 1:
         return 0.0
-    ts = baseline_worker(alias)
-    if ts <= 0:
-        return 0.0
-    return max(0.0, ts - 300.0)
+    return 0.0
 
 
 def reclamar_desde_worker(
@@ -246,17 +338,20 @@ def reclamar_desde_worker(
     silencioso: bool = False,
     consume: bool = True,
     despues_de: float | None = None,
+    margen_s: float | None = None,
 ) -> str | None:
     alias = (alias or "").strip().lower()
     kind = (kind or "").strip().lower()
     if not worker_cubre_alias(alias) or kind not in ("login", "register", "delete", "reset", "invite"):
         return None
     max_age = max(60, int((max_age_minutes or 15) * 60))
-    after_ts = _after_ts_claim(alias, after_email_id)
+    # delete/reset: margen corto (si es 90s se cuela el OTP de un intento anterior).
+    if margen_s is None:
+        margen_s = 12.0 if kind in ("delete", "reset") else 90.0
+    after_ts = _after_ts_claim(alias, after_email_id, margen_s=min(8.0, float(margen_s)))
     if despues_de:
         try:
-            # Margen de seguridad de 90s para evitar que diferencias de reloj local vs Cloudflare descarten el OTP recién llegado
-            after_ts = max(after_ts, max(0.0, float(despues_de) - 90.0))
+            after_ts = max(after_ts, max(0.0, float(despues_de) - float(margen_s)))
         except Exception:
             pass
     params = {
@@ -279,7 +374,9 @@ def reclamar_desde_worker(
         if not silencioso:
             print(f"    [WORKER] Ignorado OTP de {got_alias} (se pedía {alias})", flush=True)
         return None
-    if kind in ("invite", "reset"):
+    # Invite: no seguir el ablink por HTTP (4–8s c/u y Tidal a menudo cae en ?lid=).
+    # El CTA /ls/click se abre en Chrome. Reset sí se resuelve (necesitamos resetpass).
+    if kind == "reset":
         val = resolver_enlace_worker(val, kind)
     if not silencioso:
         print(f"    [WORKER] {kind} para {alias}: {val[:96]}")
@@ -297,6 +394,7 @@ def esperar_desde_worker(
     silencioso: bool = False,
     consume: bool = True,
     despues_de: float | None = None,
+    margen_s: float | None = None,
 ) -> str | None:
     """Sondea /claim cada ~80 ms hasta que el correo llegue al worker."""
     alias = (alias or "").strip().lower()
@@ -306,11 +404,16 @@ def esperar_desde_worker(
     visto = False
     ultimo_hb = 0.0
     tope = max(1.0, float(max_wait_s))
-    alt_kind = None
+    alt_kinds: list[str] = []
     if kind == "register":
-        alt_kind = "login"
+        alt_kinds = ["login"]
     elif kind == "login":
-        alt_kind = "register"
+        alt_kinds = ["register"]
+    elif kind == "delete":
+        alt_kinds = ["login", "register"]
+
+    def _otp_digitos(v: str | None) -> str:
+        return "".join(ch for ch in str(v or "") if ch.isdigit())
 
     while time.time() - t0 < tope:
         val = reclamar_desde_worker(
@@ -320,16 +423,25 @@ def esperar_desde_worker(
             silencioso=True,
             consume=consume,
             despues_de=despues_de,
+            margen_s=margen_s,
         )
-        if not val and alt_kind:
-            val = reclamar_desde_worker(
-                alias, alt_kind,
-                max_age_minutes=max_age_minutes,
-                after_email_id=after_email_id,
-                silencioso=True,
-                consume=consume,
-                despues_de=despues_de,
-            )
+        if not val:
+            for alt_kind in alt_kinds:
+                cand = reclamar_desde_worker(
+                    alias, alt_kind,
+                    max_age_minutes=max_age_minutes,
+                    after_email_id=after_email_id,
+                    silencioso=True,
+                    consume=consume,
+                    despues_de=despues_de,
+                    margen_s=margen_s,
+                )
+                if not cand:
+                    continue
+                if kind == "delete" and not (5 <= len(_otp_digitos(cand)) <= 6):
+                    continue
+                val = cand
+                break
         if val:
             if not silencioso:
                 print(f"    [WORKER] {kind} para {alias}: {val[:96]} ({time.time() - t0:.1f}s)", flush=True)
@@ -367,10 +479,14 @@ def resolver_enlace_worker(url: str, kind: str = "invite") -> str:
         fl = final.lower()
         if kind == "reset" and "resetpass" in fl:
             return final
-        if kind == "invite" and (
-            "family" in fl or "accept" in fl or "/join/" in fl
-        ) and "resetpass" not in fl:
-            return final
+        if kind == "invite":
+            if "resetpass" in fl:
+                return ""
+            if "family" in fl or "accept" in fl or "/join/" in fl:
+                return final
+            # tidal.com/?lid=... es home de campaña, no el accept familiar.
+            # Conservar el ablink original para que Chrome haga el click real.
+            return u
         return final if final.startswith("http") else u
     except Exception:
         return u
@@ -422,60 +538,174 @@ def _email_en_url(url: str) -> str:
 def reclamar_invites_para_aliases(
     aliases: list[str],
     max_age_minutes: int = 1440,
+    max_wait_s: float = 8.0,
 ) -> tuple[dict[str, str], list[str]]:
     """Reclama invitaciones del worker. Devuelve (asignados, aliases para IMAP).
 
-    Un UUID por alias. Si el enlace trae email= de otro correo, no se asigna.
-    Si el worker no tiene el enlace, el alias pasa a IMAP (FORWARD_TO → Gmail).
+    Catch-all (@cheapmusic.best): si el worker no tiene el enlace, NO pasa a
+    IMAP salvo email_worker_imap_fallback=1.
     """
-    asignados: dict[str, str] = {}
+    asignados = extraer_invites_worker(
+        aliases,
+        max_age_minutes=max_age_minutes,
+        max_wait_s=max_wait_s,
+        silencioso=False,
+    )
     restantes: list[str] = []
-    usados_ident: set[str] = set()
-
-    def _tomar(al: str, enlace: str) -> bool:
-        if not enlace or "resetpass" in enlace.lower():
-            return False
-        ident = _invite_url_identidad(enlace)
-        em = _email_en_url(enlace)
-        if em and em.strip().lower() != al.strip().lower():
-            return False
-        if ident and ident in usados_ident:
-            return False
-        if ident:
-            usados_ident.add(ident)
-        asignados[al] = enlace
-        return True
-
+    vistos_asig = {(k or "").strip().lower() for k in asignados}
     for a in aliases or []:
         al = (a or "").strip()
         if not al:
             continue
-        if not worker_cubre_alias(al):
-            restantes.append(al)
+        if al.lower() in vistos_asig:
             continue
-        elegido = ""
-        for it in listar_invites_worker(al, max_age_minutes):
-            link = str((it or {}).get("link") or "").strip()
-            em = _email_en_url(link)
-            ident = _invite_url_identidad(link)
-            if ident and ident in usados_ident:
-                continue
-            if em and em.strip().lower() != al.strip().lower():
-                continue
-            if em and em.strip().lower() == al.strip().lower():
-                elegido = link
-                break
-            if not elegido:
-                elegido = link
-        if elegido and _tomar(al, elegido):
-            continue
-        enlace = reclamar_desde_worker(
-            al, "invite", max_age_minutes=max_age_minutes, silencioso=False,
-        )
-        if enlace and _tomar(al, enlace):
+        if worker_cubre_alias(al) and not worker_config().get("imap_fallback"):
             continue
         restantes.append(al)
     return asignados, restantes
+
+
+def _link_de_item_invite(it: dict | None) -> str:
+    if not isinstance(it, dict):
+        return ""
+    return str(it.get("link") or it.get("value") or "").strip()
+
+
+def _mejor_invite_de_hits(hits: list | None, alias: str) -> str:
+    al = (alias or "").strip().lower()
+    mejor = ""
+    for it in hits or []:
+        link = _link_de_item_invite(it if isinstance(it, dict) else None)
+        if not link or "resetpass" in link.lower():
+            continue
+        em = _email_en_url(link)
+        if em and em.strip().lower() != al:
+            continue
+        if enlace_invite_completo(link):
+            if em and em.strip().lower() == al:
+                return link
+            if not mejor:
+                mejor = link
+    return mejor
+
+
+def _listar_invites_lote(aliases: list[str], max_age_minutes: int) -> dict[str, list]:
+    """Una sola POST /list-many; si el worker aún no la tiene, GET /list en paralelo."""
+    global _LIST_MANY_OK
+    cubiertos = []
+    vistos = set()
+    for a in aliases or []:
+        al = (a or "").strip().lower()
+        if not al or al in vistos or not worker_cubre_alias(al):
+            continue
+        vistos.add(al)
+        cubiertos.append(al)
+    if not cubiertos:
+        return {}
+    max_age = max(60, int((max_age_minutes or 1440) * 60))
+    if _LIST_MANY_OK is not False:
+        data = _post("/list-many", {
+            "aliases": cubiertos,
+            "kind": "invite",
+            "max_age": max_age,
+        })
+        by = (data or {}).get("by_alias") if data and data.get("ok") else None
+        if isinstance(by, dict):
+            _LIST_MANY_OK = True
+            out: dict[str, list] = {}
+            for al in cubiertos:
+                items = by.get(al) or []
+                out[al] = items if isinstance(items, list) else []
+            return out
+        _LIST_MANY_OK = False
+
+    out = {al: [] for al in cubiertos}
+
+    def _one(al: str) -> tuple[str, list]:
+        return al, listar_invites_worker(al, max_age_minutes)
+
+    n_workers = min(32, max(1, len(cubiertos)))
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = [ex.submit(_one, al) for al in cubiertos]
+        for fut in as_completed(futs):
+            try:
+                al, hits = fut.result()
+                out[al] = hits or []
+            except Exception:
+                pass
+    return out
+
+
+def extraer_invites_worker(
+    aliases: list[str],
+    max_age_minutes: int = 2880,
+    max_wait_s: float = 8.0,
+    silencioso: bool = False,
+) -> dict[str, str]:
+    """Extrae invitaciones del Email Worker en segundos. Sin IMAP.
+
+    Devuelve {alias_original: url}. Poll corto si el correo acaba de entrar a KV.
+    """
+    orig: dict[str, str] = {}
+    for a in aliases or []:
+        al = (a or "").strip()
+        if not al or "@" not in al:
+            continue
+        key = al.lower()
+        if key not in orig and worker_cubre_alias(al):
+            orig[key] = al
+    if not orig:
+        return {}
+    if not worker_habilitado():
+        if not silencioso:
+            print("    [WORKER] Sin email_worker_url/secret en passwords.txt.")
+        return {}
+
+    asignados: dict[str, str] = {}
+    usados_ident: set[str] = set()
+    pendientes = list(orig.keys())
+    t0 = time.time()
+    tope = max(0.0, float(max_wait_s))
+    pasada = 0
+    while pendientes:
+        pasada += 1
+        by = _listar_invites_lote(pendientes, max_age_minutes)
+        hallados: list[str] = []
+        for al in pendientes:
+            link = _mejor_invite_de_hits(by.get(al) or [], al)
+            if not link:
+                continue
+            ident = _invite_url_identidad(link)
+            if ident and ident in usados_ident:
+                continue
+            if ident:
+                usados_ident.add(ident)
+            asignados[orig.get(al, al)] = link
+            hallados.append(al)
+        for al in hallados:
+            pendientes.remove(al)
+        if not pendientes:
+            break
+        if (time.time() - t0) >= tope:
+            break
+        if pasada == 1 and not silencioso:
+            print(
+                f"    [WORKER] {len(asignados)}/{len(orig)} invites; "
+                f"esperando {len(pendientes)} en KV ({tope:.0f}s)...",
+                flush=True,
+            )
+        time.sleep(0.12)
+
+    if not silencioso:
+        dt = time.time() - t0
+        print(
+            f"    [WORKER] Extraídos {len(asignados)}/{len(orig)} enlace(s) "
+            f"en {dt:.1f}s (sin IMAP).",
+            flush=True,
+        )
+        for al in pendientes:
+            print(f"    [WORKER] {orig.get(al, al)}: sin invitación en el worker.", flush=True)
+    return asignados
 
 
 def listar_invites_worker(alias: str, max_age_minutes: int = 1440) -> list[dict]:
@@ -495,9 +725,6 @@ def listar_invites_worker(alias: str, max_age_minutes: int = 1440) -> list[dict]
     for it in data.get("items") or []:
         link = str((it or {}).get("value") or "").strip()
         if not link.startswith("http") or "resetpass" in link.lower():
-            continue
-        link = resolver_enlace_worker(link, "invite")
-        if "resetpass" in link.lower():
             continue
         out.append({
             "uid": hash(link) & 0x7FFFFFFF,
@@ -537,3 +764,14 @@ def worker_salud() -> tuple[bool, str]:
         return False, f"HTTP {r.status_code} {cfg['url']}"
     except Exception as e:
         return False, f"{cfg['url']} ({e})"
+
+
+def marcar_parada_pipeline(parar: bool) -> bool:
+    """Señal /parar del bot → KV del Worker (llega al PC aunque el bot esté en otro sitio)."""
+    data = _post("/pipeline-stop", {"stop": bool(parar)}, timeout=8.0)
+    return bool(data and data.get("ok"))
+
+
+def parada_pipeline_pedida() -> bool:
+    data = _get("/pipeline-stop", {})
+    return bool(data and data.get("stop"))

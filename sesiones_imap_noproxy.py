@@ -2616,7 +2616,7 @@ def abrir_enlace_restablecimiento_con_autocierre(url: str, correo: str, proxy_pe
 # Se puede ampliar/cambiar en passwords.txt:
 #   imap_forward_cheapmusic.best=otro@gmail.com
 _FORWARD_IMAP_DEFAULT = {
-    "cheapmusic.best": "cakeseller1234@gmail.com",
+    "cheapmusic.best": "getspooky2758@gmail.com",
 }
 
 

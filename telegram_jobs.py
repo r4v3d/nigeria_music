@@ -148,6 +148,7 @@ class JobQueue:
             "op5": runners.ejecutar_opcion5,
             "op9": runners.ejecutar_opcion9,
             "op12": runners.ejecutar_opcion12,
+            "oleada": runners.ejecutar_oleada_familiar,
         }
         while True:
             job = self._q.get()

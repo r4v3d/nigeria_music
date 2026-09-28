@@ -7,8 +7,11 @@ from __future__ import annotations
 import os
 import random
 import re
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 
 import sesiones_imap as S
@@ -345,7 +348,7 @@ def ejecutar_opcion4(
 ) -> dict[str, Any]:
     """Aceptar invitaciones familiares (opción 4) sin menú interactivo.
 
-    fuente: 'imap' | 'archivo' (linksextraidos.txt)
+    fuente: 'worker' | 'imap' | 'archivo' (linksextraidos.txt)
     """
     correos = _norm_correos(correos)
     if not correos:
@@ -355,15 +358,34 @@ def ejecutar_opcion4(
     print("=== OPCIÓN 4 (bot) — invitaciones familiares ===")
     print(f"  Correos: {len(correos)} | fuente={fuente} | headless={headless}")
 
-    origen = (fuente or "imap").strip().lower()
+    origen = (fuente or "worker").strip().lower()
     if origen in ("archivo", "a", "file", "links"):
         enlaces_map = S.leer_enlaces_desde_linksextraidos(correos)
         origen_enlaces = "archivo"
         print(f"  [Enlaces] {len(enlaces_map)} desde linksextraidos.txt")
-    else:
-        print("  Buscando enlaces (worker @cheapmusic.best / IMAP)...")
+    elif origen in ("imap", "i", "gmail"):
+        print("  Buscando enlaces (IMAP / worker fallback)...")
         enlaces_map = S.asignar_enlaces_invitacion_a_correos(correos)
         origen_enlaces = "imap"
+    else:
+        print("  Extrayendo enlaces del Email Worker (sin IMAP)...")
+        enlaces_map = S.extraer_enlaces_invitacion_via_worker(correos)
+        origen_enlaces = "worker"
+        gmail_rest: list[str] = []
+        try:
+            from otp_worker_client import usar_imap_gmail
+            hay = {(k or "").strip().lower() for k in (enlaces_map or {})}
+            gmail_rest = [
+                c for c in correos
+                if (c or "").strip().lower() not in hay and usar_imap_gmail(c)
+            ]
+        except Exception:
+            gmail_rest = []
+        if gmail_rest:
+            extra = S.asignar_enlaces_invitacion_a_correos(gmail_rest)
+            for c, u in (extra or {}).items():
+                if u and c not in enlaces_map:
+                    enlaces_map[c] = u
 
     for c in correos:
         e = enlaces_map.get(c)
@@ -715,3 +737,58 @@ def ejecutar_opcion9(
         "fail_count": len(correos),
         "error": "Sin resultado de restablecer_contrasenas_tidal",
     }
+
+
+def ejecutar_oleada_familiar(
+    correos: list[str] | None = None,
+    *,
+    cancel_check=None,
+    headless: bool = False,
+    **_kwargs,
+) -> dict[str, Any]:
+    """Lanza oleada_familiar.py (multiscript) y deja el tablero en resumen.txt."""
+    script = Path(__file__).resolve().parent.parent / "multiscript" / "oleada_familiar.py"
+    if not script.is_file():
+        return {
+            "ok_list": [],
+            "fail_list": list(correos or []),
+            "error": f"No está {script}",
+        }
+    print("Oleada familiar en curso. El tablero es resumen.txt (sin log de terminal).")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    # El bot ya publica resumen.txt; el pipeline no debe mandar el log.
+    env["TELEGRAM_PIPELINE_PUSH"] = "0"
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(script)],
+        cwd=str(script.parent),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for _line in proc.stdout:
+        if cancel_check and cancel_check():
+            proc.terminate()
+            try:
+                proc.wait(timeout=20)
+            except Exception:
+                proc.kill()
+            return {
+                "ok_list": [],
+                "fail_list": list(correos or []),
+                "error": "cancelado desde Telegram",
+            }
+    rc = proc.wait()
+    resumen = script.parent / "resumen.txt"
+    extra = ""
+    if resumen.is_file():
+        try:
+            extra = resumen.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            extra = ""
+    return {"ok_list": [], "fail_list": [], "error": extra, "exit_code": rc}

